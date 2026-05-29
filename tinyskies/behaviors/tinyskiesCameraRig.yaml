@@ -1,0 +1,189 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Camera Rig"
+  id: "tinyskies.cameraRig"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Chase camera for the globe-flight player. Verbatim port of source CameraRig.update() (REQ-011, REQ-012). Drops voidChase / shake / trauma / intro fly-through (deferred)."
+  documentation: "Reads player spherical state from this.erth.store (published by tinyskiesFlightController) and drives game.camera each frame: position, up (set per-frame to currentPos.normalized() so the horizon stays aligned with local 'down'), lookAt, FOV, banking-tilt rotateZ. Snaps on first update so the camera doesn't lerp in from origin. Behaves identically to source feel: FOLLOW_DISTANCE 1.2 + dynamic 0.6 zoom; FOLLOW_HEIGHT 0.7 + 0.15 zoom; BASE_FOV 60 + up-to-+20 boost; POSITION_SMOOTH 10 / LOOKAT_SMOOTH 9 with closeDamp; banking-tilt MAX_TILT 0.06 smoothed at 5/s."
+  tags:
+    - camera
+    - gameplay
+  priority: 0
+  throttleConfig:
+    throttlePriority: "CRITICAL"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    globeRadius:
+      name: "Globe Radius"
+      type: "number"
+      default: 5
+      min: 0.5
+      max: 200
+    followDistance:
+      name: "Follow Distance"
+      type: "number"
+      default: 1.2
+      min: 0.4
+      max: 5
+    followHeight:
+      name: "Follow Height"
+      type: "number"
+      default: 0.7
+      min: 0
+      max: 5
+    baseFov:
+      name: "Base FOV (deg)"
+      type: "number"
+      default: 60
+      min: 30
+      max: 120
+    fovBoost:
+      name: "FOV Boost (deg)"
+      type: "number"
+      default: 20
+      min: 0
+      max: 60
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  @import "spherical-math" as S;
+
+  const LOG_TAG = "[tinyskies.cameraRig]";
+
+  // Constants from source CameraRig.ts:4-15 (REQ-011).
+  const FOLLOW_DISTANCE_BOOST = 0.6;
+  const FOLLOW_HEIGHT_BOOST = 0.15;
+  const MIN_CHASE_DISTANCE = 0.42;
+  const POSITION_SMOOTH = 10.0;
+  const LOOKAT_SMOOTH = 9.0;
+  const MAX_TILT = 0.06;
+  const TILT_SMOOTH = 5.0;
+  const ZOOM_SMOOTH = 3.0;
+
+  let game;
+
+  this.init = function (_game) {
+    game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+
+    // Pre-allocated working set (CLAUDE.md hot-path rule).
+    this._qPos = new THREE.Quaternion();
+    this._targetPos = new THREE.Vector3();
+    this._targetLookAt = new THREE.Vector3();
+    this._currentPos = new THREE.Vector3();
+    this._currentLookAt = new THREE.Vector3();
+    this._forward = new THREE.Vector3();
+    this._planeWorldPos = new THREE.Vector3();
+    this._camUp = new THREE.Vector3();
+
+    this._currentZoom = 0;
+    this._currentTilt = 0;
+    this._snapped = false;
+
+    this._log("init");
+  };
+
+  this.update = function (deltaTime) {
+    if (!game || !game.camera) return;
+    const dt = Math.min(deltaTime, 0.1);
+    const camera = game.camera;
+    const store = this.erth.store;
+    const globeRadius = this.getAttribute("globeRadius");
+    const followDist = this.getAttribute("followDistance");
+    const followHeight = this.getAttribute("followHeight");
+    const baseFov = this.getAttribute("baseFov");
+    const fovBoost = this.getAttribute("fovBoost");
+
+    // Read player spherical state from store.
+    const qx = store.get("tinyskies/qx");
+    const qy = store.get("tinyskies/qy");
+    const qz = store.get("tinyskies/qz");
+    const qw = store.get("tinyskies/qw");
+    if (qx === undefined || qw === undefined) return; // flight controller hasn't published yet
+    this._qPos.set(qx, qy, qz, qw);
+    const heading = store.get("tinyskies/heading") || 0;
+    const altitude = store.get("tinyskies/altitude") || 0;
+    const turnRate = store.get("tinyskies/turnRate") || 0;
+    const speedRatio = store.get("tinyskies/speedRatio") || 0;
+
+    const frame = S.tangentFrame(this._qPos);
+    const planeWorldPos = S.cartesianFromSpherical(this._qPos, altitude, globeRadius);
+    this._planeWorldPos.copy(planeWorldPos);
+
+    // Zoom-pull and effective follow geometry (CameraRig.ts:97-101).
+    this._currentZoom += (speedRatio - this._currentZoom) * Math.min(1, ZOOM_SMOOTH * dt);
+    let dist = followDist + FOLLOW_DISTANCE_BOOST * this._currentZoom;
+    dist = Math.max(MIN_CHASE_DISTANCE, dist);
+    const height = followHeight + FOLLOW_HEIGHT_BOOST * this._currentZoom;
+
+    const targetFov = baseFov + fovBoost * this._currentZoom;
+    if (Math.abs(camera.fov - targetFov) > 0.01) {
+      camera.fov = targetFov;
+      if (camera.updateProjectionMatrix) camera.updateProjectionMatrix();
+    }
+
+    // Forward direction on the tangent plane from the player's heading.
+    this._forward
+      .copy(frame.north)
+      .multiplyScalar(Math.cos(heading))
+      .addScaledVector(frame.east, Math.sin(heading))
+      .normalize();
+
+    // Targets — CameraRig.ts:113-118.
+    this._targetPos
+      .copy(this._planeWorldPos)
+      .addScaledVector(this._forward, -dist)
+      .addScaledVector(frame.up, height);
+    this._targetLookAt
+      .copy(this._planeWorldPos)
+      .addScaledVector(this._forward, 0.5);
+
+    if (!this._snapped) {
+      this._currentPos.copy(this._targetPos);
+      this._currentLookAt.copy(this._targetLookAt);
+      this._snapped = true;
+    } else {
+      const closeDamp = THREE.MathUtils.clamp(dist / 0.95, 0.36, 1.0);
+      const posFactor = 1 - Math.exp(-POSITION_SMOOTH * closeDamp * dt);
+      const lookFactor = 1 - Math.exp(-LOOKAT_SMOOTH * closeDamp * 0.78 * dt);
+      this._currentPos.lerp(this._targetPos, posFactor);
+      this._currentLookAt.lerp(this._targetLookAt, lookFactor);
+    }
+
+    camera.position.copy(this._currentPos);
+
+    // Per-frame camera up = surface-radial, so the horizon stays aligned with local
+    // 'down' regardless of the player's orbital position. Source CameraRig.ts:150-152.
+    this._camUp.copy(this._currentPos).normalize();
+    camera.up.copy(this._camUp);
+    camera.lookAt(this._currentLookAt);
+
+    // Banking tilt — CameraRig.ts:154-159.
+    const closeDamp2 = THREE.MathUtils.clamp(dist / 0.95, 0.36, 1.0);
+    const tiltDamp = THREE.MathUtils.clamp(0.45 + 0.55 * closeDamp2, 0, 1);
+    const targetTilt = -turnRate * MAX_TILT * tiltDamp;
+    this._currentTilt += (targetTilt - this._currentTilt) * Math.min(1, TILT_SMOOTH * dt);
+    if (Math.abs(this._currentTilt) > 0.0001) {
+      camera.rotateZ(this._currentTilt);
+    }
+  };
+
+  // No editor preview — the editor drives its own camera. Override would fight it.
+
+  this.dispose = function () {
+    this._log("dispose");
+  };

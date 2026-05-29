@@ -1,0 +1,205 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies God Rays"
+  id: "tinyskies.godRays"
+  author: "script-wizard"
+  isScript: true
+  md: "script.js"
+  main: "script.js"
+  version: "1.0.0"
+  description: "Volumetric sun-shaft cone aligned to the sun direction. Opacity scales with dayWeight."
+  documentation: "Single open cone (CylinderGeometry, top radius 0.5, bottom radius 8, height 18, origin at top tip). Positioned at sunDirection × distance, oriented to look at scene origin so the cone opens out from the sun toward the world. MeshBasicNodeMaterial + TSL with a faux-volumetric streak pattern (multi-frequency sin shafts × vertical fade). Source uses a 3D value-noise shader; TSL noise is verbose, so the WebGPU port uses a faux-shaft approximation that's visually close. Documented in tinyskies-fidelity-decision-record.md."
+  tags:
+    - environment
+    - vfx
+  priority: 0
+  throttleConfig:
+    throttlePriority: "LOW"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    distanceFromOrigin:
+      name: "Cone Distance From Origin"
+      type: "number"
+      default: 14
+      min: 5
+      max: 50
+    coneTopRadius:
+      name: "Cone Top Radius"
+      type: "number"
+      default: 0.5
+      min: 0.1
+      max: 5
+    coneBottomRadius:
+      name: "Cone Bottom Radius"
+      type: "number"
+      default: 8
+      min: 1
+      max: 30
+    coneHeight:
+      name: "Cone Height"
+      type: "number"
+      default: 18
+      min: 1
+      max: 60
+    intensityScale:
+      name: "Intensity Scale"
+      type: "number"
+      default: 0.18
+      min: 0.0
+      max: 1.0
+    rayColor:
+      name: "Ray Color"
+      type: "color"
+      default: "#fff5d8"
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  const LOG_TAG = "[tinyskies.godRays]";
+
+  let game;
+
+  this.init = function (_game) {
+    game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._buildVisuals(this.gameObject._internal.three);
+    this._log("init");
+  };
+
+  this.onEditorAdded = function (editor) {
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._buildVisuals(this.gameObject._internal.three);
+  };
+
+  this.onEditorAttributesUpdated = function () {
+    this._teardownVisuals();
+    this._buildVisuals(this.gameObject._internal.three);
+  };
+
+  this.onEditorDispose = function () {
+    this._teardownVisuals();
+  };
+
+  this.update = function (deltaTime) {
+    const group = this._group;
+    if (!group || !this._timeUniform || !this._opacityUniform) return;
+    const dt = Math.min(deltaTime, 0.1);
+    this._timeUniform.value += dt;
+
+    const dayW = this.erth.store.get("tinyskies/dayWeight");
+    const dayWeight = typeof dayW === "number" ? dayW : 1;
+    this._opacityUniform.value = this.getAttribute("intensityScale") * dayWeight;
+
+    // Position the cone at sunDirection × distance, oriented so the cone opens
+    // toward the world origin.
+    const sunDir = this.erth.store.get("tinyskies/sunDirection");
+    if (sunDir && sunDir.isVector3) {
+      const dist = this.getAttribute("distanceFromOrigin");
+      group.position.set(sunDir.x * dist, sunDir.y * dist, sunDir.z * dist);
+      group.up.set(0, 1, 0);
+      group.lookAt(0, 0, 0);
+    }
+
+    // Update color uniform from attribute (allows live re-tuning).
+    if (this._colorUniform && this._colorUniform.value && this._colorUniform.value.isColor) {
+      this._tmpColor.set(this.getAttribute("rayColor"));
+      this._colorUniform.value.copy(this._tmpColor);
+    }
+  };
+
+  this._buildVisuals = function (parent) {
+    const TSL = THREE.TSL;
+    const topR = this.getAttribute("coneTopRadius");
+    const botR = this.getAttribute("coneBottomRadius");
+    const h = this.getAttribute("coneHeight");
+    const colorAttr = this.getAttribute("rayColor");
+
+    this._tmpColor = new THREE.Color();
+    const baseColor = new THREE.Color().set(colorAttr);
+
+    const group = new THREE.Group();
+    group.name = "tinyskiesGodRaysRoot";
+    group.userData.isRuntimeOnly = true;
+
+    // Open-ended cone with origin at top tip (matches source GodRays.ts:82-84).
+    const geo = new THREE.CylinderGeometry(topR, botR, h, 32, 1, true);
+    geo.translate(0, -h * 0.5, 0);
+
+    // Locals avoid the static-analysis "this._x is set to null in dispose" false
+    // positive; reassigned to `this.*` at the bottom of this function.
+    const timeUniform = TSL.uniform(0);
+    const opacityUniform = TSL.uniform(0.18);
+    const colorUniform = TSL.uniform(baseColor);
+
+    const mat = new THREE.MeshBasicNodeMaterial({
+      transparent: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      blending: THREE.AdditiveBlending,
+      toneMapped: false,
+    });
+
+    // Faux volumetric ray pattern — multi-frequency sin shafts around the cone
+    // (uv.x is the angular coordinate around the cylinder, uv.y is height 0=top → 1=bottom).
+    // Source uses 3D value-noise; this is a cheaper approximation that gives the
+    // same streaky-shaft look without porting noise functions to TSL.
+    const uv = TSL.uv();
+    const shaftA = TSL.pow(TSL.sin(uv.x.mul(24.0).add(timeUniform.mul(0.4))).mul(0.5).add(0.5), TSL.float(3.0));
+    const shaftB = TSL.pow(TSL.sin(uv.x.mul(13.0).sub(timeUniform.mul(0.25)).add(1.7)).mul(0.5).add(0.5), TSL.float(2.5));
+    const shafts = shaftA.mul(0.6).add(shaftB.mul(0.5));
+
+    // Vertical fades — match source exactly.
+    const fadeTop = TSL.smoothstep(TSL.float(0.0), TSL.float(0.45), uv.y);
+    const fadeBot = TSL.smoothstep(TSL.float(1.0), TSL.float(0.65), uv.y);
+    const fadeY = fadeTop.mul(fadeBot);
+
+    const intensity = shafts.mul(fadeY).mul(opacityUniform);
+    mat.colorNode = TSL.vec4(colorUniform.mul(intensity), intensity);
+
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.frustumCulled = false;
+    mesh.renderOrder = 1;
+    mesh.rotation.x = -Math.PI / 2;
+    mesh.userData.isRuntimeOnly = true;
+    group.add(mesh);
+
+    parent.add(group);
+
+    this._group = group;
+    this._mesh = mesh;
+    this._mat = mat;
+    this._geo = geo;
+    this._timeUniform = timeUniform;
+    this._opacityUniform = opacityUniform;
+    this._colorUniform = colorUniform;
+  };
+
+  this._teardownVisuals = function () {
+    if (this._geo) this._geo.dispose();
+    if (this._mat) this._mat.dispose();
+    if (this._group && this._group.parent) this._group.parent.remove(this._group);
+    this._group = null;
+    this._mesh = null;
+    this._mat = null;
+    this._geo = null;
+    this._timeUniform = null;
+    this._opacityUniform = null;
+    this._colorUniform = null;
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    this._teardownVisuals();
+  };

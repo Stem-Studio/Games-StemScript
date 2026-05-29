@@ -1,0 +1,723 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Globe Monuments"
+  id: "tinyskies.globeMonuments"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Final pair of source-deferred landmarks: 1 victory-memorial Statue (procedural figure with vertical beacon beam) and 2 MoonstoneRuin halves (procedural angular crystal-ring fragments with sparse hovering dust). Source loads /3D/statue.glb + /3D/moonstone_left.glb / moonstone_right.glb which we don't have, so geometry is procedural; placement rules and state machine kept verbatim from source. Fidelity tradeoffs documented in FDR-006."
+  documentation: "Statue (Globe.ts:3212) source is gated by post-victory ProgressionManager flag `moonFrozenByEternalFlames`; we ship it unconditionally with the same flat-lowland site selection (seed 626262+seed) and add a vertical TSL beacon beam — visually it reads as a memorial. MoonstoneRuins (Globe.ts:3411) source has 2 halves placed in inland sites (seed 771133+seed) with idle/raising/floating phases driven by `cycleStartAt` timestamps — we only ship the idle phase (gentle hover) since the cinematic union flow is gameplay-driven (we have no MoonstoneCinematic controller). Per-half hovering dust uses InstancedMesh of small sprites with TSL-driven sin motion (engine VFX retrofit possible — see FDR-006)."
+  tags:
+    - visual
+    - environment
+    - landmarks
+  priority: 0
+  throttleConfig:
+    throttlePriority: "HIGH"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    radius:
+      name: "Globe Radius"
+      type: "number"
+      default: 5
+      min: 0.5
+      max: 200
+    terrainSeed:
+      name: "Terrain Seed"
+      type: "number"
+      default: 42
+      min: 1
+      max: 1000000
+    terrainType:
+      name: "Terrain Type"
+      type: "string"
+      default: "default"
+    statueEnabled:
+      name: "Statue Enabled"
+      type: "boolean"
+      default: true
+      description: "Top-level toggle. Independent of `statueAlwaysVisible` and `statueStoreKey`."
+    statueAlwaysVisible:
+      name: "Statue Always Visible"
+      type: "boolean"
+      default: true
+      description: "When true, statue spawns regardless of store-key gate. Default true matches the existing FDR-006 behavior; set false to require the store-key gate (which any future ProgressionManager port can flip)."
+    statueStoreKey:
+      name: "Statue Visibility Store Key"
+      type: "string"
+      default: "tinyskies/statueEnabled"
+      description: "When `statueAlwaysVisible` is false, the statue spawns only if `this.erth.store.get(<this key>) === true`. Mirrors source `ProgressionManager.moonFrozenByEternalFlames` victory gate."
+    moonstoneRuinCount:
+      name: "Moonstone Ruin Count"
+      type: "number"
+      default: 2
+      min: 0
+      max: 6
+    moonstoneCinematicStoreKey:
+      name: "Moonstone Cinematic Trigger Store Key"
+      type: "string"
+      default: "tinyskies/moonstoneCinematicTrigger"
+      description: "Reserved for a future controller. When set to true via `this.erth.store.set(<this key>, true)`, the moonstone halves run a raise → float → union sequence. Currently logs the trigger; full state machine is FDR-006 followup."
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  @import "terrain" as T;
+  @import "spherical-math" as S;
+
+  const LOG_TAG = "[tinyskies.globeMonuments]";
+  const MOONSTONE_FLOAT_HEIGHT = 0.82;
+  const MOONSTONE_HOVER_AMPLITUDE = 0.025;
+
+  function buildSoftSpriteTexture() {
+    const canvas = document.createElement("canvas"); // @check-ok
+    canvas.width = 64;
+    canvas.height = 64;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+    const grad = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+    grad.addColorStop(0, "rgba(255,255,255,1)");
+    grad.addColorStop(0.4, "rgba(255,255,255,0.6)");
+    grad.addColorStop(1, "rgba(255,255,255,0)");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, 64, 64);
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }
+
+  // Walks every mesh vertex transformed to world space, returns the smallest
+  // projection along `normal`. Used by GLB grounding so models rest on the
+  // surface regardless of model-space pivot. Source Globe.ts uses the same
+  // helper inline in createPyramid / createStatue / createMoonstoneRuins.
+  function minVertexProjectionAlongNormal(root, normal) {
+    let minVal = Infinity;
+    const v = new THREE.Vector3();
+    root.updateMatrixWorld(true);
+    root.traverse((child) => {
+      if (!child.isMesh) return;
+      const pos = child.geometry?.attributes?.position;
+      if (!pos) return;
+      for (let i = 0; i < pos.count; i++) {
+        v.fromBufferAttribute(pos, i);
+        v.applyMatrix4(child.matrixWorld);
+        const d = v.dot(normal);
+        if (d < minVal) minVal = d;
+      }
+    });
+    return minVal;
+  }
+
+  function applyRimLight(mat, rimColorHex, intensity, power) {
+    const TSL = THREE.TSL;
+    const c = new THREE.Color(rimColorHex);
+    const viewDir = TSL.normalize(TSL.cameraPosition.sub(TSL.positionWorld));
+    // dFdx/dFdy-derived normal — no `normal` attribute needed, so the material compiles cleanly in shadow / AO passes that strip lighting attrs (avoids TSL "Vertex attribute 'normal' not found" warnings that pin frame budget).
+    const nW = TSL.normalize(TSL.cross(TSL.dFdx(TSL.positionWorld), TSL.dFdy(TSL.positionWorld)));
+    const fresnel = TSL.float(1.0).sub(TSL.dot(viewDir, nW).abs());
+    const rim = TSL.vec3(c.r, c.g, c.b).mul(TSL.float(intensity)).mul(TSL.pow(fresnel, TSL.float(power)));
+    mat.emissiveNode = rim;
+    mat.needsUpdate = true;
+  }
+
+  // -----------------------------------------------------------------
+  // Procedural statue substitute (source loads /3D/statue.glb).
+  // Geometry: pedestal + tapering torso + sphere head + outstretched arms.
+  // Topped with a TSL additive beacon beam (the source attaches a
+  // PackageQuest beam group with color 0x88ccff).
+  // -----------------------------------------------------------------
+
+  function buildStatue() {
+    const TSL = THREE.TSL;
+    const g = new THREE.Group();
+    g.userData.isRuntimeOnly = true;
+
+    const stoneMat = new THREE.MeshStandardNodeMaterial({ color: 0xb8b3a8, flatShading: true, roughness: 0.85, metalness: 0 });
+    applyRimLight(stoneMat, 0xe8e0d0, 0.42, 2.7);
+    const detailMat = new THREE.MeshStandardNodeMaterial({ color: 0x8e8884, flatShading: true, roughness: 0.85, metalness: 0 });
+    applyRimLight(detailMat, 0xd0c8b8, 0.36, 2.7);
+
+    // Pedestal (3-tier)
+    const pedBot = new THREE.BoxGeometry(0.20, 0.04, 0.20); pedBot.translate(0, 0.02, 0);
+    const pedMid = new THREE.BoxGeometry(0.16, 0.03, 0.16); pedMid.translate(0, 0.055, 0);
+    const pedTop = new THREE.BoxGeometry(0.13, 0.025, 0.13); pedTop.translate(0, 0.0825, 0);
+    const pedBotMesh = new THREE.Mesh(pedBot, detailMat); pedBotMesh.userData.isRuntimeOnly = true; g.add(pedBotMesh);
+    const pedMidMesh = new THREE.Mesh(pedMid, stoneMat);  pedMidMesh.userData.isRuntimeOnly = true; g.add(pedMidMesh);
+    const pedTopMesh = new THREE.Mesh(pedTop, detailMat); pedTopMesh.userData.isRuntimeOnly = true; g.add(pedTopMesh);
+
+    // Body (tapered cylinder)
+    const bodyY = 0.095;
+    const bodyH = 0.18;
+    const body = new THREE.CylinderGeometry(0.030, 0.045, bodyH, 12);
+    body.translate(0, bodyY + bodyH / 2, 0);
+    const bodyMesh = new THREE.Mesh(body, stoneMat); bodyMesh.castShadow = true; bodyMesh.userData.isRuntimeOnly = true; g.add(bodyMesh);
+
+    // Robe folds (vertical stripes at the base)
+    for (let i = 0; i < 6; i++) {
+      const a = (i / 6) * Math.PI * 2;
+      const fold = new THREE.BoxGeometry(0.008, 0.12, 0.008);
+      fold.translate(Math.cos(a) * 0.04, bodyY + 0.06, Math.sin(a) * 0.04);
+      const foldMesh = new THREE.Mesh(fold, detailMat);
+      foldMesh.userData.isRuntimeOnly = true;
+      g.add(foldMesh);
+    }
+
+    // Outstretched arms (boxes rotated outward)
+    const armY = bodyY + bodyH * 0.85;
+    for (const side of [-1, 1]) {
+      const arm = new THREE.BoxGeometry(0.06, 0.014, 0.014);
+      arm.translate(side * 0.05, armY, 0);
+      arm.rotateZ(side * -0.3);
+      const armMesh = new THREE.Mesh(arm, stoneMat);
+      armMesh.userData.isRuntimeOnly = true;
+      g.add(armMesh);
+      // Hand
+      const hand = new THREE.SphereGeometry(0.012, 7, 5);
+      hand.translate(side * 0.085, armY + side * 0.015, 0);
+      const handMesh = new THREE.Mesh(hand, stoneMat);
+      handMesh.userData.isRuntimeOnly = true;
+      g.add(handMesh);
+    }
+
+    // Head
+    const headY = bodyY + bodyH + 0.018;
+    const head = new THREE.SphereGeometry(0.025, 12, 10);
+    head.translate(0, headY + 0.025, 0);
+    const headMesh = new THREE.Mesh(head, stoneMat); headMesh.castShadow = true; headMesh.userData.isRuntimeOnly = true; g.add(headMesh);
+
+    // Crown / halo (thin torus above head)
+    const halo = new THREE.TorusGeometry(0.022, 0.003, 6, 16);
+    halo.rotateX(Math.PI / 2);
+    halo.translate(0, headY + 0.062, 0);
+    const haloMat = new THREE.MeshStandardNodeMaterial({ color: 0xd8c890, flatShading: true, roughness: 0.4, metalness: 0.6 });
+    haloMat.emissiveNode = TSL.vec3(0.9, 0.78, 0.5).mul(TSL.float(0.8));
+    const haloMesh = new THREE.Mesh(halo, haloMat); haloMesh.userData.isRuntimeOnly = true; g.add(haloMesh);
+
+    // Beacon beam — vertical cylinder above the statue with TSL fade.
+    // Length-fade from base (full) to top (transparent).
+    const beamH = 2.0;
+    const beamGeo = new THREE.CylinderGeometry(0.018, 0.05, beamH, 12, 1, true);
+    beamGeo.translate(0, headY + 0.08 + beamH / 2, 0);
+    const beamMat = new THREE.MeshBasicNodeMaterial({
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      side: THREE.DoubleSide,
+    });
+    const beamColor = TSL.vec3(0.55, 0.78, 1.0); // 0x88ccff source color
+    const lenFade = TSL.float(1.0).sub(TSL.uv().y);
+    beamMat.colorNode = beamColor;
+    beamMat.opacityNode = lenFade.mul(TSL.float(0.55));
+    const beam = new THREE.Mesh(beamGeo, beamMat);
+    beam.userData.isRuntimeOnly = true;
+    g.add(beam);
+
+    return g;
+  }
+
+  // -----------------------------------------------------------------
+  // Procedural moonstone-ruin half. Source has GLB-loaded ornate ring
+  // halves; we substitute with an arched crystal slab — angular,
+  // glowing, blue-white. Two halves per ruin, mirrored.
+  // -----------------------------------------------------------------
+
+  function buildMoonstoneHalf(mirrored) {
+    const TSL = THREE.TSL;
+    const g = new THREE.Group();
+    g.userData.isRuntimeOnly = true;
+
+    const baseMat = new THREE.MeshStandardNodeMaterial({
+      color: 0xc8d8e8,
+      flatShading: true,
+      roughness: 0.45,
+      metalness: 0.15,
+    });
+    baseMat.emissiveNode = TSL.vec3(0.55, 0.7, 0.95).mul(TSL.float(0.45));
+    applyRimLight(baseMat, 0xfff1c0, 0.7, 2.6);
+
+    const detailMat = new THREE.MeshStandardNodeMaterial({
+      color: 0xa8b8d0,
+      flatShading: true,
+      roughness: 0.55,
+      metalness: 0.2,
+    });
+    detailMat.emissiveNode = TSL.vec3(0.4, 0.55, 0.85).mul(TSL.float(0.32));
+
+    // Build a half-arch — 5 faceted blocks following a quarter-circle arc.
+    // Source's GLB is one large ring half ~0.875 max-dim; we approximate
+    // with ~7 segments curving from base to apex.
+    const SEGMENTS = 7;
+    const archR = 0.30;
+    const archH = 0.36;
+    const sideSign = mirrored ? -1 : 1;
+    for (let i = 0; i < SEGMENTS; i++) {
+      const t = i / (SEGMENTS - 1);
+      const angle = sideSign * (Math.PI * 0.5 * t);
+      const x = sideSign * Math.cos(angle - sideSign * Math.PI * 0.5) * archR;
+      const y = archH * t;
+      const z = 0;
+      const segH = 0.10 - t * 0.04;
+      const segW = 0.08 - t * 0.02;
+      const segD = 0.05;
+      const block = new THREE.BoxGeometry(segW, segH, segD);
+      // Tilt to follow the arc
+      block.rotateZ(-sideSign * angle);
+      block.translate(x, y, z);
+      const mesh = new THREE.Mesh(block, i % 2 === 0 ? baseMat : detailMat);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      mesh.userData.isRuntimeOnly = true;
+      g.add(mesh);
+    }
+    // A small angular crystal at the apex
+    const apex = new THREE.OctahedronGeometry(0.05, 0);
+    apex.translate(0, archH + 0.02, 0);
+    const apexMesh = new THREE.Mesh(apex, baseMat);
+    apexMesh.castShadow = true;
+    apexMesh.userData.isRuntimeOnly = true;
+    g.add(apexMesh);
+
+    // Buried base anchor (so the half reads as ruin)
+    const buried = new THREE.BoxGeometry(0.12, 0.09, 0.10);
+    buried.translate(sideSign * archR * 0.7, -0.03, 0);
+    buried.rotateZ(sideSign * 0.2);
+    const buriedMesh = new THREE.Mesh(buried, detailMat);
+    buriedMesh.userData.isRuntimeOnly = true;
+    g.add(buriedMesh);
+
+    return g;
+  }
+
+  // -----------------------------------------------------------------
+  // Lifecycle
+  // -----------------------------------------------------------------
+
+  let game;
+
+  this.init = function (_game) {
+    game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._buildVisuals(this.gameObject._internal.three);
+    this._registerParticleSystemsWithBatchedRenderer();
+    this._log("init");
+  };
+
+  this.onEditorAdded = function () {
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._buildVisuals(this.gameObject._internal.three);
+  };
+
+  this.onEditorAttributesUpdated = function () {
+    this._teardownVisuals();
+    this._buildVisuals(this.gameObject._internal.three);
+  };
+
+  this.onEditorDispose = function () {
+    this._teardownVisuals();
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    this._teardownVisuals();
+  };
+
+  // Source Globe.ts:5660-5700 idle moonstone update — gentle hover via
+  // sin(time * 0.7) * 0.02 along normal + tiny tangent/bitangent jitter.
+  // We restrict to the idle phase because we don't have the cinematic
+  // post-union state machine.
+  this.update = function (deltaTime) {
+    if (!this._root) return;
+    const dt = Math.min(deltaTime, 0.1);
+    this._time = (this._time || 0) + dt;
+    const t = this._time;
+
+    // Cinematic trigger hook — store-key polling. When a future controller
+    // sets this key to true, the moonstone halves enter a raise → float
+    // sequence. We log the rising edge here; the full state machine is
+    // FDR-006 followup work (see source Globe.ts:5660-5731 update branch
+    // for the raise/floating/postUnion phases).
+    const triggerKey = this.getAttribute("moonstoneCinematicStoreKey");
+    if (triggerKey) {
+      const triggered = this.erth.store.get(triggerKey) === true;
+      if (triggered && !this._cinematicTriggered) {
+        this._cinematicTriggered = true;
+        this._log("moonstone cinematic trigger received — full state machine is FDR-006 followup");
+      } else if (!triggered && this._cinematicTriggered) {
+        this._cinematicTriggered = false;
+      }
+    }
+
+    // Hover the moonstone halves
+    if (this._moonstoneRuins) {
+      for (let i = 0; i < this._moonstoneRuins.length; i++) {
+        const ruin = this._moonstoneRuins[i];
+        const hover = Math.sin(t * 0.7 + i * 1.31) * MOONSTONE_HOVER_AMPLITUDE;
+        const k = i * 2.31;
+        const wobble = 0.1;
+        ruin.root.position.copy(ruin.basePosition);
+        ruin.root.position.addScaledVector(ruin.normal, hover);
+        ruin.root.position.addScaledVector(ruin.tangent, Math.sin(t * 19.2 + k) * 0.012 * wobble);
+        ruin.root.position.addScaledVector(ruin.bitangent, Math.cos(t * 16.7 + k * 1.3) * 0.012 * wobble);
+        ruin.root.quaternion.copy(ruin.restQuaternion);
+        ruin.root.rotateOnWorldAxis(ruin.tangent, Math.sin(t * 21.4 + k) * 0.02);
+        ruin.root.rotateOnWorldAxis(ruin.bitangent, Math.cos(t * 18.9 + k * 0.9) * 0.02);
+      }
+    }
+
+    // Moonstone dust is now driven by the engine BatchedRenderer; no
+    // per-frame matrix update needed in this behavior.
+  };
+
+  // -----------------------------------------------------------------
+  // Builders
+  // -----------------------------------------------------------------
+
+  this._buildVisuals = function (parent) {
+    const radius = this.getAttribute("radius");
+    const seed = this.getAttribute("terrainSeed");
+    const terrainType = this.getAttribute("terrainType");
+
+    const root = new THREE.Group();
+    root.name = "tinyskiesGlobeMonuments";
+    root.userData.isRuntimeOnly = true;
+
+    this._moonstoneRuins = [];
+    this._particleEmitters = null;
+    this._batchedRenderer = null;
+    this._time = 0;
+
+    if (this.getAttribute("statueEnabled")) {
+      this._buildStatue(root, radius, seed, terrainType);
+    }
+    this._buildMoonstoneRuins(root, radius, seed, terrainType, this.getAttribute("moonstoneRuinCount"));
+
+    parent.add(root);
+    this._root = root;
+  };
+
+  // Source Globe.ts:3212 createStatue — picks 1 flat lowland (relax-cap
+  // roughness retry; we simplify to a single 0.14 cap). Source seeds
+  // 626262+seed (search), 919191+seed (spin).
+  this._buildStatue = function (root, radius, seed, terrainType) {
+    const rand = S.seededRandom(626262 + seed);
+    const propSink = T.getPropTerrainSink();
+    const REF_UP = new THREE.Vector3(0, 1, 0);
+    const MIN_E = 0.02, MAX_E = 0.32;
+    const INLAND_CHECKS = 8, INLAND_CHECK_DIST = 0.07, MAX_WATER = 0.26;
+    const ROUGH_RING_DIST = 0.09;
+
+    const ROUGHNESS_CAPS = [0.14, 0.22, 0.3];
+    let chosen = null;
+    for (const cap of ROUGHNESS_CAPS) {
+      const pool = [];
+      let attempts = 0;
+      while (attempts < 12000 && pool.length < 400) {
+        attempts++;
+        const theta = rand() * Math.PI * 2;
+        const phi = Math.acos(2 * rand() - 1);
+        const nx = Math.sin(phi) * Math.cos(theta);
+        const ny = Math.cos(phi);
+        const nz = Math.sin(phi) * Math.sin(theta);
+        const sample = T.sampleTerrain(seed, terrainType, nx, ny, nz);
+        if (!sample.isLand) continue;
+        if (sample.elevation < MIN_E || sample.elevation > MAX_E) continue;
+        if (T.waterRatioAround(seed, terrainType, nx, ny, nz, INLAND_CHECK_DIST, INLAND_CHECKS) > MAX_WATER) continue;
+        const rough = T.terrainRingElevationRoughness(seed, terrainType, nx, ny, nz, ROUGH_RING_DIST);
+        if (rough > cap) continue;
+        pool.push({ normal: new THREE.Vector3(nx, ny, nz), elevation: sample.elevation, rough });
+      }
+      if (pool.length > 0) {
+        pool.sort((a, b) => a.rough - b.rough || a.elevation - b.elevation);
+        chosen = pool[0].normal;
+        break;
+      }
+    }
+    if (!chosen) return;
+
+    const spin = S.seededRandom(919191 + seed);
+    const disp = T.surfaceDisplacementAt(seed, terrainType, chosen.x, chosen.y, chosen.z);
+    const surfaceR = radius + disp - propSink;
+
+    // GLB-template clone path. Source Globe.ts:3286-3382 loads /3D/statue.glb
+    // at TARGET_MAX_DIM=0.42 with the ProgressionManager
+    // `moonFrozenByEternalFlames` victory gate. We replicate the geometry
+    // load via the imported StatueModel template; the gate is now a store
+    // key (`tinyskies/statueEnabled`, default false) so any future
+    // ProgressionManager port can flip it without touching this behavior.
+    const TARGET_MAX_DIM = 0.42;
+    const statueTemplate = game?.scene?.getObjectByName?.("StatueModel") || null;
+    const gateKey = this.getAttribute("statueStoreKey") || "tinyskies/statueEnabled";
+    const gateOpen = this.getAttribute("statueAlwaysVisible") === true
+      || this.erth.store.get(gateKey) === true;
+    if (!gateOpen) {
+      this._log("statue gated by store key", gateKey, "— skipping spawn");
+      // Track the chosen normal so re-spawn (if the gate later opens via
+      // store update) lands at the same site.
+      this._statuePendingSite = chosen.clone();
+      return;
+    }
+
+    let statue;
+    if (statueTemplate) {
+      statue = statueTemplate.clone(true);
+      statue.userData = statue.userData || {};
+      statue.userData.isRuntimeOnly = true;
+      statue.traverse((c) => {
+        if (c) {
+          c.userData = c.userData || {};
+          c.userData.isRuntimeOnly = true;
+          if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; }
+          c.visible = true;
+        }
+      });
+      statue.visible = true;
+      const box = new THREE.Box3().setFromObject(statue);
+      const size = new THREE.Vector3();
+      box.getSize(size);
+      const maxDim = Math.max(size.x, size.y, size.z, 1e-4);
+      statue.scale.setScalar(TARGET_MAX_DIM / maxDim);
+    } else {
+      statue = buildStatue();
+    }
+
+    statue.position.copy(chosen.clone().multiplyScalar(surfaceR));
+    statue.quaternion.setFromUnitVectors(REF_UP, chosen);
+    statue.rotateY(spin() * Math.PI * 2);
+    if (statueTemplate) {
+      statue.updateMatrixWorld(true);
+      const lift = surfaceR - minVertexProjectionAlongNormal(statue, chosen);
+      if (Number.isFinite(lift)) statue.position.addScaledVector(chosen, lift);
+    }
+    root.add(statue);
+    this._log("statue placed at elevation",
+      T.sampleTerrain(seed, terrainType, chosen.x, chosen.y, chosen.z).elevation.toFixed(3),
+      statueTemplate ? "(GLB)" : "(procedural fallback)");
+  };
+
+  // Source Globe.ts:3411 createMoonstoneRuins — places `count` halves at
+  // inland sites (seed 771133+seed). Idle hover only; cinematic union
+  // phase deferred (no controller in our port).
+  this._buildMoonstoneRuins = function (root, radius, seed, terrainType, count) {
+    if (count === 0) return;
+    const rand = S.seededRandom(771133 + seed);
+    const propSink = T.getPropTerrainSink();
+    const REF_UP = new THREE.Vector3(0, 1, 0);
+    const MIN_E = 0.06, MAX_E = 0.7, MIN_SEP = 0.84;
+    const INLAND_CHECKS = 8, INLAND_CHECK_DIST = 0.07, MAX_WATER = 0.26;
+    const ROUGH_RING_DIST = 0.085, MAX_ROUGH = 0.26;
+
+    const candidates = [];
+    let attempts = 0;
+    while (attempts < 8000 && candidates.length < 220) {
+      attempts++;
+      const theta = rand() * Math.PI * 2;
+      const phi = Math.acos(2 * rand() - 1);
+      const nx = Math.sin(phi) * Math.cos(theta);
+      const ny = Math.cos(phi);
+      const nz = Math.sin(phi) * Math.sin(theta);
+      const sample = T.sampleTerrain(seed, terrainType, nx, ny, nz);
+      if (!sample.isLand) continue;
+      if (sample.elevation < MIN_E || sample.elevation > MAX_E) continue;
+      if (T.waterRatioAround(seed, terrainType, nx, ny, nz, INLAND_CHECK_DIST, INLAND_CHECKS) > MAX_WATER) continue;
+      if (T.terrainRingElevationRoughness(seed, terrainType, nx, ny, nz, ROUGH_RING_DIST) > MAX_ROUGH) continue;
+      candidates.push({ normal: new THREE.Vector3(nx, ny, nz), elevation: sample.elevation });
+    }
+    candidates.sort((a, b) => a.elevation - b.elevation);
+
+    const chosen = [];
+    for (const c of candidates) {
+      if (chosen.length >= count) break;
+      let tooClose = false;
+      for (const v of chosen) { if (c.normal.dot(v) > MIN_SEP) { tooClose = true; break; } }
+      if (!tooClose) chosen.push(c.normal);
+    }
+    if (chosen.length === 0) return;
+
+    const spin = S.seededRandom(991122 + seed);
+
+    for (let i = 0; i < chosen.length; i++) {
+      const normal = chosen[i];
+      const disp = T.surfaceDisplacementAt(seed, terrainType, normal.x, normal.y, normal.z);
+      const surfaceR = radius + disp - propSink;
+      const basePosition = normal.clone().multiplyScalar(surfaceR);
+
+      // GLB-template clone path. Source Globe.ts:3504-3577 alternates
+      // /3D/moonstone_left.glb and /3D/moonstone_right.glb at
+      // TARGET_MAX_DIM=0.875 with BURY_DEPTH_RATIO=0.44 (sink along
+      // normal so the half reads as ruin). The per-half tilt
+      // (TILT_ORNATE_TOWARD_SKY=0.36, TILT_DIAGONAL=0.14 with sign
+      // flip per index) is preserved.
+      const TARGET_MAX_DIM = 0.875;
+      const BURY_DEPTH_RATIO = 0.44;
+      const halfTemplateName = (i % 2 === 0) ? "MoonstoneLeftModel" : "MoonstoneRightModel";
+      const halfTemplate = game?.scene?.getObjectByName?.(halfTemplateName) || null;
+
+      // Tangent basis for hover wobble + dust placement (computed early so
+      // we can apply tilts to the cloned model before storing restQuaternion)
+      let tangent = new THREE.Vector3(-normal.y, normal.x, 0);
+      if (tangent.lengthSq() < 1e-6) tangent.set(0, -normal.z, normal.y);
+      tangent.normalize();
+      const bitangent = new THREE.Vector3().crossVectors(normal, tangent).normalize();
+
+      let half;
+      if (halfTemplate) {
+        half = halfTemplate.clone(true);
+        half.userData = half.userData || {};
+        half.userData.isRuntimeOnly = true;
+        half.traverse((c) => {
+          if (c) {
+            c.userData = c.userData || {};
+            c.userData.isRuntimeOnly = true;
+            if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; }
+            c.visible = true;
+          }
+        });
+        half.visible = true;
+        const box = new THREE.Box3().setFromObject(half);
+        const size = new THREE.Vector3();
+        box.getSize(size);
+        const maxDim = Math.max(size.x, size.y, size.z, 1e-4);
+        half.scale.setScalar(TARGET_MAX_DIM / maxDim);
+      } else {
+        half = buildMoonstoneHalf(i % 2 === 1);
+      }
+
+      half.position.copy(basePosition);
+      half.quaternion.setFromUnitVectors(REF_UP, normal);
+      half.rotateY(spin() * Math.PI * 2 + i * 2.17);
+      half.rotateOnWorldAxis(tangent, 0.36);  // TILT_ORNATE_TOWARD_SKY
+      half.rotateOnWorldAxis(bitangent, 0.14 * (i === 0 ? 1 : -1));
+
+      // Source Globe.ts:3549-3551 grounds the lowest mesh vertex onto the
+      // surface, then sinks by BURY_DEPTH_RATIO * TARGET_MAX_DIM to read as
+      // a half-buried ruin.
+      if (halfTemplate) {
+        half.updateMatrixWorld(true);
+        const lift = surfaceR - minVertexProjectionAlongNormal(half, normal);
+        if (Number.isFinite(lift)) half.position.addScaledVector(normal, lift);
+        half.position.addScaledVector(normal, -BURY_DEPTH_RATIO * TARGET_MAX_DIM);
+      }
+      const restQuaternion = half.quaternion.clone();
+
+      root.add(half);
+
+      this._moonstoneRuins.push({
+        root: half,
+        normal: normal.clone(),
+        basePosition,
+        tangent,
+        bitangent,
+        restQuaternion,
+      });
+
+      // Per-ruin dust emitter — three.quarks ParticleSystem rising from
+      // basePosition along the surface normal. Replaces the prior
+      // procedural InstancedMesh + per-frame update logic with engine-
+      // batched particles.
+      const dustEmitter = this._addMoonstoneDust(basePosition, normal);
+      if (dustEmitter) root.add(dustEmitter);
+    }
+    this._log("moonstone ruins placed", chosen.length);
+  };
+
+  this._addMoonstoneDust = function (basePosition, normal) {
+    if (typeof ParticleSystem === "undefined") return null;
+    if (!this._spriteTexture) this._spriteTexture = buildSoftSpriteTexture();
+    if (!this._spriteTexture) return null;
+    if (!this._particleEmitters) this._particleEmitters = [];
+
+    const mat = new THREE.MeshBasicNodeMaterial({
+      map: this._spriteTexture,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    });
+    const ps = new ParticleSystem({
+      duration: 6,
+      looping: true,
+      // Slow rise — moonstone dust drifts upward over a few seconds
+      startLife: new Quarks.IntervalValue(2.0, 3.5),
+      startSpeed: new Quarks.IntervalValue(0.05, 0.12),
+      startSize: new Quarks.IntervalValue(0.012, 0.022),
+      // Pale moonlight blue (matches procedural color 0.85, 0.92, 1.0)
+      startColor: new Quarks.RandomColor(
+        new THREE.Vector4(0.85, 0.92, 1.00, 0.65),
+        new THREE.Vector4(0.78, 0.85, 0.98, 0.55),
+      ),
+      emissionOverTime: new Quarks.ConstantValue(8),
+      shape: new SphereEmitter({ radius: 0.18 }),
+      material: mat,
+      renderMode: Quarks.RenderMode.BillBoard,
+      worldSpace: true,
+    });
+    const emitter = new ParticleEmitter(ps);
+    emitter.userData.isRuntimeOnly = true;
+    emitter.position.copy(basePosition);
+    emitter.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), normal);
+    this._particleEmitters.push(emitter);
+    return emitter;
+  };
+
+  this._registerParticleSystemsWithBatchedRenderer = function () {
+    if (!this._particleEmitters || this._particleEmitters.length === 0) return;
+    const br = game?.scene?.getObjectByProperty?.("type", "BatchedRenderer");
+    if (!br) {
+      this._log("BatchedRenderer not found — particles will not render this frame");
+      return;
+    }
+    for (const e of this._particleEmitters) {
+      if (e && e.system) br.addSystem(e.system);
+    }
+    this._batchedRenderer = br;
+  };
+
+  this._teardownVisuals = function () {
+    if (!this._root) return;
+    if (this._batchedRenderer && this._particleEmitters) {
+      for (const e of this._particleEmitters) {
+        if (e && e.system) {
+          try { this._batchedRenderer.deleteSystem(e.system); } catch (_) {}
+        }
+      }
+    }
+    if (this._particleEmitters) {
+      for (const e of this._particleEmitters) {
+        if (e && e.system && typeof e.system.dispose === "function") {
+          try { e.system.dispose(); } catch (_) {}
+        }
+      }
+    }
+    if (this._spriteTexture) {
+      try { this._spriteTexture.dispose(); } catch (_) {}
+      this._spriteTexture = null;
+    }
+    this._root.traverse((child) => {
+      if (child.geometry && typeof child.geometry.dispose === "function") child.geometry.dispose();
+      if (child.material) {
+        if (Array.isArray(child.material)) {
+          for (const m of child.material) if (m && typeof m.dispose === "function") m.dispose();
+        } else if (typeof child.material.dispose === "function") {
+          child.material.dispose();
+        }
+      }
+    });
+    if (this._root.parent) this._root.parent.remove(this._root);
+    this._root = null;
+    this._moonstoneRuins = null;
+    this._particleEmitters = null;
+    this._batchedRenderer = null;
+    this._time = 0;
+  };

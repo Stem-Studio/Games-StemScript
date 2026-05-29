@@ -1,0 +1,173 @@
+# Black Hole orbit camera behavior
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+config:
+  name: "BH Orbit Camera"
+  id: "bh.orbitCamera"
+  author: "conversion"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  priority: 0
+  description: "Minimal orbit camera replacement for the upstream
+    OrbitControls. LMB-drag orbits yaw/pitch around the origin; mouse-wheel
+    zooms in/out. Mirrors the source's 'debug' camera mode."
+  tags: [camera]
+  attributes:
+    fov:
+      name: "FOV (deg)"
+      type: "number"
+      default: 45
+    distance:
+      name: "Initial Distance"
+      type: "number"
+      default: 7
+    distanceMin:
+      name: "Distance Min"
+      type: "number"
+      default: 2
+    distanceMax:
+      name: "Distance Max"
+      type: "number"
+      default: 50
+    initialPitchDeg:
+      name: "Initial Pitch (deg)"
+      type: "number"
+      default: 18
+    initialYawDeg:
+      name: "Initial Yaw (deg)"
+      type: "number"
+      default: 30
+    yawSensitivity:
+      name: "Drag Yaw Sensitivity"
+      type: "number"
+      default: 0.005
+    pitchSensitivity:
+      name: "Drag Pitch Sensitivity"
+      type: "number"
+      default: 0.005
+    pitchClampDeg:
+      name: "Pitch Clamp (deg)"
+      type: "number"
+      default: 80
+    zoomStep:
+      name: "Zoom Wheel Step"
+      type: "number"
+      default: 0.5
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+  throttleConfig:
+    throttlePriority: "HIGH"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  documentation: Mouse-drag orbit camera around the origin with wheel zoom.
+code: |
+  let game;
+  const LOG_TAG = "[bh.orbitCamera]";
+
+  this.init = function (_game) {
+    game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) {
+        console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+      }
+    };
+    this._fov = this.getAttribute("fov") ?? 45;
+    this._distance = this.getAttribute("distance") ?? 7;
+    this._distanceMin = this.getAttribute("distanceMin") ?? 2;
+    this._distanceMax = this.getAttribute("distanceMax") ?? 50;
+    this._yawSens = this.getAttribute("yawSensitivity") ?? 0.005;
+    this._pitchSens = this.getAttribute("pitchSensitivity") ?? 0.005;
+    this._pitchClamp = THREE.MathUtils.degToRad(this.getAttribute("pitchClampDeg") ?? 80);
+    this._zoomStep = this.getAttribute("zoomStep") ?? 0.5;
+
+    this._yaw = THREE.MathUtils.degToRad(this.getAttribute("initialYawDeg") ?? 30);
+    this._pitch = THREE.MathUtils.degToRad(this.getAttribute("initialPitchDeg") ?? 18);
+
+    this._dragging = false;
+    this._lastClientX = 0;
+    this._lastClientY = 0;
+    this._mouseDownHandler = null;
+    this._mouseUpHandler = null;
+    this._mouseMoveHandler = null;
+    this._wheelHandler = null;
+  };
+
+  this.onStart = function () {
+    const cam = game?.camera;
+    if (cam) {
+      cam.fov = this._fov;
+      cam.near = 0.1;
+      cam.far = 2000;
+      cam.updateProjectionMatrix();
+    }
+
+    if (typeof window !== "undefined") {
+      const canvas = (game && game.renderer && game.renderer.domElement) || null;
+      if (canvas) {
+        this._mouseDownHandler = (e) => {
+          if (e.button === 0) {
+            this._dragging = true;
+            this._lastClientX = e.clientX;
+            this._lastClientY = e.clientY;
+          }
+        };
+        this._mouseUpHandler = (e) => {
+          if (e.button === 0) this._dragging = false;
+        };
+        this._mouseMoveHandler = (e) => {
+          if (!this._dragging) return;
+          const dx = e.clientX - this._lastClientX;
+          const dy = e.clientY - this._lastClientY;
+          this._lastClientX = e.clientX;
+          this._lastClientY = e.clientY;
+          this._yaw -= dx * this._yawSens;
+          this._pitch -= dy * this._pitchSens;
+          if (this._pitch > this._pitchClamp) this._pitch = this._pitchClamp;
+          if (this._pitch < -this._pitchClamp) this._pitch = -this._pitchClamp;
+        };
+        this._wheelHandler = (e) => {
+          const direction = e.deltaY > 0 ? 1 : -1;
+          this._distance = Math.max(this._distanceMin, Math.min(this._distanceMax, this._distance + direction * this._zoomStep));
+          e.preventDefault();
+        };
+        canvas.addEventListener("mousedown", this._mouseDownHandler); // @check-ok — canvas DOM element listener
+        canvas.addEventListener("mouseup", this._mouseUpHandler); // @check-ok — canvas DOM element listener
+        canvas.addEventListener("mousemove", this._mouseMoveHandler); // @check-ok — canvas DOM element listener
+        canvas.addEventListener("wheel", this._wheelHandler, { passive: false }); // @check-ok — wheel zoom
+      }
+    }
+  };
+
+  this.update = function (_deltaTime) {
+    const cam = game?.camera;
+    if (!cam) return;
+    const cosP = Math.cos(this._pitch);
+    const sinP = Math.sin(this._pitch);
+    const x = -Math.sin(this._yaw) * cosP * this._distance;
+    const y = -sinP * this._distance;
+    const z = -Math.cos(this._yaw) * cosP * this._distance;
+    cam.position.set(x, y, z);
+    cam.lookAt(0, 0, 0);
+  };
+
+  this.dispose = function () {
+    if (typeof window !== "undefined") {
+      const canvas = (game && game.renderer && game.renderer.domElement) || null;
+      if (canvas) {
+        if (this._mouseDownHandler) canvas.removeEventListener("mousedown", this._mouseDownHandler);
+        if (this._mouseUpHandler) canvas.removeEventListener("mouseup", this._mouseUpHandler);
+        if (this._mouseMoveHandler) canvas.removeEventListener("mousemove", this._mouseMoveHandler);
+        if (this._wheelHandler) canvas.removeEventListener("wheel", this._wheelHandler);
+      }
+    }
+    this._mouseDownHandler = null;
+    this._mouseUpHandler = null;
+    this._mouseMoveHandler = null;
+    this._wheelHandler = null;
+  };

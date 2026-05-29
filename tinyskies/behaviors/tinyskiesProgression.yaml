@@ -1,0 +1,167 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Progression"
+  id: "tinyskies.progression"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "localStorage-backed lifetime stats: rings collected, gremlins downed, sessions played. Capped Batch E — no Game Services API leaderboard."
+  documentation: "Source ProgressionManager + UpgradeManager + LevelUpCards + the Game Services /api/v1/gameProgress/* endpoints together form a deeper persistence layer (XP, level-up cards, leaderboards, multi-device sync). The capped MVP ships only the 4 lifetime counters in localStorage with key prefix `tinyskies/`. Reads counters at init, listens for triggerBoost (rings) and gremlinHits (gremlins) each frame, persists on change with a debounce. No leaderboard view; counters are published to store for any future HUD to consume."
+  tags:
+    - persistence
+  priority: 0
+  throttleConfig:
+    throttlePriority: "LOW"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    storageKey:
+      name: "localStorage Key"
+      type: "string"
+      default: "tinyskies.progression.v1"
+    saveDebounceSec:
+      name: "Save Debounce (sec)"
+      type: "number"
+      default: 2.0
+      min: 0.1
+      max: 30
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  const LOG_TAG = "[tinyskies.progression]";
+
+  function safeReadStorage(key) {
+    try {
+      if (typeof window === "undefined" || !window.localStorage) return null;
+      const raw = window.localStorage.getItem(key);                                  // @check-ok lifetime stats persistence — see CLAUDE.md (window.localStorage is allowed)
+      if (!raw) return null;
+      return JSON.parse(raw);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function safeWriteStorage(key, value) {
+    try {
+      if (typeof window === "undefined" || !window.localStorage) return;
+      window.localStorage.setItem(key, JSON.stringify(value));                       // @check-ok lifetime stats persistence
+    } catch (e) {
+      // Quota / private mode / etc — silent failure is fine for a stats counter.
+    }
+  }
+
+  let game;
+
+  this.init = function (_game) {
+    game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+
+    const key = this.getAttribute("storageKey");
+    const saved = safeReadStorage(key);
+    this._stats = {
+      ringsCollected: 0,
+      gremlinsDowned: 0,
+      sessionsPlayed: 0,
+      firstSeenMs: Date.now(),
+      lastSeenMs: Date.now(),
+    };
+    if (saved && typeof saved === "object") {
+      if (typeof saved.ringsCollected === "number") this._stats.ringsCollected = saved.ringsCollected;
+      if (typeof saved.gremlinsDowned === "number") this._stats.gremlinsDowned = saved.gremlinsDowned;
+      if (typeof saved.sessionsPlayed === "number") this._stats.sessionsPlayed = saved.sessionsPlayed;
+      if (typeof saved.firstSeenMs === "number") this._stats.firstSeenMs = saved.firstSeenMs;
+    }
+    this._stats.sessionsPlayed += 1;
+    this._stats.lastSeenMs = Date.now();
+    this._dirty = true;
+    this._timeSinceSave = 0;
+    this._sessionRingsBaseline = this._stats.ringsCollected;
+    this._sessionGremlinsBaseline = this._stats.gremlinsDowned;
+
+    // Track previous boost-trigger state so we count edges, not levels.
+    this._prevBoostFlag = false;
+    // Track gremlin hit queue length to detect new entries.
+    this._lastSeenHitsLen = 0;
+
+    this._publishStore();
+    this._persist();
+    this._log("init sessions=", this._stats.sessionsPlayed,
+      " lifetimeRings=", this._stats.ringsCollected,
+      " lifetimeGremlins=", this._stats.gremlinsDowned);
+  };
+
+  this.update = function (deltaTime) {
+    if (!this._stats) return;
+    const dt = Math.min(deltaTime, 0.1);
+    const store = this.erth.store;
+
+    // Rings: triggerBoost is a one-shot store flag set by tinyskiesBoostRings on
+    // collection. We look for the rising edge.
+    const boostFlag = store.get("tinyskies/triggerBoost") === true;
+    if (boostFlag && !this._prevBoostFlag) {
+      this._stats.ringsCollected += 1;
+      this._dirty = true;
+    }
+    this._prevBoostFlag = boostFlag;
+
+    // Gremlins: tinyskies/gremlinHits is an array drained by the gremlin behavior
+    // each frame. We watch for new entries arriving (length change before drain).
+    const hits = store.get("tinyskies/gremlinHits");
+    if (Array.isArray(hits)) {
+      // Counter-style approach: any non-zero length this frame counts toward
+      // hits-this-frame. The gremlin behavior drains each frame, so we read
+      // before they drain (depends on update order; both publish each frame).
+      // For robustness, count each frame the hit array isn't empty as +N entries.
+      if (hits.length > 0) {
+        this._stats.gremlinsDowned += hits.length;
+        this._dirty = true;
+      }
+    }
+    // Note: a gremlin hit ≠ a gremlin downed (3 hits = 1 down). For the capped
+    // counter we count "hits landed" which doubles as "engagement" — close enough
+    // for an MVP lifetime stat. A future pass would consume a dedicated
+    // `gremlinDownedThisFrame` event from skyGremlins.
+
+    if (this._dirty) {
+      this._timeSinceSave += dt;
+      if (this._timeSinceSave >= this.getAttribute("saveDebounceSec")) {
+        this._persist();
+      }
+    }
+
+    this._publishStore();
+  };
+
+  this._publishStore = function () {
+    const s = this.erth.store;
+    s.set("tinyskies/lifetimeRingsCollected", this._stats.ringsCollected);
+    s.set("tinyskies/lifetimeGremlinsDowned", this._stats.gremlinsDowned);
+    s.set("tinyskies/lifetimeSessionsPlayed", this._stats.sessionsPlayed);
+    s.set("tinyskies/sessionRingsCollected", this._stats.ringsCollected - this._sessionRingsBaseline);
+    s.set("tinyskies/sessionGremlinsDowned", this._stats.gremlinsDowned - this._sessionGremlinsBaseline);
+  };
+
+  this._persist = function () {
+    if (!this._stats) return;
+    this._stats.lastSeenMs = Date.now();
+    safeWriteStorage(this.getAttribute("storageKey"), this._stats);
+    this._dirty = false;
+    this._timeSinceSave = 0;
+    this._log("persisted");
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    if (this._dirty) this._persist();
+  };

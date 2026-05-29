@@ -1,0 +1,188 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Eternal Flame Beams"
+  id: "tinyskies.eternalFlameBeams"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "5 vertical glowing columns rising from the eternal flame in a slow rotating ring. Source-faithful color palette + flame-anchored placement; simplified port of EternalFlameBeams.ts (560 LOC) — full source has cinematic two-phase orb-launch + trails + particle bursts which are gameplay-script driven."
+  documentation: "Active when `tinyskies/inVoid` is true. Reads `tinyskies/voidPlane` for the flame frame (flamePos, planeUp, planeN, planeE), then builds 5 cylinder columns positioned around the flame on the planeN/E ring at radius 0.9, height 4.0 along planeUp. Each column uses one of the source's BEAM_COLORS entries (warm gold, orange, white, amber, sky-blue). The whole rig rotates around planeUp at 0.3 rad/s and each column gently pulses. Source uses raw GLSL ShaderMaterial for soft edges + animated particle trails; replaced with MeshBasicNodeMaterial + emissive + opacity-fade-by-position for WebGPU compat. Group parented to scene root."
+  tags:
+    - vfx
+    - void
+  priority: 0
+  throttleConfig:
+    throttlePriority: "MEDIUM"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    beamRadius:
+      name: "Beam Ring Radius"
+      type: "number"
+      default: 0.9
+      min: 0.1
+      max: 5
+    beamHeight:
+      name: "Beam Height"
+      type: "number"
+      default: 4.0
+      min: 0.5
+      max: 20
+    beamWidth:
+      name: "Beam Width"
+      type: "number"
+      default: 0.08
+      min: 0.01
+      max: 1
+    rotationSpeed:
+      name: "Rotation Speed (rad/s)"
+      type: "number"
+      default: 0.3
+      min: 0
+      max: 5
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  const LOG_TAG = "[tinyskies.eternalFlameBeams]";
+
+  // Source EternalFlameBeams.ts:114-120 — verbatim palette.
+  const BEAM_COLORS = [
+    [1.0, 0.85, 0.30],
+    [1.0, 0.60, 0.20],
+    [0.95, 0.95, 1.0],
+    [1.0, 0.75, 0.25],
+    [0.80, 0.95, 1.0],
+  ];
+
+  function colorToHex(rgb) {
+    const r = Math.max(0, Math.min(255, Math.round(rgb[0] * 255)));
+    const g = Math.max(0, Math.min(255, Math.round(rgb[1] * 255)));
+    const b = Math.max(0, Math.min(255, Math.round(rgb[2] * 255)));
+    return (r << 16) | (g << 8) | b;
+  }
+
+  this.init = function (_game) {
+    this._game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+
+    this._time = 0;
+    this._beams = [];
+
+    this._group = new THREE.Group();
+    this._group.userData.isRuntimeOnly = true;
+    this._group.visible = false;
+    const sceneParent = this.gameObject._internal.three.parent || this.gameObject._internal.three;
+    sceneParent.add(this._group);
+
+    const radius = this.getAttribute("beamRadius");
+    const height = this.getAttribute("beamHeight");
+    const width = this.getAttribute("beamWidth");
+
+    // 5 cylinder columns. Vertical = local Y; we'll orient the whole group
+    // to the flame's planeUp at runtime via lookAt-style rotation.
+    this._beamGeo = new THREE.CylinderGeometry(width, width * 0.55, height, 10, 1, true); // @check-ok no editor preview — beams only render in void
+    for (let i = 0; i < BEAM_COLORS.length; i++) {
+      const hex = colorToHex(BEAM_COLORS[i]);
+      const mat = new THREE.MeshBasicNodeMaterial({
+        color: hex, transparent: true, opacity: 0.55,
+        blending: THREE.AdditiveBlending, side: THREE.DoubleSide, depthWrite: false,
+      });
+      const mesh = new THREE.Mesh(this._beamGeo, mat);
+      mesh.userData.isRuntimeOnly = true;
+      mesh.frustumCulled = false;
+      const angle = (i / BEAM_COLORS.length) * Math.PI * 2;
+      // Position in ring on local XZ plane (planeN cos + planeE sin), bottom
+      // at flame, top extending up by height/2 (cylinder centred so position
+      // is the midpoint).
+      mesh.userData.ringAngle = angle;
+      mesh.userData.phase = i * 0.7;
+      this._group.add(mesh);
+      this._beams.push({ mesh, mat, angle, phase: i * 0.7 });
+    }
+
+    this._tmpMid = new THREE.Vector3();
+    this._tmpLook = new THREE.Vector3();
+    this._tmpRingPos = new THREE.Vector3();
+
+    this._log("init");
+  };
+
+  this._reorient = function (plane) {
+    // Place the whole group at flame, oriented so local +Y aligns with planeUp.
+    this._group.position.set(plane.flamePos.x, plane.flamePos.y, plane.flamePos.z);
+    this._tmpLook.set(
+      plane.flamePos.x + plane.up.x,
+      plane.flamePos.y + plane.up.y,
+      plane.flamePos.z + plane.up.z,
+    );
+    this._group.up.set(plane.up.x, plane.up.y, plane.up.z);
+    this._group.lookAt(this._tmpLook);
+    // lookAt makes local -Z point to target; we want local +Y to point to
+    // target. Apply a -90deg X rotation correction.
+    this._group.rotateX(Math.PI * 0.5);
+  };
+
+  this._tickBeams = function (dt) {
+    const radius = this.getAttribute("beamRadius");
+    const height = this.getAttribute("beamHeight");
+    const rot = this.getAttribute("rotationSpeed") * dt;
+    for (const b of this._beams) {
+      b.angle += rot;
+      // Local-space position: ring on XZ plane, lifted to height/2 in +Y.
+      const x = Math.cos(b.angle) * radius;
+      const z = Math.sin(b.angle) * radius;
+      const y = height * 0.5;
+      b.mesh.position.set(x, y, z);
+      // Pulse opacity.
+      const pulse = 0.45 + 0.25 * (0.5 + 0.5 * Math.sin(this._time * 2.0 + b.phase));
+      if (b.mat) b.mat.opacity = pulse;
+    }
+  };
+
+  this.update = function (deltaTime) {
+    if (!this._group) return;
+    const dt = Math.min(deltaTime || 0, 0.1);
+    this._time += dt;
+
+    const inVoid = this.erth.store.get("tinyskies/inVoid") === true;
+    if (!inVoid) {
+      if (this._group.visible) this._group.visible = false;
+      return;
+    }
+    const planeData = this.erth.store.get("tinyskies/voidPlane");
+    if (!planeData) return;
+    const plane = {
+      flamePos: { x: planeData.flame[0], y: planeData.flame[1], z: planeData.flame[2] },
+      up: { x: planeData.up[0], y: planeData.up[1], z: planeData.up[2] },
+    };
+
+    if (!this._group.visible) {
+      this._group.visible = true;
+      this._reorient(plane);
+    }
+    this._tickBeams(dt);
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    if (this._beamGeo && typeof this._beamGeo.dispose === "function") this._beamGeo.dispose();
+    if (this._beams) {
+      for (const b of this._beams) {
+        if (b.mat && typeof b.mat.dispose === "function") b.mat.dispose();
+      }
+      this._beams = null;
+    }
+    if (this._group && this._group.parent) this._group.parent.remove(this._group);
+    this._group = null;
+  };

@@ -1,0 +1,704 @@
+# StemStudio Export File
+# Do not edit manually unless you know what you're doing
+
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+  exportedAt: 2026-04-30T17:38:41.964Z
+config:
+  name: Chess HUD
+  id: 69eab9ee5b53803168c082ab
+  author: chess
+  isScript: true
+  main: script.js
+  version: 1.0.0
+  description: UIKit-based HUD for the chess game. Shows turn indicator, check warning, game over screen, and reset button.
+  tags:
+    - gameplay
+  priority: 2
+  attributes:
+    hudScale:
+      name: HUD Scale
+      type: number
+      default: 1
+      min: 0.5
+      max: 2
+    showTurnIndicator:
+      name: Show Turn Indicator
+      type: boolean
+      default: true
+    backgroundColor:
+      name: Background Color
+      type: string
+      default: rgba(0,0,0,0.6)
+    textColor:
+      name: Text Color
+      type: string
+      default: "#ffffff"
+    accentColor:
+      name: Accent Color
+      type: string
+      default: "#ff4444"
+    showTimer:
+      name: Show Timer
+      type: boolean
+      default: true
+    sourceUrl:
+      name: Source Project URL
+      type: string
+      default: https://github.com/joshwrn/3d-chess
+  documentation: UIKit-based HUD for the chess game. Shows turn indicator, check warning, game over screen, and reset button. Configure attributes in the editor to tune gameplay behavior.
+code: |-
+  /* Chess HUD — turn indicator, check warning, game over, reset */
+
+  let game;
+  let ownerObject;
+  let root = null;
+  let dot = null;
+  let turnText = null;
+  let statusText = null;
+  let promotionPanel = null;
+  let gameOverPanel = null;
+  let gameOverText = null;
+  let resetBtn = null;
+  let returnToLobbyBtn = null;
+  let currentState = { turn: "white", inCheck: false, gameOver: null };
+  let rootParented = false;
+  let hudBuilt = false;
+  let moveListPanel = null;
+  let moveListText = null;
+  let sourceLink = null;
+  let whiteTime = 0;
+  let blackTime = 0;
+  let whiteLabel = null;
+  let blackLabel = null;
+  let whiteTimerText = null;
+  let blackTimerText = null;
+  let timerBar = null;
+  let activeTurn = "white";
+  let gameActive = false;
+  let pointerEventsReady = false;
+
+  const buildHUD = (renderer) => {
+    let scale = this.getAttribute("hudScale");
+    const isLandscape = window.innerWidth > window.innerHeight;
+    const screenScale = isLandscape ? window.innerWidth / 1920 : window.innerWidth / 767;
+
+    root = new UIKit.Fullscreen(renderer, {
+      flexDirection: "column",
+      alignItems: "center",
+      justifyContent: "flex-start",
+      pointerEvents: "none",
+      padding: 20 * scale * screenScale, visibility: "hidden"
+    });
+    root.userData.isRuntimeOnly = true;
+
+    // Top bar: turn indicator
+    if (this.getAttribute("showTurnIndicator")) {
+      let topBar = new UIKit.Container({
+        flexDirection: "row",
+        alignItems: "center",
+        justifyContent: "center",
+        backgroundColor: this.getAttribute("backgroundColor"),
+        borderRadius: 8 * scale * screenScale,
+        padding: 12 * scale * screenScale,
+        paddingLeft: 20 * scale * screenScale,
+        paddingRight: 20 * scale * screenScale,
+        gap: 10 * scale * screenScale,
+        pointerEvents: "auto", visibility: "visible"
+      });
+
+      // Turn color indicator dot
+      dot = new UIKit.Container({
+        width: 16 * scale * screenScale,
+        height: 16 * scale * screenScale,
+        borderRadius: 8 * scale * screenScale,
+        backgroundColor: "#d9d9d9", visibility: "visible"
+      });
+
+      turnText = new UIKit.Text({
+        text: "White to move",
+        fontSize: 16 * scale * screenScale,
+        color: this.getAttribute("textColor"),
+        fontWeight: "bold", visibility: "visible"
+      });
+
+      statusText = new UIKit.Text({
+        text: "",
+        fontSize: 14 * scale * screenScale,
+        color: this.getAttribute("accentColor"),
+        fontWeight: "bold", visibility: "visible"
+      });
+
+      topBar.add(dot, turnText, statusText);
+      root.add(topBar);
+
+      // Store dot ref for color updates
+      topBar.userData = { dot: dot };
+    }
+
+    // Timer bar (tracks elapsed time per player)
+    if (this.getAttribute("showTimer") !== false) {
+      timerBar = new UIKit.Container({
+        flexDirection: "row",
+        alignItems: "center",
+        justifyContent: "center",
+        backgroundColor: this.getAttribute("backgroundColor"),
+        borderRadius: 8 * scale * screenScale,
+        padding: 10 * scale * screenScale,
+        paddingLeft: 20 * scale * screenScale,
+        paddingRight: 20 * scale * screenScale,
+        gap: 20 * scale * screenScale,
+        marginTop: 8 * scale * screenScale,
+        pointerEvents: "auto", visibility: "visible"
+      });
+
+      whiteLabel = new UIKit.Text({
+        text: "White",
+        fontSize: 13 * scale * screenScale,
+        color: "#d9d9d9",
+        fontWeight: "bold", visibility: "visible"
+      });
+      whiteTimerText = new UIKit.Text({
+        text: "0:00",
+        fontSize: 16 * scale * screenScale,
+        color: "#ffffff",
+        //fontFamily: "monospace",
+        fontWeight: "bold", visibility: "visible"
+      });
+      let separator = new UIKit.Text({
+        text: "|",
+        fontSize: 14 * scale * screenScale,
+        color: "#666666", visibility: "visible"
+      });
+      blackLabel = new UIKit.Text({
+        text: "Black",
+        fontSize: 13 * scale * screenScale,
+        color: "#7c7c7c",
+        fontWeight: "bold", visibility: "visible"
+      });
+      blackTimerText = new UIKit.Text({
+        text: "0:00",
+        fontSize: 16 * scale * screenScale,
+        color: "#ffffff",
+        //fontFamily: "monospace",
+        fontWeight: "bold", visibility: "visible"
+      });
+
+      let whiteSection = new UIKit.Container({
+        flexDirection: "row",
+        alignItems: "center",
+        gap: 8 * scale * screenScale, visibility: "visible"
+      });
+      whiteSection.add(whiteLabel, whiteTimerText);
+
+      let blackSection = new UIKit.Container({
+        flexDirection: "row",
+        alignItems: "center",
+        gap: 8 * scale * screenScale, visibility: "visible"
+      });
+      blackSection.add(blackLabel, blackTimerText);
+
+      timerBar.add(whiteSection, separator, blackSection);
+      root.add(timerBar);
+    }
+
+    // Source project link (top right)
+    if (this.getAttribute("sourceUrl")) {
+      let linkContainer = new UIKit.Container({
+        positionType: "absolute",
+        positionTop: 20 * scale * screenScale,
+        positionRight: 20 * scale * screenScale,
+        flexDirection: "row",
+        alignItems: "center",
+        backgroundColor: this.getAttribute("backgroundColor"),
+        borderRadius: 8 * scale * screenScale,
+        padding: 10 * scale * screenScale,
+        paddingLeft: 16 * scale * screenScale,
+        paddingRight: 16 * scale * screenScale,
+        pointerEvents: "auto",
+        cursor: "pointer", visibility: "visible"
+      });
+
+      let linkText = new UIKit.Text({
+        text: "Original Project",
+        fontSize: 13 * scale * screenScale,
+        color: "#88bbff",
+        fontWeight: "bold", visibility: "visible"
+      });
+
+      linkContainer.add(linkText);
+      root.add(linkContainer);
+      sourceLink = linkContainer;
+    }
+
+    // Move list panel (right side)
+    moveListPanel = new UIKit.Container({
+      positionType: "absolute",
+      positionTop: 70 * scale * screenScale,
+      positionRight: 20 * scale * screenScale,
+      width: 180 * scale * screenScale,
+      maxHeight: 600 * scale * screenScale,
+      flexDirection: "column",
+      backgroundColor: this.getAttribute("backgroundColor"),
+      borderRadius: 8 * scale * screenScale,
+      padding: 12 * scale * screenScale,
+      overflow: "scroll",
+      pointerEvents: "auto", visibility: "visible"
+    });
+
+    let moveListTitle = new UIKit.Text({
+      text: "Moves",
+      fontSize: 14 * scale * screenScale,
+      color: this.getAttribute("textColor"),
+      fontWeight: "bold",
+      marginBottom: 6 * scale * screenScale, visibility: "visible"
+    });
+
+    moveListText = new UIKit.Text({
+      text: "",
+      fontSize: 13 * scale * screenScale,
+      color: this.getAttribute("textColor"),
+      //fontFamily: "monospace", 
+      visibility: "visible",
+    });
+
+    moveListPanel.add(moveListTitle, moveListText);
+    root.add(moveListPanel);
+
+    // Promotion overlay panel
+    promotionPanel = new UIKit.Container({
+      positionType: "absolute",
+      positionTop: "50%",
+      positionLeft: "50%",
+      transformTranslateX: "-50%",
+      transformTranslateY: "-50%",
+      flexDirection: "column",
+      alignItems: "center",
+      justifyContent: "center",
+      backgroundColor: "rgba(0,0,0,0.85)",
+      borderRadius: 16 * scale * screenScale,
+      padding: 40 * scale * screenScale,
+      gap: 16 * scale * screenScale,
+      pointerEvents: "auto",
+      visibility: "hidden"
+    });
+
+    const promotionText = new UIKit.Text({
+      text: "Promote to:",
+      fontSize: 28 * scale * screenScale,
+      color: this.getAttribute("textColor"),
+      fontWeight: "bold",
+      textAlign: "center", visibility: "visible"
+    });
+
+    const promoteToContainer = (_text) => {
+      const container = new UIKit.Container({
+        backgroundColor: "#4a90d9",
+        borderRadius: 8 * scale * screenScale,
+        padding: 12 * scale * screenScale,
+        paddingLeft: 24 * scale * screenScale,
+        paddingRight: 24 * scale * screenScale,
+        pointerEvents: "auto",
+        cursor: "pointer", visibility: "visible",
+        onClick: () => {
+          game.behaviorManager.sendEventToObjectBehaviors(ownerObject, "promotePiece",
+            {
+              promoteToPiece: _text.toUpperCase(),
+            }
+          );
+          promotionPanel.setProperties({ visibility: "hidden" });
+        }
+      });
+
+      const text = new UIKit.Text({
+        text: _text,
+        fontSize: 16 * scale * screenScale,
+        color: "#ffffff",
+        fontWeight: "bold", visibility: "visible"
+      });
+
+      container.add(text);
+      return { container, text };
+    }
+
+    const promoteToQueen = promoteToContainer("Queen");
+    const promoteToKnight = promoteToContainer("Knight");
+    const promoteToRook = promoteToContainer("Rook");
+    const promoteToBishop = promoteToContainer("Bishop");
+    const undoPromote = promoteToContainer("Undo");
+
+    promotionPanel.add(promotionText, promoteToQueen.container, promoteToKnight.container, promoteToRook.container, promoteToBishop.container, undoPromote.container);
+    root.add(promotionPanel);
+
+    // Game over overlay (hidden by default)
+    gameOverPanel = new UIKit.Container({
+      positionType: "absolute",
+      positionTop: "50%",
+      positionLeft: "50%",
+      transformTranslateX: "-50%",
+      transformTranslateY: "-50%",
+      flexDirection: "column",
+      alignItems: "center",
+      justifyContent: "center",
+      backgroundColor: "rgba(0,0,0,0.85)",
+      borderRadius: 16 * scale * screenScale,
+      padding: 40 * scale * screenScale,
+      gap: 16 * scale * screenScale,
+      pointerEvents: "auto",
+      visibility: "hidden"
+    });
+
+    gameOverText = new UIKit.Text({
+      text: "Game Over",
+      fontSize: 28 * scale * screenScale,
+      color: this.getAttribute("textColor"),
+      fontWeight: "bold",
+      textAlign: "center", visibility: "visible"
+    });
+
+    let resetContainer = new UIKit.Container({
+      backgroundColor: "#4a90d9",
+      borderRadius: 8 * scale * screenScale,
+      padding: 12 * scale * screenScale,
+      paddingLeft: 24 * scale * screenScale,
+      paddingRight: 24 * scale * screenScale,
+      pointerEvents: "auto",
+      cursor: "pointer", visibility: "visible"
+    });
+
+    let resetText = new UIKit.Text({
+      text: "New Game",
+      fontSize: 16 * scale * screenScale,
+      color: "#ffffff",
+      fontWeight: "bold", visibility: "visible"
+    });
+
+    let returnToLobbyContainer = new UIKit.Container({
+      backgroundColor: "#4a90d9",
+      borderRadius: 8 * scale * screenScale,
+      padding: 12 * scale * screenScale,
+      paddingLeft: 24 * scale * screenScale,
+      paddingRight: 24 * scale * screenScale,
+      pointerEvents: "auto",
+      cursor: "pointer", visibility: "visible"
+    });
+
+    let returnToLobbyText = new UIKit.Text({
+      text: "Return To Lobby",
+      fontSize: 16 * scale * screenScale,
+      color: "#ffffff",
+      fontWeight: "bold", visibility: "visible"
+    });
+
+    resetContainer.add(resetText);
+    returnToLobbyContainer.add(returnToLobbyText);
+    gameOverPanel.add(gameOverText, resetContainer, returnToLobbyContainer);
+    root.add(gameOverPanel);
+
+    resetBtn = resetContainer;
+    returnToLobbyBtn = returnToLobbyContainer;
+  }
+
+  function updateHUD(state) {
+    currentState = state;
+
+    if (dot) {
+      dot.setProperties({ backgroundColor: state.turn === "white" ? "#d9d9d9" : "#404040" });
+    }
+
+    if (turnText) {
+      let turnLabel = state.turn === "white" ? "White" : "Black";
+      turnText.setProperties({ text: turnLabel + " to move" });
+
+      if (whiteLabel && blackLabel && whiteTimerText && blackTimerText) {
+        const turn = state.turn === "white";
+        whiteLabel.setProperties({ color: turn ? "#d9d9d9" : "#7c7c7c" });
+        whiteTimerText.setProperties({ color: turn ? "#d9d9d9" : "#7c7c7c" });
+
+        blackLabel.setProperties({ color: turn ? "#7c7c7c" : "#d9d9d9" });
+        blackTimerText.setProperties({ color: turn ? "#7c7c7c" : "#d9d9d9" });
+      }
+    }
+
+    if (statusText) {
+      if (state.gameOver) {
+        statusText.setProperties({ text: "" });
+      } else if (state.inCheck) {
+        statusText.setProperties({ text: "CHECK!" });
+      } else {
+        statusText.setProperties({ text: "" });
+      }
+    }
+
+    if (gameOverPanel && state.gameOver) {
+      gameOverPanel.setProperties({ visibility: "visible" });
+      let msg = "";
+      if (state.gameOver.type === "checkmate") {
+        let winner = state.gameOver.winner === "white" ? "White" : "Black";
+        msg = "Checkmate!\n" + winner + " wins!";
+      } else {
+        msg = "Stalemate!\nDraw";
+      }
+      if (gameOverText) {
+        gameOverText.setProperties({ text: msg });
+      }
+    } else if (gameOverPanel) {
+      gameOverPanel.setProperties({ visibility: "hidden" });
+    }
+  }
+
+  function updateMoveList(notations) {
+    if (!moveListText) return;
+    let lines = [];
+    for (let i = 0; i < notations.length; i += 2) {
+      let num = Math.floor(i / 2) + 1;
+      let line = num + ". " + notations[i].padEnd(9, ' ');
+      if (i + 1 < notations.length) {
+        line += notations[i + 1];
+      }
+      lines.push(line);
+    }
+
+    const notation = lines.join("\n");
+    moveListText.setProperties({ text: notation });
+    scrollToBottom(moveListPanel);
+  }
+
+  let scrollTimeout = undefined;
+  function scrollToBottom(container) {
+    clearTimeout(scrollTimeout);
+    scrollTimeout = setTimeout(() => {
+      try {
+        const current = container.scrollPosition.value;
+        const maxY = container.maxScrollPosition.value[1];
+
+        container.scrollPosition.value = [current[0] ?? 0, maxY ?? 0];
+      } catch (e) {
+        console.error("Scroll To Bottom Error. Reason:", e);
+      }
+    }, 100);
+  }
+
+  const tryBuildHUD = () => {
+    if (hudBuilt) return;
+    if (!game) return;
+    let renderer = game.renderer;
+    if (!renderer) return;
+
+    buildHUD(renderer);
+    hudBuilt = true;
+
+    if (root) {
+      parentRootToCamera(game);
+      if (rootParented) {
+        UIKitPointerEvents.initialize(game);
+        UIKitPointerEvents.registerRoot(root); // @check-ok parentRootToCamera() parents before this
+        pointerEventsReady = true;
+      }
+    }
+
+    // Reset button click
+    if (resetBtn) {
+      resetBtn.setProperties({
+        onClick: function () {
+          if (gameOverPanel) {
+            gameOverPanel.setProperties({ visibility: "hidden" });
+          }
+          onStartGame();
+          game.behaviorManager.sendEventToObjectBehaviors(ownerObject, "resetGame", {});
+          broadcastData(MP_EVENTS.PLAY.RESET_GAME, '');
+        }
+      });
+    }
+
+    if (returnToLobbyBtn) {
+      returnToLobbyBtn.setProperties({
+        onClick: function () {
+          if (gameOverPanel) {
+            gameOverPanel.setProperties({ visibility: "hidden" });
+          }
+          root.setProperties({ visibility: "hidden" });
+          game.behaviorManager.sendEventToObjectBehaviors(ownerObject, "enterLobby", {});
+          broadcastData(MP_EVENTS.PLAY.RETURN_TO_LOBBY, '');
+        }
+      });
+    }
+
+    // Source link click
+    if (sourceLink && this.getAttribute("sourceUrl")) {
+      let url = this.getAttribute("sourceUrl");
+      sourceLink.setProperties({
+        onClick: function () {
+          window.open(url, "_blank"); // @check-ok intentional navigation to external source link
+        }
+      });
+    }
+  }
+
+  this.init = function (_game) {
+    game = _game;
+    multiplayerState = game.multiplayerState;
+    ownerObject = this.gameObject._internal.three;
+    tryBuildHUD();
+    subscribeEventListeners();
+  };
+
+  function parentRootToCamera(game) {
+    if (rootParented || !root) return;
+    let cam = game.uiCamera;
+    if (cam) {
+      cam.add(root);
+      rootParented = true;
+    }
+  }
+
+  function formatTime(seconds) {
+    let m = Math.floor(seconds / 60);
+    let s = Math.floor(seconds % 60);
+    return m + ":" + (s < 10 ? "0" : "") + s;
+  }
+
+  this.update = function (deltaTime) {
+    if (!hudBuilt) tryBuildHUD();
+    if (root) {
+      if (!rootParented) {
+        parentRootToCamera(game);
+        if (rootParented && !pointerEventsReady) {
+          UIKitPointerEvents.initialize(game);
+          UIKitPointerEvents.registerRoot(root);
+          pointerEventsReady = true;
+        }
+      }
+      if (rootParented) {
+        UIKitPointerEvents.update(deltaTime);
+      }
+    }
+    // Track elapsed time for active player
+    if (gameActive && !currentState.gameOver) {
+      if (activeTurn === "white") {
+        whiteTime += deltaTime;
+      } else {
+        blackTime += deltaTime;
+      }
+      if (whiteTimerText) whiteTimerText.setProperties({ text: formatTime(whiteTime) });
+      if (blackTimerText) blackTimerText.setProperties({ text: formatTime(blackTime) });
+    }
+  };
+
+  this.onEvent = function (msg, data) {
+    if (msg === "turnChanged") {
+      updateHUD(data);
+      if (data.moveNotations) {
+        updateMoveList(data.moveNotations);
+      }
+      activeTurn = data.turn;
+      if (data.gameOver) gameActive = false;
+      // Reset timers on new game (empty notation list)
+      if (data.moveNotations && data.moveNotations.length === 0) {
+        whiteTime = 0;
+        blackTime = 0;
+        if (whiteTimerText) whiteTimerText.setProperties({ text: "0:00" });
+        if (blackTimerText) blackTimerText.setProperties({ text: "0:00" });
+      }
+    } else if (msg === "openPromotionModal") {
+      promotionPanel.setProperties({ visibility: "visible" });
+    } else if (msg === "startGame") {
+      onStartGame();
+    }
+  };
+
+  this.dispose = function () {
+    if (root) {
+      UIKitPointerEvents.deinitialize();
+      root = null;
+    }
+    turnText = null;
+    statusText = null;
+    gameOverPanel = null;
+    gameOverText = null;
+    resetBtn = null;
+    moveListPanel = null;
+    moveListText = null;
+    sourceLink = null;
+    whiteTimerText = null;
+    blackTimerText = null;
+    timerBar = null;
+    gameActive = false;
+    pointerEventsReady = false;
+
+    removeEventListeners();
+  };
+
+  function subscribeEventListeners() {
+    if (multiplayerState) {
+      //mp.onAdded = multiplayerState.addOnPlayerAddedListener(onPlayerAdded);
+      mp.onRemoved = multiplayerState.addOnPlayerRemovedListener(onPlayerRemoved);
+      mp.onDataChanged = multiplayerState.addOnPlayerDataChangedListener(onPlayerDataChanged);
+      //mp.onHostChange = multiplayerState.addOnHostChangedListener(onHostChange);
+    }
+  }
+
+  function removeEventListeners() {
+    if (multiplayerState) {
+      //multiplayerState.removeOnPlayerAddedListener(mp.onAdded);
+      multiplayerState.removeOnPlayerRemovedListener(mp.onRemoved);
+      multiplayerState.removeOnPlayerDataChangedListener(mp.onDataChanged);
+      //multiplayerState.removeOnHostChangedListener(mp.onHostChange);
+    }
+  }
+
+  function onStartGame() {
+    gameActive = true;
+    root.setProperties({ visibility: "visible" });
+  }
+
+  // ===================== MULTIPLAYER =====================
+  let multiplayerState = undefined;
+
+  const MP_EVENTS = {
+    PLAY: {
+      RESET_GAME: 'mpEvent:reset-game',
+      RETURN_TO_LOBBY: 'mpEvent:return-to-lobby',
+    }
+  }
+
+  const mp = {
+    onAdded: undefined,
+    onRemoved: undefined,
+    onDataChanged: undefined,
+    onHostChange: undefined,
+  }
+
+  function onPlayerDataChanged(_player, _key) {
+    switch (_key) {
+      case MP_EVENTS.PLAY.RESET_GAME:
+        if (gameOverPanel) {
+          gameOverPanel.setProperties({ visibility: "hidden" });
+        }
+        onStartGame();
+        game.behaviorManager.sendEventToObjectBehaviors(ownerObject, "resetGame", {});
+        return;
+      case MP_EVENTS.PLAY.RETURN_TO_LOBBY:
+        if (gameOverPanel) {
+          gameOverPanel.setProperties({ visibility: "hidden" });
+        }
+        root.setProperties({ visibility: "hidden" });
+        game.behaviorManager.sendEventToObjectBehaviors(ownerObject, "enterLobby", {});
+        return;
+    }
+  }
+
+  function onPlayerRemoved(_player) {
+    root.setProperties({ visibility: "hidden" });
+    if (gameOverPanel) {
+      gameOverPanel.setProperties({ visibility: "hidden" });
+    }
+
+  }
+
+  function broadcastData(mpKey, data = {}) {
+    const payload = JSON.stringify(data);
+    multiplayerState.setPlayerData(mpKey, payload);
+  }

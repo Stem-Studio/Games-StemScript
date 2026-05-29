@@ -1,0 +1,578 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Globe Biome Decor"
+  id: "tinyskies.globeBiomeDecor"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Inland biome decorations on the deformed globe — 4 hot springs and 4 butterfly flower gardens with 36-52 procedural flowers each. Flowers are rendered through InstancedMesh buckets for stalks, centers, and petal colors. Steam and butterfly particles use three.quarks."
+  documentation: "Two biome-niche systems on flat inland sites. Source seeds: 16161+seed (hotsprings), 223344+seed (butterfly gardens). Hotsprings use imported GLB templates when available and fall back to the procedural pool helper. Butterfly gardens preserve the source stalk + center + 5-petal flower structure and 6 pastel petal palettes, but batch repeated submeshes into InstancedMesh buckets to avoid hundreds of decorative draw calls."
+  tags:
+    - visual
+    - environment
+    - biome
+  priority: 0
+  throttleConfig:
+    throttlePriority: "HIGH"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: false
+  attributes:
+    radius:
+      name: "Globe Radius"
+      type: "number"
+      default: 5
+      min: 0.5
+      max: 200
+    terrainSeed:
+      name: "Terrain Seed"
+      type: "number"
+      default: 42
+      min: 1
+      max: 1000000
+    terrainType:
+      name: "Terrain Type"
+      type: "string"
+      default: "default"
+    hotspringCount:
+      name: "Hotspring Count"
+      type: "number"
+      default: 4
+      min: 0
+      max: 12
+    butterflyGardenCount:
+      name: "Butterfly Garden Count"
+      type: "number"
+      default: 4
+      min: 0
+      max: 12
+    hotspringNormalsStoreKey:
+      name: "Hotspring Normals Store Key"
+      type: "string"
+      default: "tinyskies/hotspringNormals"
+    butterflyNormalsStoreKey:
+      name: "Butterfly Normals Store Key"
+      type: "string"
+      default: "tinyskies/butterflyNormals"
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  @import "terrain" as T;
+  @import "spherical-math" as S;
+
+  const LOG_TAG = "[tinyskies.globeBiomeDecor]";
+
+  function buildSoftSpriteTexture() {
+    const canvas = document.createElement("canvas"); // @check-ok
+    canvas.width = 64;
+    canvas.height = 64;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+    const grad = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+    grad.addColorStop(0, "rgba(255,255,255,1)");
+    grad.addColorStop(0.4, "rgba(255,255,255,0.6)");
+    grad.addColorStop(1, "rgba(255,255,255,0)");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, 64, 64);
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }
+
+  function applyRimLight(mat, rimColorHex, intensity, power) {
+    const TSL = THREE.TSL;
+    const c = new THREE.Color(rimColorHex);
+    const viewDir = TSL.normalize(TSL.cameraPosition.sub(TSL.positionWorld));
+    // dFdx/dFdy-derived normal — no `normal` attribute needed, so the material compiles cleanly in shadow / AO passes that strip lighting attrs (avoids TSL "Vertex attribute 'normal' not found" warnings that pin frame budget).
+    const nW = TSL.normalize(TSL.cross(TSL.dFdx(TSL.positionWorld), TSL.dFdy(TSL.positionWorld)));
+    const fresnel = TSL.float(1.0).sub(TSL.dot(viewDir, nW).abs());
+    const rim = TSL.vec3(c.r, c.g, c.b).mul(TSL.float(intensity)).mul(TSL.pow(fresnel, TSL.float(power)));
+    mat.emissiveNode = rim;
+    mat.needsUpdate = true;
+  }
+
+  // Walks every mesh vertex transformed to world space, returns the smallest
+  // projection along `normal`. Used by GLB grounding so models rest on the
+  // surface regardless of model-space pivot. See Globe.ts createHotsprings
+  // for the source pattern.
+  function minVertexProjectionAlongNormal(root, normal) {
+    let minVal = Infinity;
+    const v = new THREE.Vector3();
+    root.updateMatrixWorld(true);
+    root.traverse((child) => {
+      if (!child.isMesh) return;
+      const pos = child.geometry?.attributes?.position;
+      if (!pos) return;
+      for (let i = 0; i < pos.count; i++) {
+        v.fromBufferAttribute(pos, i);
+        v.applyMatrix4(child.matrixWorld);
+        const d = v.dot(normal);
+        if (d < minVal) minVal = d;
+      }
+    });
+    return minVal;
+  }
+
+  function buildHotspring() {
+    const TSL = THREE.TSL;
+    const g = new THREE.Group();
+    g.userData.isRuntimeOnly = true;
+
+    const rimGeo = new THREE.CylinderGeometry(0.105, 0.115, 0.025, 18, 1, false);
+    rimGeo.translate(0, 0.0125, 0);
+    const rimMat = new THREE.MeshStandardNodeMaterial({ color: 0x8a8278, flatShading: true, roughness: 0.85, metalness: 0 });
+    applyRimLight(rimMat, 0xe8e0d8, 0.36, 2.75);
+    const rim = new THREE.Mesh(rimGeo, rimMat);
+    rim.castShadow = true;
+    rim.receiveShadow = true;
+    rim.userData.isRuntimeOnly = true;
+    g.add(rim);
+
+    const waterGeo = new THREE.CylinderGeometry(0.085, 0.085, 0.005, 24);
+    waterGeo.translate(0, 0.022, 0);
+    const waterMat = new THREE.MeshStandardNodeMaterial({ color: 0x4488aa, roughness: 0.2, metalness: 0.0 });
+    waterMat.emissiveNode = TSL.vec3(0.3, 0.6, 0.85).mul(TSL.float(0.6));
+    const water = new THREE.Mesh(waterGeo, waterMat);
+    water.userData.isRuntimeOnly = true;
+    g.add(water);
+
+    const accentMat = new THREE.MeshStandardNodeMaterial({ color: 0x6e655c, flatShading: true, roughness: 0.9, metalness: 0 });
+    applyRimLight(accentMat, 0xd0c8b8, 0.32, 2.6);
+    for (let i = 0; i < 4; i++) {
+      const a = (i / 4) * Math.PI * 2 + 0.3;
+      const r = 0.115;
+      const sg = new THREE.SphereGeometry(0.015, 7, 5);
+      sg.scale(1.2, 0.55, 1.0);
+      const stone = new THREE.Mesh(sg, accentMat);
+      stone.position.set(Math.cos(a) * r, 0.018, Math.sin(a) * r);
+      stone.rotation.y = a + 0.4;
+      stone.castShadow = true;
+      stone.userData.isRuntimeOnly = true;
+      g.add(stone);
+    }
+    return g;
+  }
+
+  function buildFlowerGarden(rand) {
+    const g = new THREE.Group();
+    g.userData.isRuntimeOnly = true;
+
+    const stalkGeo = new THREE.CylinderGeometry(0.001, 0.0015, 0.015, 5);
+    stalkGeo.translate(0, 0.0075, 0);
+    const petalGeo = new THREE.SphereGeometry(0.004, 5, 4);
+    petalGeo.scale(1, 0.2, 1.5);
+    petalGeo.translate(0, 0, 0.004);
+    const centerGeo = new THREE.SphereGeometry(0.003, 5, 4);
+
+    const flowerColors = [0xff66a3, 0x66a3ff, 0xffcc66, 0xb366ff, 0xff9966, 0xffffff];
+    const stalkMat = new THREE.MeshStandardNodeMaterial({ color: 0x44aa44, flatShading: true, roughness: 0.85, metalness: 0 });
+    applyRimLight(stalkMat, 0xffffff, 0.3, 2.0);
+    const centerMat = new THREE.MeshStandardNodeMaterial({ color: 0xffdd44, flatShading: true, roughness: 0.6, metalness: 0 });
+    const petalMats = flowerColors.map((c) => {
+      const m = new THREE.MeshStandardNodeMaterial({ color: c, flatShading: true, roughness: 0.6, metalness: 0 });
+      applyRimLight(m, 0xffffff, 0.4, 2.5);
+      return m;
+    });
+
+    const stalkMatrices = [];
+    const centerMatrices = [];
+    const petalMatrices = flowerColors.map(() => []);
+    const flowerDummy = new THREE.Object3D();
+    const childDummy = new THREE.Object3D();
+    const finalMat = new THREE.Matrix4();
+
+    const numFlowers = 36 + Math.floor(rand() * 16);
+    for (let i = 0; i < numFlowers; i++) {
+      const angle = rand() * Math.PI * 2;
+      const dist = rand() * 0.055;
+      const fx = Math.cos(angle) * dist;
+      const fz = Math.sin(angle) * dist;
+      const scale = 0.6 + rand() * 0.8;
+      const colorIdx = Math.floor(rand() * petalMats.length);
+
+      flowerDummy.position.set(fx, 0, fz);
+      flowerDummy.quaternion.identity();
+      flowerDummy.scale.setScalar(scale);
+      flowerDummy.rotateX((rand() - 0.5) * 0.3);
+      flowerDummy.rotateZ((rand() - 0.5) * 0.3);
+      flowerDummy.rotateY(rand() * Math.PI * 2);
+      flowerDummy.updateMatrix();
+
+      stalkMatrices.push(flowerDummy.matrix.clone());
+
+      childDummy.position.set(0, 0.015, 0);
+      childDummy.rotation.set(0, 0, 0);
+      childDummy.scale.set(1, 1, 1);
+      childDummy.updateMatrix();
+      finalMat.multiplyMatrices(flowerDummy.matrix, childDummy.matrix);
+      centerMatrices.push(finalMat.clone());
+
+      for (let p = 0; p < 5; p++) {
+        childDummy.position.set(0, 0.015, 0);
+        childDummy.rotation.set(0.2, (p / 5) * Math.PI * 2, 0);
+        childDummy.scale.set(1, 1, 1);
+        childDummy.updateMatrix();
+        finalMat.multiplyMatrices(flowerDummy.matrix, childDummy.matrix);
+        petalMatrices[colorIdx].push(finalMat.clone());
+      }
+    }
+
+    const addInstanced = (geo, mat, matrices, castShadow) => {
+      if (matrices.length === 0) return null;
+      const inst = new THREE.InstancedMesh(geo, mat, matrices.length);
+      inst.userData.isRuntimeOnly = true;
+      inst.castShadow = castShadow;
+      for (let i = 0; i < matrices.length; i++) inst.setMatrixAt(i, matrices[i]);
+      inst.instanceMatrix.needsUpdate = true;
+      g.add(inst);
+      return inst;
+    };
+
+    addInstanced(stalkGeo, stalkMat, stalkMatrices, true);
+    addInstanced(centerGeo, centerMat, centerMatrices, false);
+    for (let i = 0; i < petalMatrices.length; i++) {
+      if (!addInstanced(petalGeo, petalMats[i], petalMatrices[i], false)) {
+        petalMats[i].dispose();
+      }
+    }
+    g.userData.flowerCount = numFlowers;
+    return g;
+  }
+
+  let game;
+
+  this.init = function (_game) {
+    game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._buildVisuals(this.gameObject._internal.three);
+    this._registerParticleSystemsWithBatchedRenderer();
+    this._log("init");
+  };
+
+  this.onEditorAdded = function () {
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._buildVisuals(this.gameObject._internal.three);
+  };
+
+  this.onEditorAttributesUpdated = function () {
+    this._teardownVisuals();
+    this._buildVisuals(this.gameObject._internal.three);
+  };
+
+  this.onEditorDispose = function () {
+    this._teardownVisuals();
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    if (this._spriteTexture && typeof this._spriteTexture.dispose === "function") {
+      this._spriteTexture.dispose();
+      this._spriteTexture = null;
+    }
+    this._teardownVisuals();
+  };
+
+  this._buildVisuals = function (parent) {
+    const radius = this.getAttribute("radius");
+    const seed = this.getAttribute("terrainSeed");
+    const terrainType = this.getAttribute("terrainType");
+
+    const root = new THREE.Group();
+    root.name = "tinyskiesGlobeBiomeDecor";
+    root.userData.isRuntimeOnly = true;
+
+    this._buildHotsprings(root, radius, seed, terrainType, this.getAttribute("hotspringCount"));
+    this._buildButterflyGardens(root, radius, seed, terrainType, this.getAttribute("butterflyGardenCount"));
+
+    parent.add(root);
+    this._root = root;
+  };
+
+  this._buildHotsprings = function (root, radius, seed, terrainType, count) {
+    const rand = S.seededRandom(16161 + seed);
+    const propSink = T.getPropTerrainSink();
+    const REF_UP = new THREE.Vector3(0, 1, 0);
+    const MIN_E = 0.005, MAX_E = 0.62, MIN_SEP = 0.78;
+    const INLAND_CHECKS = 8, INLAND_CHECK_DIST = 0.07, MAX_WATER = 0.26;
+    const ROUGH_RING_DIST = 0.085, MAX_ROUGH = 0.26;
+
+    const candidates = [];
+    let attempts = 0;
+    while (attempts < 8000 && candidates.length < 220) {
+      attempts++;
+      const theta = rand() * Math.PI * 2;
+      const phi = Math.acos(2 * rand() - 1);
+      const nx = Math.sin(phi) * Math.cos(theta);
+      const ny = Math.cos(phi);
+      const nz = Math.sin(phi) * Math.sin(theta);
+      const sample = T.sampleTerrain(seed, terrainType, nx, ny, nz);
+      if (!sample.isLand) continue;
+      if (sample.elevation < MIN_E || sample.elevation > MAX_E) continue;
+      if (T.waterRatioAround(seed, terrainType, nx, ny, nz, INLAND_CHECK_DIST, INLAND_CHECKS) > MAX_WATER) continue;
+      if (T.terrainRingElevationRoughness(seed, terrainType, nx, ny, nz, ROUGH_RING_DIST) > MAX_ROUGH) continue;
+      candidates.push({ normal: new THREE.Vector3(nx, ny, nz), elevation: sample.elevation });
+    }
+    candidates.sort((a, b) => a.elevation - b.elevation);
+
+    const chosen = [];
+    for (const c of candidates) {
+      if (chosen.length >= count) break;
+      let tooClose = false;
+      for (const v of chosen) { if (c.normal.dot(v) > MIN_SEP) { tooClose = true; break; } }
+      if (!tooClose) chosen.push(c.normal);
+    }
+    if (chosen.length === 0) return;
+
+    const spin = S.seededRandom(20202 + seed);
+
+    // GLB-template clone path. Source Globe.ts:2444-2499 loads
+    // /3D/hotspring.glb at TARGET_MAX_DIM=0.288 and grounds the lowest
+    // mesh vertex onto the surface. We use the imported HotspringModel
+    // template (stemscript `import model`); falls back to the procedural
+    // pool helper if the template is missing.
+    const TARGET_MAX_DIM = 0.288;
+    const hsTemplate = game?.scene?.getObjectByName?.("HotspringModel") || null;
+
+    for (const normal of chosen) {
+      const disp = T.surfaceDisplacementAt(seed, terrainType, normal.x, normal.y, normal.z);
+      const surfaceR = radius + disp - propSink;
+
+      let hs;
+      if (hsTemplate) {
+        hs = hsTemplate.clone(true);
+        hs.userData = hs.userData || {};
+        hs.userData.isRuntimeOnly = true;
+        hs.traverse((c) => {
+          if (c) {
+            c.userData = c.userData || {};
+            c.userData.isRuntimeOnly = true;
+            if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; }
+            c.visible = true;
+          }
+        });
+        hs.visible = true;
+        const box = new THREE.Box3().setFromObject(hs);
+        const size = new THREE.Vector3();
+        box.getSize(size);
+        const maxDim = Math.max(size.x, size.y, size.z, 1e-4);
+        hs.scale.setScalar(TARGET_MAX_DIM / maxDim);
+      } else {
+        hs = buildHotspring();
+      }
+
+      hs.position.copy(normal.clone().multiplyScalar(surfaceR));
+      hs.quaternion.setFromUnitVectors(REF_UP, normal);
+      hs.rotateY(spin() * Math.PI * 2);
+      if (hsTemplate) {
+        hs.updateMatrixWorld(true);
+        const lift = surfaceR - minVertexProjectionAlongNormal(hs, normal);
+        if (Number.isFinite(lift)) hs.position.addScaledVector(normal, lift);
+      }
+      // Steam emitter — source Globe.ts:2389-2440 used a raw ShaderMaterial
+      // with custom rising-and-spreading particles. Replaced with a
+      // three.quarks ParticleSystem rising along the local +Y axis (the
+      // hotspring is already aligned to the surface normal).
+      const steamEmitter = this._addHotspringSteam();
+      if (steamEmitter) hs.add(steamEmitter);
+      root.add(hs);
+    }
+    this._log("hotsprings placed", chosen.length);
+
+    // Publish normals for selfie-quest consumers.
+    if (this.erth && this.erth.store) {
+      const payload = chosen.map((n, i) => ({ index: i, normal: [n.x, n.y, n.z] }));
+      this.erth.store.set(this.getAttribute("hotspringNormalsStoreKey") || "tinyskies/hotspringNormals", payload);
+    }
+  };
+
+  this._addHotspringSteam = function () {
+    if (typeof ParticleSystem === "undefined") return null;
+    if (!this._spriteTexture) this._spriteTexture = buildSoftSpriteTexture();
+    if (!this._spriteTexture) return null;
+    if (!this._particleEmitters) this._particleEmitters = [];
+
+    const mat = new THREE.MeshBasicNodeMaterial({
+      map: this._spriteTexture,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    });
+    const ps = new ParticleSystem({
+      duration: 6,
+      looping: true,
+      startLife: new Quarks.IntervalValue(2.5, 4.0),
+      startSpeed: new Quarks.IntervalValue(0.08, 0.18),
+      startSize: new Quarks.IntervalValue(0.03, 0.06),
+      // Source: white-gray steam (vec4(0.9, 0.9, 0.9, 0.4))
+      startColor: new Quarks.RandomColor(
+        new THREE.Vector4(0.92, 0.92, 0.95, 0.45),
+        new THREE.Vector4(0.85, 0.88, 0.92, 0.40),
+      ),
+      emissionOverTime: new Quarks.ConstantValue(8),
+      shape: new SphereEmitter({ radius: 0.07 }),
+      material: mat,
+      renderMode: Quarks.RenderMode.BillBoard,
+      worldSpace: true,
+    });
+    const emitter = new ParticleEmitter(ps);
+    emitter.userData.isRuntimeOnly = true;
+    emitter.position.set(0, 0.025, 0); // just above the pool surface
+    this._particleEmitters.push(emitter);
+    return emitter;
+  };
+
+  this._buildButterflyGardens = function (root, radius, seed, terrainType, count) {
+    const rand = S.seededRandom(223344 + seed);
+    const propSink = T.getPropTerrainSink();
+    const REF_UP = new THREE.Vector3(0, 1, 0);
+    const MIN_E = 0.005, MAX_E = 0.62, MIN_SEP = 0.78;
+    const INLAND_CHECKS = 8, INLAND_CHECK_DIST = 0.07, MAX_WATER = 0.26;
+    const ROUGH_RING_DIST = 0.085, MAX_ROUGH = 0.26;
+
+    const candidates = [];
+    let attempts = 0;
+    while (attempts < 8000 && candidates.length < 220) {
+      attempts++;
+      const theta = rand() * Math.PI * 2;
+      const phi = Math.acos(2 * rand() - 1);
+      const nx = Math.sin(phi) * Math.cos(theta);
+      const ny = Math.cos(phi);
+      const nz = Math.sin(phi) * Math.sin(theta);
+      const sample = T.sampleTerrain(seed, terrainType, nx, ny, nz);
+      if (!sample.isLand) continue;
+      if (sample.elevation < MIN_E || sample.elevation > MAX_E) continue;
+      if (T.waterRatioAround(seed, terrainType, nx, ny, nz, INLAND_CHECK_DIST, INLAND_CHECKS) > MAX_WATER) continue;
+      if (T.terrainRingElevationRoughness(seed, terrainType, nx, ny, nz, ROUGH_RING_DIST) > MAX_ROUGH) continue;
+      candidates.push({ normal: new THREE.Vector3(nx, ny, nz), elevation: sample.elevation });
+    }
+    candidates.sort((a, b) => a.elevation - b.elevation);
+
+    const chosen = [];
+    for (const c of candidates) {
+      if (chosen.length >= count) break;
+      let tooClose = false;
+      for (const v of chosen) { if (c.normal.dot(v) > MIN_SEP) { tooClose = true; break; } }
+      if (!tooClose) chosen.push(c.normal);
+    }
+    if (chosen.length === 0) return;
+
+    for (const normal of chosen) {
+      const disp = T.surfaceDisplacementAt(seed, terrainType, normal.x, normal.y, normal.z);
+      const surfaceR = radius + disp - propSink;
+      const garden = buildFlowerGarden(rand);
+      garden.position.copy(normal.clone().multiplyScalar(surfaceR));
+      garden.quaternion.setFromUnitVectors(REF_UP, normal);
+      garden.rotateY(rand() * Math.PI * 2);
+      // Butterfly emitter — source Globe.ts:2884-2967 used a raw ShaderMaterial
+      // with chaotic darting motion. Replaced with a three.quarks ParticleSystem;
+      // chaos approximated via large emission radius + SphereEmitter random mode
+      // + short startLife so butterflies appear to flutter around.
+      const butterflyEmitter = this._addButterflySwarm();
+      if (butterflyEmitter) garden.add(butterflyEmitter);
+      root.add(garden);
+    }
+    this._log("butterfly gardens placed", chosen.length);
+
+    if (this.erth && this.erth.store) {
+      const payload = chosen.map((n, i) => ({ index: i, normal: [n.x, n.y, n.z] }));
+      this.erth.store.set(this.getAttribute("butterflyNormalsStoreKey") || "tinyskies/butterflyNormals", payload);
+    }
+  };
+
+  this._addButterflySwarm = function () {
+    if (typeof ParticleSystem === "undefined") return null;
+    if (!this._spriteTexture) this._spriteTexture = buildSoftSpriteTexture();
+    if (!this._spriteTexture) return null;
+    if (!this._particleEmitters) this._particleEmitters = [];
+
+    const mat = new THREE.MeshBasicNodeMaterial({
+      map: this._spriteTexture,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.NormalBlending,
+    });
+    const ps = new ParticleSystem({
+      duration: 3,
+      looping: true,
+      startLife: new Quarks.IntervalValue(1.5, 2.5),
+      startSpeed: new Quarks.IntervalValue(0.04, 0.10),
+      startSize: new Quarks.IntervalValue(0.012, 0.020),
+      // Source butterflyPalette: orange/blue/pink/yellow/purple
+      startColor: new Quarks.RandomColor(
+        new THREE.Vector4(1.00, 0.67, 0.00, 1.0),  // orange
+        new THREE.Vector4(0.27, 0.53, 1.00, 1.0),  // blue
+      ),
+      emissionOverTime: new Quarks.ConstantValue(15),
+      // SphereEmitter radius matches source's ~0.06 movement orbit
+      shape: new SphereEmitter({ radius: 0.07 }),
+      material: mat,
+      renderMode: Quarks.RenderMode.BillBoard,
+      worldSpace: true,
+    });
+    const emitter = new ParticleEmitter(ps);
+    emitter.userData.isRuntimeOnly = true;
+    emitter.position.set(0, 0.018, 0);
+    this._particleEmitters.push(emitter);
+    return emitter;
+  };
+
+  this._registerParticleSystemsWithBatchedRenderer = function () {
+    if (!this._particleEmitters || this._particleEmitters.length === 0) return;
+    const br = game?.scene?.getObjectByProperty?.("type", "BatchedRenderer");
+    if (!br) {
+      this._log("BatchedRenderer not found — particles will not render this frame");
+      return;
+    }
+    for (const e of this._particleEmitters) {
+      if (e && e.system) br.addSystem(e.system);
+    }
+    this._batchedRenderer = br;
+  };
+
+  this._teardownVisuals = function () {
+    if (!this._root) return;
+    if (this._batchedRenderer && this._particleEmitters) {
+      for (const e of this._particleEmitters) {
+        if (e && e.system) {
+          try { this._batchedRenderer.deleteSystem(e.system); } catch (_) {}
+        }
+      }
+    }
+    if (this._particleEmitters) {
+      for (const e of this._particleEmitters) {
+        if (e && e.system && typeof e.system.dispose === "function") {
+          try { e.system.dispose(); } catch (_) {}
+        }
+      }
+    }
+    if (this._spriteTexture) {
+      try { this._spriteTexture.dispose(); } catch (_) {}
+      this._spriteTexture = null;
+    }
+    this._root.traverse((child) => {
+      if (child.geometry && typeof child.geometry.dispose === "function") child.geometry.dispose();
+      if (child.material) {
+        if (Array.isArray(child.material)) {
+          for (const m of child.material) if (m && typeof m.dispose === "function") m.dispose();
+        } else if (typeof child.material.dispose === "function") {
+          child.material.dispose();
+        }
+      }
+    });
+    if (this._root.parent) this._root.parent.remove(this._root);
+    this._root = null;
+    this._particleEmitters = null;
+    this._batchedRenderer = null;
+  };

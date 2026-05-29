@@ -1,0 +1,2745 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "MA Machine Arena"
+  id: "ma.machineArena"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "StemStudio port of Machine Arena: FPS arena roguelite with waves,
+    bosses, upgrades, tactical abilities, fragments, shop, HUD, and procedural
+    machine arena."
+  documentation: "Attach to GameRoot. The behavior builds runtime-only procedural
+    geometry under the host, drives DefaultCamera as a first-person camera,
+    mirrors the position to the tagged Player object, and owns the full
+    single-player wave loop. Use attributes to tune camera, movement, wave
+    scaling, difficulty multipliers, and audio levels."
+  tags:
+    - gameplay
+    - fps
+    - roguelite
+  priority: 0
+  throttleConfig:
+    throttlePriority: "CRITICAL"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+    totalWaves:
+      name: "Total Waves"
+      type: "number"
+      default: 15
+      min: 1
+      max: 30
+    arenaSize:
+      name: "Arena Half Size"
+      type: "number"
+      default: 40
+      min: 18
+      max: 80
+    baseFov:
+      name: "Base FOV"
+      type: "number"
+      default: 75
+      min: 55
+      max: 110
+    mouseSensitivity:
+      name: "Mouse Sensitivity"
+      type: "number"
+      default: 0.002
+      min: 0.0005
+      max: 0.01
+    playerEyeHeight:
+      name: "Player Eye Height"
+      type: "number"
+      default: 1.6
+      min: 1
+      max: 2.4
+    gravity:
+      name: "Gravity"
+      type: "number"
+      default: 22
+      min: 5
+      max: 60
+    jumpForce:
+      name: "Jump Force"
+      type: "number"
+      default: 9
+      min: 3
+      max: 25
+    waveBaseCount:
+      name: "Wave Base Count"
+      type: "number"
+      default: 3
+      min: 1
+      max: 20
+    waveCountStep:
+      name: "Wave Count Step"
+      type: "number"
+      default: 2
+      min: 0
+      max: 8
+    enemyHealthMultiplier:
+      name: "Enemy Health Multiplier"
+      type: "number"
+      default: 1
+      min: 0.2
+      max: 5
+    enemyDamageMultiplier:
+      name: "Enemy Damage Multiplier"
+      type: "number"
+      default: 1
+      min: 0.1
+      max: 5
+    gearDropMultiplier:
+      name: "Gear Drop Multiplier"
+      type: "number"
+      default: 1
+      min: 0
+      max: 10
+    damageMultiplier:
+      name: "Player Damage Multiplier"
+      type: "number"
+      default: 1
+      min: 0.1
+      max: 8
+    musicVolume:
+      name: "Music Volume"
+      type: "number"
+      default: 0.35
+      min: 0
+      max: 1
+    sfxVolume:
+      name: "SFX Volume"
+      type: "number"
+      default: 0.45
+      min: 0
+      max: 1
+    menuMusic:
+      name: "Menu Music"
+      type: "audioAsset"
+      description: "Source menu music."
+    combatMusic:
+      name: "Combat Music"
+      type: "audioAsset"
+      description: "Source combat music."
+    bossMusic:
+      name: "Boss Music"
+      type: "audioAsset"
+      description: "Source boss music."
+    tygerSound:
+      name: "Tyger Sound"
+      type: "audioAsset"
+      description: "Source special ending audio."
+  inputs:
+    ma_Digit1: { action: true, bindings: [ { keyboard: Digit1 } ] }
+    ma_Digit2: { action: true, bindings: [ { keyboard: Digit2 } ] }
+    ma_Digit3: { action: true, bindings: [ { keyboard: Digit3 } ] }
+    ma_Digit4: { action: true, bindings: [ { keyboard: Digit4 } ] }
+    ma_Digit5: { action: true, bindings: [ { keyboard: Digit5 } ] }
+    ma_Digit6: { action: true, bindings: [ { keyboard: Digit6 } ] }
+    ma_Digit7: { action: true, bindings: [ { keyboard: Digit7 } ] }
+    ma_Digit8: { action: true, bindings: [ { keyboard: Digit8 } ] }
+    ma_Digit9: { action: true, bindings: [ { keyboard: Digit9 } ] }
+    ma_Tab: { action: true, bindings: [ { keyboard: Tab } ] }
+    ma_Enter: { action: true, bindings: [ { keyboard: Enter } ] }
+    ma_Escape: { action: true, bindings: [ { keyboard: Escape } ] }
+    ma_KeyG: { action: true, bindings: [ { keyboard: KeyG } ] }
+
+code: |-
+  const LOG_TAG = "[ma.machineArena]";
+
+  const WEAPON_DEFS = {
+      lmg: {
+          name: "LMG",
+          baseHealth: 75,
+          damage: 8,
+          fireInterval: 0.08,
+          magSize: 80,
+          reloadTime: 2.5,
+          range: 40,
+          spread: 0.06,
+          bulletsPerShot: 1,
+          recoil: 0.01,
+          moveSpeed: 6.875,
+          auto: true,
+          color: 0x6aa0ff,
+      },
+      rifle: {
+          name: "RIFLE",
+          baseHealth: 100,
+          damage: 25,
+          fireInterval: 0.25,
+          magSize: 20,
+          reloadTime: 1.8,
+          range: 80,
+          spread: 0.02,
+          bulletsPerShot: 1,
+          recoil: 0.03,
+          moveSpeed: 5.5,
+          auto: false,
+          color: 0x00ff88,
+      },
+      shotgun: {
+          name: "SHOTGUN",
+          baseHealth: 125,
+          damage: 18,
+          fireInterval: 0.6,
+          magSize: 6,
+          reloadTime: 2.0,
+          range: 22,
+          spread: 0.22,
+          bulletsPerShot: 8,
+          recoil: 0.08,
+          moveSpeed: 4.125,
+          auto: false,
+          color: 0xffaa33,
+      },
+  };
+
+  const ENEMY_DEFS = {
+      swarm: {
+          name: "Swarm Bot",
+          health: 15,
+          speed: 4,
+          damage: 6,
+          range: 1.6,
+          cooldown: 0.8,
+          score: 50,
+          radius: 0.45,
+          color: 0xffaa00,
+          scale: 0.55,
+      },
+      drone: {
+          name: "Drone",
+          health: 30,
+          speed: 5,
+          damage: 10,
+          range: 2.4,
+          cooldown: 1.5,
+          score: 100,
+          radius: 0.55,
+          color: 0xff3333,
+          scale: 0.8,
+      },
+      walker: {
+          name: "Walker",
+          health: 80,
+          speed: 3,
+          damage: 20,
+          range: 2.8,
+          cooldown: 2.0,
+          score: 200,
+          radius: 0.75,
+          color: 0xff6600,
+          scale: 1.15,
+      },
+      tank: {
+          name: "Tank",
+          health: 200,
+          speed: 1.5,
+          damage: 35,
+          range: 4.6,
+          cooldown: 3.0,
+          score: 500,
+          radius: 1.15,
+          color: 0xcc0000,
+          scale: 1.65,
+      },
+      sniper: {
+          name: "Sniper Bot",
+          health: 60,
+          speed: 2.5,
+          damage: 55,
+          range: 22,
+          cooldown: 5.0,
+          score: 350,
+          radius: 0.7,
+          color: 0xaa00ff,
+          scale: 1.0,
+      },
+      mortar: {
+          name: "Mortar Bot",
+          health: 70,
+          speed: 1.2,
+          damage: 50,
+          range: 34,
+          cooldown: 4.0,
+          score: 300,
+          radius: 0.8,
+          color: 0x884400,
+          scale: 1.0,
+      },
+      medic: {
+          name: "Medic Bot",
+          health: 90,
+          speed: 2.8,
+          damage: 0,
+          range: 0,
+          cooldown: 0,
+          score: 260,
+          radius: 0.7,
+          color: 0x22cc66,
+          scale: 1.0,
+      },
+      spectre: {
+          name: "Spectre",
+          health: 70,
+          speed: 4.2,
+          damage: 28,
+          range: 3.1,
+          cooldown: 1.4,
+          score: 380,
+          radius: 0.7,
+          color: 0x88bbff,
+          scale: 1.0,
+      },
+      shielder: {
+          name: "Shielder",
+          health: 180,
+          speed: 2.1,
+          damage: 35,
+          range: 3.6,
+          cooldown: 2.2,
+          score: 450,
+          radius: 0.95,
+          color: 0x999999,
+          scale: 1.25,
+      },
+      pinky: {
+          name: "Pinky Rider",
+          health: 350,
+          speed: 3.5,
+          damage: 40,
+          range: 3.8,
+          cooldown: 3.0,
+          score: 600,
+          radius: 1.0,
+          color: 0xff0066,
+          scale: 1.3,
+      },
+      carmackion: {
+          name: "CARMACKION",
+          health: 800,
+          speed: 4.2,
+          damage: 20,
+          range: 20,
+          cooldown: 1.8,
+          score: 2000,
+          radius: 2.0,
+          color: 0x00dd88,
+          scale: 2.2,
+          boss: true,
+      },
+      darioltman: {
+          name: "DARIOLTMAN",
+          health: 1500,
+          speed: 2.9,
+          damage: 45,
+          range: 15,
+          cooldown: 2.4,
+          score: 4000,
+          radius: 2.6,
+          color: 0xff0044,
+          scale: 3.0,
+          boss: true,
+      },
+      nanoman: {
+          name: "NANOMAN",
+          health: 2500,
+          speed: 2.5,
+          damage: 60,
+          range: 17,
+          cooldown: 1.6,
+          score: 6000,
+          radius: 3.0,
+          color: 0x44ff00,
+          scale: 3.5,
+          boss: true,
+      },
+  };
+
+  const UPGRADES = [
+      {id: "damage_up", name: "OVERDRIVE", text: "+25% weapon damage", kind: "damage"},
+      {id: "fire_rate_up", name: "OVERCLOCK", text: "+20% fire rate", kind: "fire"},
+      {id: "mag_size_up", name: "EXPANDED MAG", text: "+30% magazine", kind: "mag"},
+      {id: "health_up", name: "ARMOR PLATE", text: "+25 max HP", kind: "health"},
+      {id: "heal", name: "REPAIR KIT", text: "Restore 50% HP", kind: "heal"},
+      {id: "speed_up", name: "TURBO BOOST", text: "+15% move speed", kind: "speed"},
+      {id: "spread_down", name: "PRECISION", text: "-30% weapon spread", kind: "spread"},
+      {id: "reload_speed", name: "QUICK LOAD", text: "-25% reload time", kind: "reload"},
+      {id: "extra_bullet", name: "MULTI-SHOT", text: "+1 projectile per shot", kind: "bullet"},
+      {id: "jump", name: "JUMP JETS", text: "Unlock jump", kind: "jump"},
+      {id: "double_jump", name: "DOUBLE JUMP", text: "Unlock second jump", kind: "doubleJump"},
+      {id: "sprint", name: "SPRINT BOOTS", text: "Unlock sprint", kind: "sprint"},
+      {id: "nano_repair", name: "NANO REPAIR", text: "+3 HP per second", kind: "regen"},
+      {id: "nova_grenade", name: "NOVA GRENADE", text: "+3 grenades", kind: "grenade"},
+      {id: "ability_dash", name: "DASH MODULE", text: "RMB dash", kind: "ability", ability: "dash"},
+      {id: "ability_shield", name: "BARRIER WALL", text: "RMB barrier", kind: "ability", ability: "shield"},
+      {id: "ability_invincible", name: "PHASE SHIFT", text: "RMB invincible", kind: "ability", ability: "phase"},
+      {id: "ability_grapple", name: "GRAPPLE HOOK", text: "RMB pull target", kind: "ability", ability: "grapple"},
+      {id: "ability_rendezvous", name: "RENDEZVOUS", text: "RMB mark/teleport", kind: "ability", ability: "rendezvous"},
+  ];
+
+  const FRAGMENTS = [
+      {id: "byte_garlic", name: "BYTE WARD", unlockWave: 2},
+      {id: "spear_protocol", name: "SPEAR PROTOCOL", unlockWave: 3},
+      {id: "obus", name: "HOWITZER", unlockWave: 4},
+      {id: "trojan", name: "TROJAN", unlockWave: 5},
+      {id: "doom_streak", name: "DOOM", unlockWave: 7},
+      {id: "blood_link", name: "BLOOD LINK", unlockWave: 8},
+      {id: "shell", name: "SHELL", unlockWave: 9},
+      {id: "overclock", name: "OVERCLOCK", unlockWave: 11},
+      {id: "death_warrant", name: "MEMENTO MORI", unlockWave: 12},
+      {id: "glass_cannon", name: "GLASS CANNON", unlockWave: 15},
+  ];
+
+  let game = null;
+  let erth = null;
+  let owner = null;
+  let host = null;
+  let playerObject = null;
+  let im = null;
+  let canvas = null;
+  let onCanvasClick = null;
+
+  // FPS view-look uses a raw pointermove listener because
+  // `InputManager.getMotion("view_x"|"view_y")` returns the ACCUMULATED pixel
+  // delta and is never auto-reset, which produces continuous camera spin
+  // after any mouse motion. See docs/examples/canonical/fps_view_delta.js.
+  let viewDx = 0;
+  let viewDy = 0;
+  let onPointerMove = null;
+
+  const KEY_ACTIONS = {
+      Digit1: "ma_Digit1",
+      Digit2: "ma_Digit2",
+      Digit3: "ma_Digit3",
+      Digit4: "ma_Digit4",
+      Digit5: "ma_Digit5",
+      Digit6: "ma_Digit6",
+      Digit7: "ma_Digit7",
+      Digit8: "ma_Digit8",
+      Digit9: "ma_Digit9",
+      Tab: "ma_Tab",
+      Enter: "ma_Enter",
+      Escape: "ma_Escape",
+      KeyG: "ma_KeyG",
+  };
+
+  let worldGroup = null;
+  let enemyGroup = null;
+  let projectileGroup = null;
+  let vfxGroup = null;
+  let weaponGroup = null;
+  let uiRoot = null;
+  let uiParented = false;
+  let ui = {};
+
+  let materials = [];
+  let sounds = {};
+  let activeMusic = null;
+
+  const prevActions = {};
+  const enemies = [];
+  const projectiles = [];
+  const particles = [];
+  const trails = [];
+  const obstacles = [];
+  const walkables = [];
+  const jumpPads = [];
+
+  const raycaster = new THREE.Raycaster();
+  const tmpA = new THREE.Vector3();
+  const tmpB = new THREE.Vector3();
+  const tmpC = new THREE.Vector3();
+  const tmpD = new THREE.Vector3();
+  const tmpForward = new THREE.Vector3();
+  const tmpRight = new THREE.Vector3();
+  const tmpEuler = new THREE.Euler(0, 0, 0, "YXZ");
+  const tmpColor = new THREE.Color();
+
+  const state = {
+      phase: "menu",
+      time: 0,
+      message: "ENTER: deploy   TAB: workshop   1/2/3: class",
+      messageTimer: 99,
+      selectedClass: "rifle",
+      wave: 0,
+      totalWaves: 15,
+      waveInProgress: false,
+      health: 100,
+      maxHealth: 100,
+      score: 0,
+      gears: 0,
+      bankedGears: 0,
+      kills: 0,
+      yaw: 0,
+      pitch: 0,
+      pos: new THREE.Vector3(0, 1.6, 8),
+      velY: 0,
+      grounded: true,
+      canJump: false,
+      canDoubleJump: false,
+      hasDoubleJumped: false,
+      canSprint: false,
+      sprinting: false,
+      dashVelX: 0,
+      dashVelZ: 0,
+      weapon: null,
+      reloadTimer: 0,
+      lastShot: -99,
+      fireHeldLast: false,
+      grenades: 0,
+      regenRate: 0,
+      damageResist: 0,
+      ability: null,
+      abilityCooldown: 0,
+      invincibleTimer: 0,
+      barrierTimer: 0,
+      rendezvousSet: false,
+      rendezvousX: 0,
+      rendezvousZ: 0,
+      upgradeCards: [],
+      fragment: null,
+      fragmentTimer: 0,
+      fragmentTimer2: 0,
+      doomStreak: 0,
+      doomMultiplier: 1,
+      noHitTimer: 0,
+      shellHits: 0,
+      deathWarrantTimer: 0,
+      deathWarrantCooldown: 0,
+      overclocking: false,
+      meta: {
+          gears: 0,
+          startJump: false,
+          startSprint: false,
+          maxHealthBonus: 0,
+          gearBonus: 0,
+          abilityCooldownBonus: 0,
+          unlockedFragments: [],
+          fragmentIndex: -1,
+      },
+  };
+
+  function attr(name, fallback) {
+      const value = owner ? owner.getAttribute(name) : undefined;
+      return value === undefined || value === null ? fallback : value;
+  }
+
+  function clamp(v, lo, hi) {
+      return Math.max(lo, Math.min(hi, v));
+  }
+
+  function markRuntime(obj) {
+      obj.userData.isRuntimeOnly = true;
+      if (obj.traverse) {
+          obj.traverse(function (child) {
+              child.userData.isRuntimeOnly = true;
+          });
+      }
+  }
+
+  function matStandard(color, extra) {
+      const params = {color: color, roughness: 0.55, metalness: 0.55};
+      if (extra) {
+          for (const key in extra) params[key] = extra[key];
+      }
+      const mat = new THREE.MeshStandardNodeMaterial(params);
+      materials.push(mat);
+      return mat;
+  }
+
+  function matBasic(color, extra) {
+      const params = {color: color};
+      if (extra) {
+          for (const key in extra) params[key] = extra[key];
+      }
+      const mat = new THREE.MeshBasicNodeMaterial(params);
+      materials.push(mat);
+      return mat;
+  }
+
+  function matLine(color, extra) {
+      const params = {color: color};
+      if (extra) {
+          for (const key in extra) params[key] = extra[key];
+      }
+      const mat = new THREE.LineBasicNodeMaterial(params);
+      materials.push(mat);
+      return mat;
+  }
+
+  function addBox(parent, name, w, h, d, x, y, z, material) {
+      const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), material);
+      mesh.name = name;
+      mesh.position.set(x, y, z);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      markRuntime(mesh);
+      parent.add(mesh);
+      return mesh;
+  }
+
+  function addCylinder(parent, name, r, h, x, y, z, material, sides) {
+      const mesh = new THREE.Mesh(new THREE.CylinderGeometry(r, r, h, sides || 8), material);
+      mesh.name = name;
+      mesh.position.set(x, y, z);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      markRuntime(mesh);
+      parent.add(mesh);
+      return mesh;
+  }
+
+  function addObstacle(x, z, w, d, h) {
+      obstacles.push({minX: x - w * 0.5, maxX: x + w * 0.5, minZ: z - d * 0.5, maxZ: z + d * 0.5, height: h});
+  }
+
+  function addWalkable(x, z, w, d, topY) {
+      walkables.push({x: x, z: z, w: w, d: d, topY: topY});
+  }
+
+  function disposeObject(obj) {
+      if (!obj) return;
+      if (obj.parent) obj.parent.remove(obj);
+      if (obj.traverse) {
+          obj.traverse(function (child) {
+              if (child.geometry && child.geometry.dispose) child.geometry.dispose();
+              if (child.material) {
+                  if (Array.isArray(child.material)) {
+                      for (let i = 0; i < child.material.length; i++) {
+                          if (child.material[i] && child.material[i].dispose) child.material[i].dispose();
+                      }
+                  } else if (child.material.dispose) {
+                      child.material.dispose();
+                  }
+              }
+          });
+      }
+  }
+
+  function cleanupRuntime() {
+      disposeObject(worldGroup);
+      disposeObject(enemyGroup);
+      disposeObject(projectileGroup);
+      disposeObject(vfxGroup);
+      disposeObject(weaponGroup);
+      worldGroup = null;
+      enemyGroup = null;
+      projectileGroup = null;
+      vfxGroup = null;
+      weaponGroup = null;
+      obstacles.length = 0;
+      walkables.length = 0;
+      jumpPads.length = 0;
+      enemies.length = 0;
+      projectiles.length = 0;
+      particles.length = 0;
+      trails.length = 0;
+      for (let i = 0; i < materials.length; i++) {
+          if (materials[i] && materials[i].dispose) materials[i].dispose();
+      }
+      materials = [];
+  }
+
+  function buildArena() {
+      cleanupRuntime();
+      host = owner.gameObject._internal.three;
+
+      worldGroup = new THREE.Group();
+      worldGroup.name = "MA_RuntimeWorld";
+      enemyGroup = new THREE.Group();
+      enemyGroup.name = "MA_Enemies";
+      projectileGroup = new THREE.Group();
+      projectileGroup.name = "MA_Projectiles";
+      vfxGroup = new THREE.Group();
+      vfxGroup.name = "MA_VFX";
+      markRuntime(worldGroup);
+      markRuntime(enemyGroup);
+      markRuntime(projectileGroup);
+      markRuntime(vfxGroup);
+      host.add(worldGroup);
+      host.add(enemyGroup);
+      host.add(projectileGroup);
+      host.add(vfxGroup);
+
+      const metal = matStandard(0x515b58, {roughness: 0.35, metalness: 0.9});
+      const dark = matStandard(0x202827, {roughness: 0.5, metalness: 0.8});
+      const green = matBasic(0x00ff77, {transparent: true, opacity: 0.85});
+      const red = matBasic(0xff3322, {transparent: true, opacity: 0.82});
+      const amber = matBasic(0xffaa33, {transparent: true, opacity: 0.8});
+      const size = attr("arenaSize", 40);
+
+      for (let ix = -4; ix < 4; ix++) {
+          for (let iz = -4; iz < 4; iz++) {
+              const x = ix * 10 + 5;
+              const z = iz * 10 + 5;
+              const mat = Math.abs(ix) <= 1 && Math.abs(iz) <= 1 ? dark : metal;
+              addBox(worldGroup, "FloorPlate", 9.85, 0.35, 9.85, x, -0.18, z, mat);
+              if ((ix + iz) % 3 === 0) addBox(worldGroup, "CircuitLine", 9.5, 0.08, 0.08, x, 0.05, z + 4.9, green);
+          }
+      }
+
+      addBox(worldGroup, "WallNorth", size * 1.55, 10, 2, 0, 5, -size, dark);
+      addBox(worldGroup, "WallSouth", size * 1.55, 10, 2, 0, 5, size, dark);
+      addBox(worldGroup, "WallWest", 2, 10, size * 1.55, -size, 5, 0, dark);
+      addBox(worldGroup, "WallEast", 2, 10, size * 1.55, size, 5, 0, dark);
+
+      const cornerData = [
+          [-size + 6, -size + 6, 0.785],
+          [size - 6, -size + 6, -0.785],
+          [-size + 6, size - 6, -0.785],
+          [size - 6, size - 6, 0.785],
+      ];
+      for (let c = 0; c < cornerData.length; c++) {
+          const wall = addBox(worldGroup, "CornerWall", 20, 10, 2, cornerData[c][0], 5, cornerData[c][1], dark);
+          wall.rotation.y = cornerData[c][2];
+          addObstacle(cornerData[c][0], cornerData[c][1], 14, 14, 10);
+      }
+
+      const walkwayY = 5;
+      const walks = [
+          [-size + 4, 0, 5.5, 40],
+          [size - 4, 0, 5.5, 40],
+          [0, -size + 4, 40, 5.5],
+          [0, size - 4, 40, 5.5],
+      ];
+      for (let i = 0; i < walks.length; i++) {
+          addBox(worldGroup, "Walkway", walks[i][2], 0.45, walks[i][3], walks[i][0], walkwayY, walks[i][1], metal);
+          addBox(
+              worldGroup,
+              "WalkwayGlow",
+              walks[i][2],
+              0.12,
+              walks[i][3],
+              walks[i][0],
+              walkwayY + 0.3,
+              walks[i][1],
+              i % 2 === 0 ? green : amber,
+          );
+          addWalkable(walks[i][0], walks[i][1], walks[i][2], walks[i][3], walkwayY + 0.23);
+      }
+
+      const crates = [
+          [-12, -10, 3, 2, 3],
+          [13, -8, 4, 2.5, 2],
+          [-16, 13, 2.5, 2.5, 4],
+          [16, 14, 4, 2, 3],
+          [0, 16, 7, 1.2, 2],
+          [0, -18, 7, 1.2, 2],
+          [-22, 0, 2.5, 5, 2.5],
+          [22, 0, 2.5, 5, 2.5],
+      ];
+      for (let j = 0; j < crates.length; j++) {
+          addBox(
+              worldGroup,
+              "ArenaCover",
+              crates[j][2],
+              crates[j][3],
+              crates[j][4],
+              crates[j][0],
+              crates[j][3] * 0.5,
+              crates[j][1],
+              j % 2 === 0 ? dark : metal,
+          );
+          addObstacle(crates[j][0], crates[j][1], crates[j][2], crates[j][4], crates[j][3]);
+          addWalkable(crates[j][0], crates[j][1], crates[j][2], crates[j][4], crates[j][3]);
+      }
+
+      for (let p = 0; p < 8; p++) {
+          const a = (p / 8) * Math.PI * 2;
+          const x = Math.cos(a) * 24;
+          const z = Math.sin(a) * 24;
+          addCylinder(worldGroup, "Pillar", 0.75, 7, x, 3.5, z, dark, 8);
+          addBox(worldGroup, "PillarLight", 0.16, 6, 0.16, x, 3.5, z + 0.8, green);
+          addObstacle(x, z, 1.6, 1.6, 7);
+      }
+
+      for (let pad = 0; pad < 4; pad++) {
+          const a = (pad / 4) * Math.PI * 2 + Math.PI / 4;
+          const x = Math.cos(a) * 15;
+          const z = Math.sin(a) * 15;
+          const base = addCylinder(worldGroup, "JumpPad", 1.4, 0.15, x, 0.08, z, red, 12);
+          base.visible = false;
+          jumpPads.push({x: x, z: z, radius: 2.2, mesh: base});
+      }
+
+      const core = addCylinder(worldGroup, "CentralCore", 2.2, 1.2, 0, 0.6, 0, green, 12);
+      addBox(worldGroup, "CentralCoreCap", 4.2, 0.2, 4.2, 0, 1.25, 0, amber);
+      core.rotation.y = 0.4;
+
+      const light1 = new THREE.PointLight(0x00ff88, 4, 42);
+      light1.position.set(0, 7, 0);
+      const light2 = new THREE.PointLight(0xff331a, 2.5, 34);
+      light2.position.set(-18, 6, 18);
+      markRuntime(light1);
+      markRuntime(light2);
+      worldGroup.add(light1);
+      worldGroup.add(light2);
+
+      buildWeaponView();
+  }
+
+  function buildWeaponView() {
+      weaponGroup = new THREE.Group();
+      weaponGroup.name = "MA_WeaponView";
+      markRuntime(weaponGroup);
+      if (game.camera) game.camera.add(weaponGroup); // @check-ok first-person weapon model parented to game camera
+      const metal = matStandard(0x2f3838, {roughness: 0.3, metalness: 0.8});
+      const accent = matBasic(0x00ff88, {transparent: true, opacity: 0.9});
+      addBox(weaponGroup, "GunBody", 0.22, 0.18, 0.65, 0.22, -0.22, -0.48, metal);
+      addBox(weaponGroup, "GunBarrel", 0.09, 0.09, 0.48, 0.22, -0.19, -0.92, accent);
+      addBox(weaponGroup, "GunGrip", 0.13, 0.32, 0.16, 0.18, -0.44, -0.35, metal);
+  }
+
+  function createEnemyMesh(type, def) {
+      const group = new THREE.Group();
+      group.name = "MA_" + def.name;
+      const scale = def.scale || 1;
+      const bodyMat = matStandard(def.color, {roughness: 0.42, metalness: 0.72});
+      const eyeMat = matBasic(0xff1111, {transparent: true, opacity: 0.95});
+      const glowMat = matBasic(def.color, {transparent: true, opacity: 0.4});
+
+      if (type === "swarm") {
+          const body = new THREE.Mesh(new THREE.IcosahedronGeometry(0.55 * scale, 0), bodyMat);
+          body.position.y = 0.65;
+          group.add(body);
+      } else if (type === "drone") {
+          const body = new THREE.Mesh(new THREE.OctahedronGeometry(0.55 * scale, 0), bodyMat);
+          body.position.y = 1.55;
+          group.add(body);
+          for (let i = 0; i < 4; i++) {
+              const arm = addBox(group, "DroneArm", 0.08, 0.05, 0.75 * scale, 0, 1.55, 0, bodyMat);
+              arm.rotation.y = (i / 4) * Math.PI * 2;
+          }
+      } else if (type === "tank") {
+          addBox(group, "TankBase", 1.8 * scale, 0.7 * scale, 2.3 * scale, 0, 0.45 * scale, 0, bodyMat);
+          addBox(group, "TankTurret", 1.2 * scale, 0.5 * scale, 1.2 * scale, 0, 1.15 * scale, 0, bodyMat);
+          addBox(group, "TankCannon", 0.22 * scale, 0.22 * scale, 1.4 * scale, 0, 1.18 * scale, 0.95 * scale, eyeMat);
+      } else if (type === "sniper") {
+          addBox(group, "SniperBody", 0.65 * scale, 1.6 * scale, 0.5 * scale, 0, 0.9 * scale, 0, bodyMat);
+          addBox(group, "SniperBarrel", 0.12 * scale, 0.12 * scale, 1.35 * scale, 0, 1.35 * scale, 0.75 * scale, eyeMat);
+          const laser = addBox(
+              group,
+              "SniperLaser",
+              0.05,
+              0.05,
+              1,
+              0,
+              1.35 * scale,
+              1.4 * scale,
+              matBasic(0xff0000, {transparent: true, opacity: 0.75}),
+          );
+          laser.visible = false;
+          group.userData.laser = laser;
+      } else if (type === "mortar") {
+          addCylinder(group, "MortarBase", 0.55 * scale, 0.6 * scale, 0, 0.3 * scale, 0, bodyMat, 8);
+          const tube = addCylinder(group, "MortarTube", 0.18 * scale, 1.1 * scale, 0, 1.0 * scale, 0, bodyMat, 8);
+          tube.rotation.x = Math.PI * 0.28;
+      } else if (type === "medic") {
+          addBox(group, "MedicBody", 0.75 * scale, 1.4 * scale, 0.55 * scale, 0, 0.8 * scale, 0, bodyMat);
+          addBox(group, "MedicCrossA", 0.12, 0.7, 0.08, 0, 1.0 * scale, 0.31, eyeMat);
+          addBox(group, "MedicCrossB", 0.5, 0.12, 0.08, 0, 1.0 * scale, 0.32, eyeMat);
+      } else if (type === "shielder") {
+          addBox(group, "ShielderBody", 0.9 * scale, 1.5 * scale, 0.55 * scale, 0, 0.8 * scale, -0.15, bodyMat);
+          addBox(group, "ShielderPlate", 1.15 * scale, 1.3 * scale, 0.16 * scale, 0, 0.85 * scale, 0.45 * scale, glowMat);
+      } else if (type === "pinky") {
+          addBox(group, "PinkyMount", 1.3 * scale, 0.9 * scale, 1.8 * scale, 0, 0.55 * scale, 0, bodyMat);
+          addBox(group, "PinkyRider", 0.55 * scale, 0.9 * scale, 0.45 * scale, 0, 1.35 * scale, -0.15 * scale, eyeMat);
+      } else if (def.boss) {
+          addBox(group, "BossTorso", 1.1 * scale, 1.7 * scale, 0.8 * scale, 0, 1.35 * scale, 0, bodyMat);
+          addBox(group, "BossHead", 0.7 * scale, 0.55 * scale, 0.65 * scale, 0, 2.45 * scale, 0.05 * scale, bodyMat);
+          addBox(group, "BossLeftArm", 0.32 * scale, 1.2 * scale, 0.32 * scale, -0.8 * scale, 1.35 * scale, 0, bodyMat);
+          addBox(group, "BossRightArm", 0.32 * scale, 1.2 * scale, 0.32 * scale, 0.8 * scale, 1.35 * scale, 0, bodyMat);
+          addBox(group, "BossCore", 0.45 * scale, 0.45 * scale, 0.12 * scale, 0, 1.45 * scale, 0.45 * scale, eyeMat);
+      } else {
+          addBox(group, "WalkerBody", 0.75 * scale, 1.25 * scale, 0.55 * scale, 0, 0.9 * scale, 0, bodyMat);
+          addBox(group, "WalkerHead", 0.48 * scale, 0.38 * scale, 0.45 * scale, 0, 1.72 * scale, 0.08 * scale, bodyMat);
+          addBox(group, "EyeL", 0.09, 0.09, 0.07, -0.12 * scale, 1.73 * scale, 0.34 * scale, eyeMat);
+          addBox(group, "EyeR", 0.09, 0.09, 0.07, 0.12 * scale, 1.73 * scale, 0.34 * scale, eyeMat);
+      }
+
+      const hpGroup = new THREE.Group();
+      hpGroup.name = "HPBar";
+      hpGroup.position.y = def.boss ? 3.2 * scale : 2.3 * scale;
+      const hpBg = addBox(hpGroup, "HPBg", 1.2, 0.08, 0.04, 0, 0, 0, matBasic(0x330000));
+      const hpFill = addBox(hpGroup, "HPFill", 1.2, 0.08, 0.05, 0, 0, 0.03, matBasic(0xff2222));
+      group.add(hpGroup);
+      group.userData.hpGroup = hpGroup;
+      group.userData.hpFill = hpFill;
+      markRuntime(group);
+      return group;
+  }
+
+  function createEnemy(type, x, z, waveMultiplier) {
+      const def = ENEMY_DEFS[type] || ENEMY_DEFS.walker;
+      const enemy = {
+          type: type,
+          name: def.name,
+          maxHealth: def.health * waveMultiplier * attr("enemyHealthMultiplier", 1),
+          health: 0,
+          speed: def.speed,
+          damage: def.damage * attr("enemyDamageMultiplier", 1),
+          range: def.range,
+          cooldown: def.cooldown,
+          score: def.score,
+          radius: def.radius,
+          boss: !!def.boss,
+          phase: 1,
+          attackTimer: 0.7 + Math.random() * 0.8,
+          specialTimer: 2 + Math.random() * 2,
+          slowTimer: 0,
+          alive: true,
+          telegraph: 0,
+          lockX: 0,
+          lockZ: 0,
+          mesh: null,
+      };
+      enemy.health = enemy.maxHealth;
+      enemy.mesh = createEnemyMesh(type, def);
+      enemy.mesh.position.set(x, 0, z);
+      enemyGroup.add(enemy.mesh);
+      enemies.push(enemy);
+      return enemy;
+  }
+
+  function selectClass(id) {
+      if (!WEAPON_DEFS[id]) return;
+      state.selectedClass = id;
+      setMessage("CLASS: " + WEAPON_DEFS[id].name, 2.0);
+      publishState();
+  }
+
+  function resetRun() {
+      const def = WEAPON_DEFS[state.selectedClass] || WEAPON_DEFS.rifle;
+      state.time = 0;
+      state.wave = 0;
+      state.health = def.baseHealth + state.meta.maxHealthBonus;
+      state.maxHealth = state.health;
+      state.score = 0;
+      state.gears = 0;
+      state.kills = 0;
+      state.waveInProgress = false;
+      state.pos.set(0, attr("playerEyeHeight", 1.6), 8);
+      state.velY = 0;
+      state.grounded = true;
+      state.canJump = !!state.meta.startJump;
+      state.canDoubleJump = false;
+      state.hasDoubleJumped = false;
+      state.canSprint = !!state.meta.startSprint;
+      state.sprinting = false;
+      state.dashVelX = 0;
+      state.dashVelZ = 0;
+      state.grenades = 0;
+      state.regenRate = 0;
+      state.damageResist = 0;
+      state.ability = null;
+      state.abilityCooldown = 0;
+      state.invincibleTimer = 0;
+      state.barrierTimer = 0;
+      state.rendezvousSet = false;
+      state.fragmentTimer = 0;
+      state.fragmentTimer2 = 0;
+      state.doomStreak = 0;
+      state.doomMultiplier = 1;
+      state.noHitTimer = 0;
+      state.shellHits = 0;
+      state.deathWarrantTimer = 0;
+      state.deathWarrantCooldown = 0;
+      state.overclocking = false;
+      state.weapon = {
+          type: state.selectedClass,
+          name: def.name,
+          damage: def.damage,
+          fireInterval: def.fireInterval,
+          magSize: def.magSize,
+          ammo: def.magSize,
+          reloadTime: def.reloadTime,
+          range: def.range,
+          spread: def.spread,
+          bulletsPerShot: def.bulletsPerShot,
+          recoil: def.recoil,
+          moveSpeed: def.moveSpeed,
+          auto: def.auto,
+          damageMultiplier: 1,
+          fireRateMultiplier: 1,
+          magMultiplier: 1,
+      };
+      if (state.fragment === "glass_cannon") {
+          state.maxHealth = Math.max(1, Math.round(state.maxHealth * 0.5));
+          state.health = state.maxHealth;
+          state.weapon.damageMultiplier *= 2;
+      }
+      clearRuntimeActors();
+      buildArena();
+  }
+
+  function clearRuntimeActors() {
+      for (let i = enemies.length - 1; i >= 0; i--) disposeObject(enemies[i].mesh);
+      for (let j = projectiles.length - 1; j >= 0; j--) disposeObject(projectiles[j].mesh);
+      for (let k = particles.length - 1; k >= 0; k--) disposeObject(particles[k].mesh);
+      for (let t = trails.length - 1; t >= 0; t--) disposeObject(trails[t].mesh);
+      enemies.length = 0;
+      projectiles.length = 0;
+      particles.length = 0;
+      trails.length = 0;
+  }
+
+  function startRun() {
+      resetRun();
+      state.phase = "playing";
+      state.totalWaves = Math.floor(attr("totalWaves", 15));
+      setMessage("DEPLOYED: " + state.weapon.name, 2.5);
+      requestLock();
+      startNextWave();
+      playMusic("combat");
+      owner._log("run start", state.selectedClass);
+      publishState();
+  }
+
+  function startNextWave() {
+      state.wave++;
+      state.waveInProgress = true;
+      const wave = state.wave;
+      const bossWave = wave % 5 === 0;
+      const waveMult = 1 + (wave - 1) * 0.15;
+      const countBase = attr("waveBaseCount", 3) + wave * attr("waveCountStep", 2);
+      const count = bossWave ? Math.max(3, Math.floor(countBase * 0.4)) : countBase;
+      const size = attr("arenaSize", 40) - 4;
+
+      for (let i = 0; i < jumpPads.length; i++) jumpPads[i].mesh.visible = wave >= 5;
+
+      for (let i = 0; i < count; i++) {
+          const type = pickEnemyType(wave);
+          const side = Math.floor(Math.random() * 4);
+          let x = 0;
+          let z = 0;
+          if (side === 0) {
+              x = (Math.random() - 0.5) * size * 2;
+              z = -size;
+          }
+          if (side === 1) {
+              x = (Math.random() - 0.5) * size * 2;
+              z = size;
+          }
+          if (side === 2) {
+              x = -size;
+              z = (Math.random() - 0.5) * size * 2;
+          }
+          if (side === 3) {
+              x = size;
+              z = (Math.random() - 0.5) * size * 2;
+          }
+          createEnemy(type, x, z, waveMult);
+      }
+
+      if (bossWave) {
+          let boss = "carmackion";
+          if (wave >= 15) boss = "nanoman";
+          else if (wave >= 10) boss = "darioltman";
+          createEnemy(boss, 0, -size + 3, waveMult);
+          setMessage("BOSS: " + ENEMY_DEFS[boss].name, 3.5);
+          playMusic("boss");
+      } else {
+          setMessage("WAVE " + wave, 2.0);
+          playMusic("combat");
+      }
+      owner._log("wave start", wave, "enemies", enemies.length);
+      publishState();
+  }
+
+  function pickEnemyType(wave) {
+      const r = Math.random();
+      if (wave < 3) return r < 0.6 ? "swarm" : "drone";
+      if (wave < 5) {
+          if (r < 0.3) return "swarm";
+          if (r < 0.6) return "drone";
+          return "walker";
+      }
+      if (r < 0.1) return "swarm";
+      if (r < 0.24) return "drone";
+      if (r < 0.43) return "walker";
+      if (r < 0.58) return "tank";
+      if (r < 0.69) return "sniper";
+      if (r < 0.76) return "mortar";
+      if (r < 0.84) return "shielder";
+      if (r < 0.91) return wave >= 8 ? "medic" : "walker";
+      if (r < 0.97) return wave >= 10 ? "spectre" : "drone";
+      return "pinky";
+  }
+
+  function completeWave() {
+      state.waveInProgress = false;
+      unlockFragments();
+      if (state.wave >= state.totalWaves) {
+          state.phase = "victory";
+          state.meta.gears += state.gears;
+          setMessage("MISSION COMPLETE", 99);
+          playMusic("menu");
+          playOneShot("tyger");
+          publishState();
+          return;
+      }
+      state.upgradeCards = pickUpgradeCards();
+      state.phase = "upgrade";
+      setMessage("WAVE " + state.wave + " COMPLETE - SELECT 1/2/3", 99);
+      publishState();
+  }
+
+  function unlockFragments() {
+      for (let i = 0; i < FRAGMENTS.length; i++) {
+          const frag = FRAGMENTS[i];
+          if (state.wave >= frag.unlockWave && state.meta.unlockedFragments.indexOf(frag.id) === -1) {
+              state.meta.unlockedFragments.push(frag.id);
+              if (state.meta.fragmentIndex < 0) state.meta.fragmentIndex = 0;
+              setMessage("FRAGMENT UNLOCKED: " + frag.name, 4);
+          }
+      }
+  }
+
+  function pickUpgradeCards() {
+      const available = [];
+      for (let i = 0; i < UPGRADES.length; i++) {
+          const u = UPGRADES[i];
+          if (u.kind === "jump" && state.canJump) continue;
+          if (u.kind === "doubleJump" && (!state.canJump || state.canDoubleJump)) continue;
+          if (u.kind === "sprint" && state.canSprint) continue;
+          if (u.kind === "ability" && state.ability === u.ability) continue;
+          available.push(u);
+      }
+      const cards = [];
+      while (cards.length < 3 && available.length > 0) {
+          const idx = Math.floor(Math.random() * available.length);
+          cards.push(available.splice(idx, 1)[0]);
+      }
+      return cards;
+  }
+
+  function applyUpgrade(index) {
+      const u = state.upgradeCards[index];
+      if (!u || !state.weapon) return;
+      const w = state.weapon;
+      if (u.kind === "damage") w.damageMultiplier += 0.25;
+      else if (u.kind === "fire") w.fireRateMultiplier += 0.2;
+      else if (u.kind === "mag") {
+          w.magMultiplier += 0.3;
+          w.magSize = Math.floor(WEAPON_DEFS[w.type].magSize * w.magMultiplier);
+          w.ammo = w.magSize;
+      } else if (u.kind === "health") {
+          state.maxHealth += 25;
+          state.health = Math.min(state.maxHealth, state.health + 25);
+      } else if (u.kind === "heal") state.health = Math.min(state.maxHealth, state.health + state.maxHealth * 0.5);
+      else if (u.kind === "speed") w.moveSpeed *= 1.15;
+      else if (u.kind === "spread") w.spread *= 0.7;
+      else if (u.kind === "reload") w.reloadTime *= 0.75;
+      else if (u.kind === "bullet") w.bulletsPerShot += 1;
+      else if (u.kind === "jump") state.canJump = true;
+      else if (u.kind === "doubleJump") state.canDoubleJump = true;
+      else if (u.kind === "sprint") state.canSprint = true;
+      else if (u.kind === "regen") state.regenRate += 3;
+      else if (u.kind === "grenade") state.grenades += 3;
+      else if (u.kind === "ability") {
+          state.ability = u.ability;
+          state.abilityCooldown = 0;
+      }
+      state.phase = "playing";
+      state.upgradeCards = [];
+      w.ammo = Math.min(w.ammo, w.magSize);
+      setMessage("INSTALLED: " + u.name, 2.0);
+      requestLock();
+      startNextWave();
+      publishState();
+  }
+
+  function openWorkshop() {
+      state.phase = "workshop";
+      setMessage("WORKSHOP - spend banked gears, choose class, TAB exits", 99);
+      releaseLock();
+      playMusic("menu");
+      publishState();
+  }
+
+  function buyWorkshop(slot) {
+      const meta = state.meta;
+      if (slot === 1 && !meta.startJump && meta.gears >= 20) {
+          meta.gears -= 20;
+          meta.startJump = true;
+          setMessage("Purchased Jump Actuator", 2);
+      } else if (slot === 2 && !meta.startSprint && meta.gears >= 25) {
+          meta.gears -= 25;
+          meta.startSprint = true;
+          setMessage("Purchased Sprint Servo", 2);
+      } else if (slot === 3 && meta.gears >= 35) {
+          meta.gears -= 35;
+          meta.maxHealthBonus += 25;
+          setMessage("Purchased Plating Upgrade", 2);
+      } else if (slot === 4 && meta.gears >= 40) {
+          meta.gears -= 40;
+          meta.gearBonus += 0.15;
+          setMessage("Purchased Salvage Matrix", 2);
+      } else if (slot === 5 && meta.gears >= 45) {
+          meta.gears -= 45;
+          meta.abilityCooldownBonus += 0.1;
+          setMessage("Purchased Quick Deploy", 2);
+      } else if (slot === 6 && meta.unlockedFragments.length > 0) {
+          meta.fragmentIndex = (meta.fragmentIndex + 1) % meta.unlockedFragments.length;
+          state.fragment = meta.unlockedFragments[meta.fragmentIndex];
+          setMessage("Equipped " + getFragmentName(state.fragment), 2);
+      } else {
+          setMessage("Insufficient gears or already owned", 1.5);
+      }
+      publishState();
+  }
+
+  function openFieldShop() {
+      state.phase = "shop";
+      setMessage("FIELD CACHE - 1 armor  2 repair  3 ammo  4 core  TAB exits", 99);
+      releaseLock();
+      publishState();
+  }
+
+  function buyFieldShop(slot) {
+      if (slot === 1 && state.gears >= 15) {
+          state.gears -= 15;
+          state.damageResist = Math.min(0.5, state.damageResist + 0.08);
+          setMessage("Armor module installed", 1.5);
+      } else if (slot === 2 && state.gears >= 12) {
+          state.gears -= 12;
+          state.health = Math.min(state.maxHealth, state.health + 45);
+          setMessage("Field repair complete", 1.5);
+      } else if (slot === 3 && state.gears >= 10) {
+          state.gears -= 10;
+          state.weapon.ammo = state.weapon.magSize;
+          state.reloadTimer = 0;
+          setMessage("Ammo cache loaded", 1.5);
+      } else if (slot === 4 && state.gears >= 25) {
+          state.gears -= 25;
+          state.weapon.damageMultiplier += 0.15;
+          setMessage("Weapon core overdriven", 1.5);
+      } else setMessage("Not enough gears", 1.2);
+      publishState();
+  }
+
+  function closeOverlayToGame() {
+      state.phase = "playing";
+      setMessage("RESUME", 0.8);
+      requestLock();
+      playMusic(
+          enemies.some(function (e) {
+              return e.boss && e.alive;
+          })
+              ? "boss"
+              : "combat",
+      );
+      publishState();
+  }
+
+  function handleMenuInput() {
+      if (consumeKey("Digit1")) selectClass("lmg");
+      if (consumeKey("Digit2")) selectClass("rifle");
+      if (consumeKey("Digit3")) selectClass("shotgun");
+      if (consumeKey("Tab")) openWorkshop();
+      if (consumeKey("Enter") || defaultStartPressed()) startRun();
+  }
+
+  function handleOverlayInput() {
+      if (state.phase === "upgrade") {
+          if (consumeKey("Digit1")) applyUpgrade(0);
+          if (consumeKey("Digit2")) applyUpgrade(1);
+          if (consumeKey("Digit3")) applyUpgrade(2);
+          if (defaultStartPressed()) applyUpgrade(0);
+      } else if (state.phase === "workshop") {
+          if (consumeKey("Digit1")) selectClass("lmg");
+          if (consumeKey("Digit2")) selectClass("rifle");
+          if (consumeKey("Digit3")) selectClass("shotgun");
+          if (consumeKey("Digit4")) buyWorkshop(1);
+          if (consumeKey("Digit5")) buyWorkshop(2);
+          if (consumeKey("Digit6")) buyWorkshop(3);
+          if (consumeKey("Digit7")) buyWorkshop(4);
+          if (consumeKey("Digit8")) buyWorkshop(5);
+          if (consumeKey("Digit9")) buyWorkshop(6);
+          if (consumeKey("Tab") || consumeKey("Escape")) {
+              state.phase = "menu";
+              setMessage("ENTER: deploy   TAB: workshop   1/2/3: class", 99);
+              publishState();
+          }
+          if (consumeKey("Enter") || defaultStartPressed()) startRun();
+      } else if (state.phase === "shop") {
+          if (consumeKey("Digit1")) buyFieldShop(1);
+          if (consumeKey("Digit2")) buyFieldShop(2);
+          if (consumeKey("Digit3")) buyFieldShop(3);
+          if (consumeKey("Digit4")) buyFieldShop(4);
+          if (consumeKey("Tab") || consumeKey("Escape")) closeOverlayToGame();
+      } else if (state.phase === "paused") {
+          if (consumeKey("Escape") || consumeKey("Enter") || defaultStartPressed()) closeOverlayToGame();
+          if (consumeKey("Tab")) openFieldShop();
+      } else if (state.phase === "gameover" || state.phase === "victory") {
+          if (consumeKey("Enter") || defaultStartPressed()) {
+              state.phase = "menu";
+              setMessage("ENTER: deploy   TAB: workshop   1/2/3: class", 99);
+              publishState();
+          }
+      }
+  }
+
+  function updatePlayer(dt) {
+      const cam = game.camera;
+      if (!cam || !state.weapon) return;
+
+      const locked = typeof document !== "undefined" && document.pointerLockElement === canvas;
+      if (locked) {
+          const sens = attr("mouseSensitivity", 0.002);
+          state.yaw -= viewDx * sens;
+          state.pitch -= viewDy * sens;
+          state.pitch = clamp(state.pitch, -Math.PI * 0.49, Math.PI * 0.49);
+          viewDx = 0;
+          viewDy = 0;
+      } else {
+          // Drop any motion accumulated before lock engaged so the first
+          // post-lock frame doesn't snap the camera by the cursor's path.
+          viewDx = 0;
+          viewDy = 0;
+      }
+
+      tmpForward.set(0, 0, -1).applyAxisAngle(tmpA.set(0, 1, 0), state.yaw);
+      tmpRight.set(1, 0, 0).applyAxisAngle(tmpA.set(0, 1, 0), state.yaw);
+      tmpB.set(0, 0, 0);
+      if (im) {
+          tmpB.addScaledVector(tmpForward, im.getMotion("forward") || 0);
+          tmpB.addScaledVector(tmpRight, im.getMotion("lateral") || 0);
+      }
+      if (tmpB.lengthSq() > 0.0001) tmpB.normalize();
+
+      const shift = im ? !!im.getAction("run") : false;
+      const overclockAllowed = state.fragment === "overclock";
+      state.overclocking = overclockAllowed && shift && tmpB.lengthSq() > 0.0001;
+      state.sprinting = !overclockAllowed && state.canSprint && shift && state.grounded && tmpB.lengthSq() > 0.0001;
+
+      let speed = state.weapon.moveSpeed;
+      if (state.sprinting) speed *= 1.6;
+      if (state.overclocking) speed *= 2.0;
+      if (state.deathWarrantTimer > 0) speed *= 1.2;
+
+      const oldX = state.pos.x;
+      const oldZ = state.pos.z;
+      state.pos.x += tmpB.x * speed * dt;
+      collideAxis("x", oldX);
+      state.pos.z += tmpB.z * speed * dt;
+      collideAxis("z", oldZ);
+
+      if (state.dashVelX !== 0 || state.dashVelZ !== 0) {
+          const oldDx = state.pos.x;
+          const oldDz = state.pos.z;
+          state.pos.x += state.dashVelX * dt;
+          collideAxis("x", oldDx);
+          state.pos.z += state.dashVelZ * dt;
+          collideAxis("z", oldDz);
+          const decay = Math.exp(-dt * 14);
+          state.dashVelX *= decay;
+          state.dashVelZ *= decay;
+          if (Math.abs(state.dashVelX) < 0.05) state.dashVelX = 0;
+          if (Math.abs(state.dashVelZ) < 0.05) state.dashVelZ = 0;
+      }
+
+      const jumpPressed = pressedAction("jump");
+      if (jumpPressed && state.canJump && state.grounded) {
+          state.velY = attr("jumpForce", 9);
+          state.grounded = false;
+          state.hasDoubleJumped = false;
+      } else if (jumpPressed && state.canJump && state.canDoubleJump && !state.grounded && !state.hasDoubleJumped) {
+          state.velY = attr("jumpForce", 9) * 0.85;
+          state.hasDoubleJumped = true;
+      }
+
+      if (!state.grounded) {
+          state.velY -= attr("gravity", 22) * dt;
+          state.pos.y += state.velY * dt;
+      }
+
+      resolveGround();
+
+      if (state.grounded && state.wave >= 5) {
+          for (let i = 0; i < jumpPads.length; i++) {
+              const dx = state.pos.x - jumpPads[i].x;
+              const dz = state.pos.z - jumpPads[i].z;
+              if (dx * dx + dz * dz < jumpPads[i].radius * jumpPads[i].radius) {
+                  state.velY = attr("jumpForce", 9) * 2.4;
+                  state.grounded = false;
+                  state.hasDoubleJumped = false;
+                  setMessage("JUMP PAD", 0.8);
+                  break;
+              }
+          }
+      }
+
+      const baseFov = attr("baseFov", 75);
+      let targetFov = baseFov;
+      if (state.sprinting) targetFov = Math.min(120, baseFov + 13);
+      if (state.overclocking) targetFov = Math.min(125, baseFov + 18);
+      cam.fov += (targetFov - cam.fov) * 0.12;
+      cam.near = 0.1;
+      cam.far = 260;
+      cam.updateProjectionMatrix();
+      cam.position.copy(state.pos);
+      tmpEuler.set(state.pitch, state.yaw, 0);
+      cam.quaternion.setFromEuler(tmpEuler);
+
+      if (playerObject) {
+          playerObject.position.set(state.pos.x, state.pos.y - attr("playerEyeHeight", 1.6) + 0.9, state.pos.z);
+      }
+
+      if (weaponGroup) {
+          const bob =
+              tmpB.lengthSq() > 0.0001
+                  ? Math.sin(state.time * (state.sprinting || state.overclocking ? 14 : 9)) * 0.015
+                  : Math.sin(state.time * 3) * 0.004;
+          weaponGroup.position.set(0, bob, 0);
+      }
+  }
+
+  function collideAxis(axis, oldValue) {
+      const size = attr("arenaSize", 40) - 1.4;
+      state.pos.x = clamp(state.pos.x, -size, size);
+      state.pos.z = clamp(state.pos.z, -size, size);
+      const r = 0.45;
+      for (let i = 0; i < obstacles.length; i++) {
+          const obs = obstacles[i];
+          if (state.pos.y - attr("playerEyeHeight", 1.6) > obs.height + 0.2) continue;
+          if (
+              state.pos.x + r > obs.minX &&
+              state.pos.x - r < obs.maxX &&
+              state.pos.z + r > obs.minZ &&
+              state.pos.z - r < obs.maxZ
+          ) {
+              if (axis === "x") state.pos.x = oldValue;
+              else state.pos.z = oldValue;
+          }
+      }
+  }
+
+  function resolveGround() {
+      const eye = attr("playerEyeHeight", 1.6);
+      let groundY = eye;
+      for (let i = 0; i < walkables.length; i++) {
+          const w = walkables[i];
+          if (
+              state.pos.x > w.x - w.w * 0.5 - 0.3 &&
+              state.pos.x < w.x + w.w * 0.5 + 0.3 &&
+              state.pos.z > w.z - w.d * 0.5 - 0.3 &&
+              state.pos.z < w.z + w.d * 0.5 + 0.3
+          ) {
+              groundY = Math.max(groundY, w.topY + eye);
+          }
+      }
+      if (state.pos.y <= groundY) {
+          state.pos.y = groundY;
+          state.velY = 0;
+          state.grounded = true;
+          state.hasDoubleJumped = false;
+      } else if (state.grounded && state.pos.y > groundY + 0.15) {
+          state.grounded = false;
+      }
+  }
+
+  function updateWeapon(dt) {
+      if (!state.weapon) return;
+      if (state.reloadTimer > 0) {
+          state.reloadTimer -= dt;
+          if (state.reloadTimer <= 0) {
+              state.reloadTimer = 0;
+              state.weapon.ammo = state.weapon.magSize;
+              setMessage("RELOADED", 0.8);
+          }
+      }
+      if (pressedAction("reload")) startReload();
+      if (pressedAction("drop")) performMelee();
+      if (consumeKey("KeyG")) throwGrenade();
+      if (pressedAction("secondary")) activateAbility();
+
+      const primary = im ? !!im.getAction("primary") : false;
+      const canHold = state.weapon.auto || state.overclocking;
+      if (primary && (canHold || !state.fireHeldLast)) fireWeapon();
+      state.fireHeldLast = primary;
+  }
+
+  function startReload() {
+      if (!state.weapon || state.reloadTimer > 0 || state.weapon.ammo >= state.weapon.magSize) return;
+      state.reloadTimer = state.weapon.reloadTime;
+      setMessage("RELOADING", 0.8);
+  }
+
+  function fireWeapon() {
+      const w = state.weapon;
+      const fireMult = w.fireRateMultiplier * (state.overclocking ? 2 : 1);
+      if (state.time - state.lastShot < w.fireInterval / Math.max(0.1, fireMult)) return;
+      if (state.reloadTimer > 0) return;
+      const bloodLink = state.fragment === "blood_link";
+      if (w.ammo <= 0 && !bloodLink) {
+          startReload();
+          return;
+      }
+
+      state.lastShot = state.time;
+      if (!bloodLink) w.ammo--;
+      if (w.ammo <= 0 && !bloodLink) startReload();
+
+      let hitAny = false;
+      const cam = game.camera;
+      const pelletCount = w.bulletsPerShot;
+      const damageBase =
+          w.damage *
+          w.damageMultiplier *
+          attr("damageMultiplier", 1) *
+          (state.deathWarrantTimer > 0 ? 1.2 : 1) *
+          state.doomMultiplier;
+      for (let i = 0; i < pelletCount; i++) {
+          tmpA.set((Math.random() - 0.5) * w.spread, (Math.random() - 0.5) * w.spread, -1);
+          tmpA.applyQuaternion(cam.quaternion).normalize();
+          const hit = traceEnemy(cam.position, tmpA, w.range);
+          tmpB.copy(cam.position).addScaledVector(tmpA, hit.distance);
+          spawnTrail(cam.position, tmpB, WEAPON_DEFS[w.type].color);
+          if (hit.enemy) {
+              damageEnemy(hit.enemy, damageBase, cam.position);
+              hitAny = true;
+          }
+      }
+      spawnMuzzleFlash();
+      if (state.fragment === "doom_streak") {
+          if (hitAny) {
+              state.doomStreak++;
+              state.doomMultiplier = Math.min(3.5, Math.pow(1.1, state.doomStreak));
+          } else {
+              state.doomStreak = 0;
+              state.doomMultiplier = 1;
+          }
+      }
+      if (!hitAny && bloodLink) takeDamage(1.5, null, true);
+  }
+
+  function traceEnemy(origin, dir, range) {
+      let bestEnemy = null;
+      let bestT = range;
+      for (let i = 0; i < enemies.length; i++) {
+          const e = enemies[i];
+          if (!e.alive) continue;
+          tmpC.copy(e.mesh.position).sub(origin);
+          const t = tmpC.dot(dir);
+          if (t < 0 || t > bestT) continue;
+          tmpD.copy(origin).addScaledVector(dir, t);
+          const distSq = tmpD.distanceToSquared(e.mesh.position);
+          const r = e.radius * (e.boss ? 1.25 : 1.0);
+          if (distSq <= r * r) {
+              bestT = t;
+              bestEnemy = e;
+          }
+      }
+      return {enemy: bestEnemy, distance: bestT};
+  }
+
+  function damageEnemy(enemy, amount, sourcePos) {
+      if (!enemy || !enemy.alive) return;
+      let finalDamage = amount;
+      if (enemy.type === "shielder" && sourcePos) {
+          tmpA.set(0, 0, 1).applyQuaternion(enemy.mesh.quaternion).normalize();
+          tmpB.copy(sourcePos).sub(enemy.mesh.position).setY(0).normalize();
+          if (tmpA.dot(tmpB) > 0.35) finalDamage *= 0.25;
+      }
+      if (enemy.type === "nanoman" && enemy.phase === 3 && enemy.specialTimer > 1.2) finalDamage *= 0.2;
+      enemy.health -= finalDamage;
+      updateEnemyHp(enemy);
+      spawnParticle(enemy.mesh.position, enemy.boss ? 0xffaa00 : 0xff4400, enemy.boss ? 14 : 6);
+      if (enemy.health <= 0) killEnemy(enemy);
+  }
+
+  function updateEnemyHp(enemy) {
+      const fill = enemy.mesh.userData.hpFill;
+      if (!fill) return;
+      const ratio = clamp(enemy.health / enemy.maxHealth, 0, 1);
+      fill.scale.x = ratio;
+      fill.position.x = -(1.2 * (1 - ratio)) * 0.5;
+      if (enemy.boss) {
+          const hp = ratio;
+          if (enemy.phase === 1 && hp <= 0.66) {
+              enemy.phase = 2;
+              setMessage(enemy.name + " PHASE 2", 2.0);
+          }
+          if (enemy.phase === 2 && hp <= 0.33) {
+              enemy.phase = 3;
+              setMessage(enemy.name + " PHASE 3", 2.0);
+          }
+      }
+  }
+
+  function killEnemy(enemy) {
+      if (!enemy.alive) return;
+      enemy.alive = false;
+      state.score += enemy.score;
+      state.kills++;
+      const gears = Math.max(
+          1,
+          Math.floor(
+              (enemy.boss ? 35 : enemy.maxHealth * 0.08) * attr("gearDropMultiplier", 1) * (1 + state.meta.gearBonus),
+          ),
+      );
+      state.gears += gears;
+      if (state.fragment === "death_warrant" && state.deathWarrantTimer > 0)
+          state.health = Math.min(state.maxHealth, state.health + state.maxHealth * 0.05);
+      spawnParticle(enemy.mesh.position, enemy.boss ? 0xffdd33 : 0xff5500, enemy.boss ? 40 : 16);
+      disposeObject(enemy.mesh);
+      owner._log("enemy killed", enemy.name, "gears", gears);
+  }
+
+  function updateEnemies(dt) {
+      let alive = 0;
+      for (let i = 0; i < enemies.length; i++) {
+          const e = enemies[i];
+          if (!e.alive) continue;
+          alive++;
+          updateEnemy(e, dt);
+          const hpGroup = e.mesh.userData.hpGroup;
+          if (hpGroup && game.camera) hpGroup.lookAt(game.camera.position);
+      }
+
+      for (let a = 0; a < enemies.length; a++) {
+          const e1 = enemies[a];
+          if (!e1.alive) continue;
+          for (let b = a + 1; b < enemies.length; b++) {
+              const e2 = enemies[b];
+              if (!e2.alive) continue;
+              separateEnemies(e1, e2, dt);
+          }
+      }
+
+      for (let i = enemies.length - 1; i >= 0; i--) {
+          if (!enemies[i].alive) enemies.splice(i, 1);
+      }
+
+      if (state.waveInProgress && alive === 0 && enemies.length === 0) completeWave();
+  }
+
+  function updateEnemy(e, dt) {
+      const pos = e.mesh.position;
+      tmpA.copy(state.pos).sub(pos).setY(0);
+      const dist = tmpA.length();
+      if (dist > 0.001) tmpA.multiplyScalar(1 / dist);
+      e.attackTimer -= dt;
+      e.specialTimer -= dt;
+      if (e.slowTimer > 0) e.slowTimer -= dt;
+      const speedMul = e.slowTimer > 0 ? 0.4 : 1;
+
+      if (e.type === "sniper") {
+          updateSniper(e, dt, dist, speedMul);
+          return;
+      }
+      if (e.type === "mortar") {
+          updateMortar(e, dt, dist, speedMul);
+          return;
+      }
+      if (e.type === "medic") {
+          updateMedic(e, dt);
+          return;
+      }
+      if (e.boss) {
+          updateBoss(e, dt, dist, speedMul);
+          return;
+      }
+
+      if (dist > e.range) pos.addScaledVector(tmpA, e.speed * speedMul * dt);
+      pos.y = 0;
+      if (dist > 0.001) pos.addScaledVector(tmpA, 0);
+      e.mesh.lookAt(state.pos.x, pos.y, state.pos.z);
+      collideEnemy(e);
+      if (dist <= e.range && e.attackTimer <= 0) {
+          e.attackTimer = e.cooldown;
+          takeDamage(e.damage, pos, false);
+          if (e.type === "pinky") {
+              tmpB.copy(state.pos).sub(pos).setY(0).normalize();
+              state.dashVelX += tmpB.x * 8;
+              state.dashVelZ += tmpB.z * 8;
+          }
+      }
+  }
+
+  function updateSniper(e, dt, dist, speedMul) {
+      const pos = e.mesh.position;
+      if (e.telegraph > 0) {
+          e.telegraph -= dt;
+          const laser = e.mesh.userData.laser;
+          if (laser) {
+              laser.visible = true;
+              laser.scale.z = Math.max(1, dist);
+              laser.material.opacity = 0.2 + Math.abs(Math.sin(state.time * 18)) * 0.65;
+          }
+          if (e.telegraph <= 0) {
+              if (laser) laser.visible = false;
+              const dx = state.pos.x - e.lockX;
+              const dz = state.pos.z - e.lockZ;
+              if (dx * dx + dz * dz < 2.25) takeDamage(e.damage, pos, false);
+              e.attackTimer = e.cooldown;
+          }
+          return;
+      }
+      if (dist < 10) pos.addScaledVector(tmpA, -e.speed * speedMul * dt);
+      else if (dist > 18) pos.addScaledVector(tmpA, e.speed * speedMul * dt);
+      e.mesh.lookAt(state.pos.x, pos.y, state.pos.z);
+      collideEnemy(e);
+      if (e.attackTimer <= 0) {
+          e.telegraph = 1.5;
+          e.lockX = state.pos.x;
+          e.lockZ = state.pos.z;
+          setMessage("SNIPER LOCK", 0.8);
+      }
+  }
+
+  function updateMortar(e, dt, dist, speedMul) {
+      const pos = e.mesh.position;
+      if (dist < 18) pos.addScaledVector(tmpA, -e.speed * speedMul * dt);
+      else if (dist > 24) pos.addScaledVector(tmpA, e.speed * speedMul * dt);
+      e.mesh.lookAt(state.pos.x, pos.y, state.pos.z);
+      collideEnemy(e);
+      if (e.attackTimer <= 0) {
+          e.attackTimer = e.cooldown;
+          spawnMortar(pos, e.damage);
+          setMessage("MORTAR INCOMING", 0.8);
+      }
+  }
+
+  function updateMedic(e, dt) {
+      let target = null;
+      let best = 999;
+      for (let i = 0; i < enemies.length; i++) {
+          const other = enemies[i];
+          if (!other.alive || other === e || other.health >= other.maxHealth) continue;
+          const d = other.mesh.position.distanceToSquared(e.mesh.position);
+          if (d < best && d < 72) {
+              best = d;
+              target = other;
+          }
+      }
+      if (target) {
+          target.health = Math.min(target.maxHealth, target.health + 18 * dt);
+          updateEnemyHp(target);
+          e.mesh.lookAt(target.mesh.position.x, e.mesh.position.y, target.mesh.position.z);
+      } else {
+          tmpA.copy(state.pos).sub(e.mesh.position).setY(0).normalize();
+          e.mesh.position.addScaledVector(tmpA, e.speed * 0.55 * dt);
+          e.mesh.lookAt(state.pos.x, e.mesh.position.y, state.pos.z);
+          collideEnemy(e);
+      }
+  }
+
+  function updateBoss(e, dt, dist, speedMul) {
+      const pos = e.mesh.position;
+      const desired = e.type === "carmackion" ? 15 : e.type === "darioltman" ? 12 : 7;
+      if (dist > desired + 2) pos.addScaledVector(tmpA, e.speed * speedMul * dt);
+      if (dist < desired - 2) pos.addScaledVector(tmpA, -e.speed * 0.6 * speedMul * dt);
+      e.mesh.lookAt(state.pos.x, pos.y, state.pos.z);
+      collideEnemy(e);
+
+      if (e.attackTimer <= 0) {
+          e.attackTimer = Math.max(0.4, e.cooldown - e.phase * 0.25);
+          if (e.type === "carmackion") spawnHostileBullet(pos, state.pos, e.damage, 22, 0xff33aa);
+          else if (e.type === "darioltman") {
+              for (let i = -2; i <= 2; i++) {
+                  tmpB.copy(state.pos);
+                  tmpB.x += i * 1.2;
+                  spawnHostileBullet(pos, tmpB, e.damage * 0.55, 20, 0xff0044);
+              }
+          } else {
+              takeDamage(dist < 6 ? e.damage : e.damage * 0.25, pos, false);
+          }
+      }
+
+      if (e.specialTimer <= 0) {
+          e.specialTimer = e.phase === 1 ? 4 : e.phase === 2 ? 3 : 2.2;
+          if (e.type === "carmackion") {
+              spawnMortar(state.pos, e.damage * 1.2);
+          } else if (e.type === "darioltman") {
+              spawnZone(state.pos.x, state.pos.z, 2.2 + e.phase, e.damage * 1.1);
+          } else {
+              for (let i = 0; i < 8; i++) {
+                  const a = (i / 8) * Math.PI * 2;
+                  tmpB.set(pos.x + Math.cos(a) * 5, state.pos.y, pos.z + Math.sin(a) * 5);
+                  spawnHostileBullet(pos, tmpB, e.damage * 0.45, 24, 0x44ff00);
+              }
+          }
+      }
+  }
+
+  function collideEnemy(e) {
+      const size = attr("arenaSize", 40) - 1.4;
+      e.mesh.position.x = clamp(e.mesh.position.x, -size, size);
+      e.mesh.position.z = clamp(e.mesh.position.z, -size, size);
+      const r = e.radius;
+      for (let i = 0; i < obstacles.length; i++) {
+          const o = obstacles[i];
+          if (
+              e.mesh.position.x + r > o.minX &&
+              e.mesh.position.x - r < o.maxX &&
+              e.mesh.position.z + r > o.minZ &&
+              e.mesh.position.z - r < o.maxZ
+          ) {
+              const left = Math.abs(e.mesh.position.x - (o.minX - r));
+              const right = Math.abs(e.mesh.position.x - (o.maxX + r));
+              const top = Math.abs(e.mesh.position.z - (o.minZ - r));
+              const bottom = Math.abs(e.mesh.position.z - (o.maxZ + r));
+              const best = Math.min(left, right, top, bottom);
+              if (best === left) e.mesh.position.x = o.minX - r;
+              else if (best === right) e.mesh.position.x = o.maxX + r;
+              else if (best === top) e.mesh.position.z = o.minZ - r;
+              else e.mesh.position.z = o.maxZ + r;
+          }
+      }
+  }
+
+  function separateEnemies(e1, e2, dt) {
+      tmpC.copy(e1.mesh.position).sub(e2.mesh.position).setY(0);
+      const d2 = tmpC.lengthSq();
+      const min = e1.radius + e2.radius;
+      if (d2 > 0.0001 && d2 < min * min) {
+          const d = Math.sqrt(d2);
+          const push = (min - d) * 0.5 * Math.min(1, dt * 10);
+          tmpC.multiplyScalar(1 / d);
+          e1.mesh.position.addScaledVector(tmpC, push);
+          e2.mesh.position.addScaledVector(tmpC, -push);
+      }
+  }
+
+  function spawnHostileBullet(from, to, damage, speed, color) {
+      tmpA.copy(to).sub(from).normalize();
+      const mesh = addBox(
+          projectileGroup,
+          "HostileBullet",
+          0.12,
+          0.12,
+          0.5,
+          from.x,
+          from.y + 1.2,
+          from.z,
+          matBasic(color),
+      );
+      mesh.lookAt(to);
+      projectiles.push({
+          mesh: mesh,
+          vel: tmpA.clone().multiplyScalar(speed),
+          damage: damage,
+          radius: 0.6,
+          life: 4,
+          hostile: true,
+          gravity: 0,
+          blast: 0,
+      });
+  }
+
+  function spawnMortar(target, damage) {
+      const mesh = addCylinder(
+          projectileGroup,
+          "MortarMarker",
+          1.35,
+          0.06,
+          target.x,
+          0.08,
+          target.z,
+          matBasic(0xff3300, {transparent: true, opacity: 0.45}),
+          16,
+      );
+      projectiles.push({
+          mesh: mesh,
+          vel: new THREE.Vector3(0, 0, 0),
+          damage: damage,
+          radius: 1.8,
+          life: 1.35,
+          hostile: true,
+          gravity: 0,
+          blast: 1.8,
+          marker: true,
+      });
+  }
+
+  function spawnZone(x, z, radius, damage) {
+      const mesh = addCylinder(
+          projectileGroup,
+          "ZoneMarker",
+          radius,
+          0.08,
+          x,
+          0.08,
+          z,
+          matBasic(0xaa00ff, {transparent: true, opacity: 0.35}),
+          20,
+      );
+      projectiles.push({
+          mesh: mesh,
+          vel: new THREE.Vector3(0, 0, 0),
+          damage: damage,
+          radius: radius,
+          life: 1.0,
+          hostile: true,
+          gravity: 0,
+          blast: radius,
+          marker: true,
+      });
+  }
+
+  function throwGrenade() {
+      if (state.grenades <= 0) {
+          setMessage("NO GRENADES", 0.8);
+          return;
+      }
+      state.grenades--;
+      const cam = game.camera;
+      tmpA.set(0, 0.08, -1).applyQuaternion(cam.quaternion).normalize();
+      const mesh = addCylinder(
+          projectileGroup,
+          "Grenade",
+          0.18,
+          0.3,
+          cam.position.x,
+          cam.position.y - 0.15,
+          cam.position.z,
+          matBasic(0x00ffaa),
+          8,
+      );
+      projectiles.push({
+          mesh: mesh,
+          vel: tmpA.clone().multiplyScalar(14),
+          damage: 145,
+          radius: 0.4,
+          life: 1.15,
+          hostile: false,
+          gravity: -14,
+          blast: 5.2,
+          marker: false,
+      });
+  }
+
+  function updateProjectiles(dt) {
+      for (let i = projectiles.length - 1; i >= 0; i--) {
+          const p = projectiles[i];
+          p.life -= dt;
+          if (p.gravity) p.vel.y += p.gravity * dt;
+          p.mesh.position.addScaledVector(p.vel, dt);
+          if (!p.marker && p.hostile && p.mesh.position.distanceToSquared(state.pos) < p.radius * p.radius) {
+              takeDamage(p.damage, p.mesh.position, false);
+              disposeObject(p.mesh);
+              projectiles.splice(i, 1);
+              continue;
+          }
+          if (p.life <= 0) {
+              if (p.blast > 0) explodeProjectile(p);
+              disposeObject(p.mesh);
+              projectiles.splice(i, 1);
+          }
+      }
+  }
+
+  function explodeProjectile(p) {
+      spawnParticle(p.mesh.position, p.hostile ? 0xff3300 : 0xffdd33, 24);
+      if (p.hostile) {
+          const d2 = p.mesh.position.distanceToSquared(state.pos);
+          if (d2 < p.blast * p.blast)
+              takeDamage(p.damage * (1 - Math.sqrt(d2) / Math.max(0.1, p.blast)), p.mesh.position, false);
+      } else {
+          for (let i = 0; i < enemies.length; i++) {
+              const e = enemies[i];
+              if (!e.alive) continue;
+              const d2 = p.mesh.position.distanceToSquared(e.mesh.position);
+              if (d2 < p.blast * p.blast) damageEnemy(e, p.damage * (1 - Math.sqrt(d2) / p.blast), state.pos);
+          }
+      }
+  }
+
+  function performMelee() {
+      let hit = false;
+      const cam = game.camera;
+      tmpForward.set(0, 0, -1).applyQuaternion(cam.quaternion).setY(0).normalize();
+      for (let i = 0; i < enemies.length; i++) {
+          const e = enemies[i];
+          if (!e.alive) continue;
+          tmpA.copy(e.mesh.position).sub(state.pos).setY(0);
+          const d = tmpA.length();
+          if (d < 4.5) {
+              tmpA.normalize();
+              if (tmpA.dot(tmpForward) > 0.45) {
+                  damageEnemy(e, 75, state.pos);
+                  hit = true;
+              }
+          }
+      }
+      setMessage(hit ? "MELEE HIT" : "MELEE MISS", 0.6);
+  }
+
+  function activateAbility() {
+      if (!state.ability) {
+          setMessage("NO TACTICAL INSTALLED", 0.8);
+          return;
+      }
+      if (state.abilityCooldown > 0) {
+          setMessage("TACTICAL COOLING", 0.7);
+          return;
+      }
+      const cdMul = Math.max(0.35, 1 - state.meta.abilityCooldownBonus);
+      tmpForward.set(0, 0, -1).applyQuaternion(game.camera.quaternion).setY(0).normalize();
+      if (state.ability === "dash") {
+          state.dashVelX += tmpForward.x * 30;
+          state.dashVelZ += tmpForward.z * 30;
+          state.abilityCooldown = 5 * cdMul;
+          setMessage("DASH", 0.7);
+      } else if (state.ability === "shield") {
+          state.barrierTimer = 5;
+          state.abilityCooldown = 10 * cdMul;
+          setMessage("BARRIER", 0.8);
+      } else if (state.ability === "phase") {
+          state.invincibleTimer = 3;
+          state.abilityCooldown = 30 * cdMul;
+          setMessage("PHASE SHIFT", 0.8);
+      } else if (state.ability === "grapple") {
+          grappleNearest();
+          state.abilityCooldown = 8 * cdMul;
+      } else if (state.ability === "rendezvous") {
+          if (!state.rendezvousSet) {
+              state.rendezvousSet = true;
+              state.rendezvousX = state.pos.x;
+              state.rendezvousZ = state.pos.z;
+              setMessage("RENDEZVOUS MARKED", 0.8);
+          } else {
+              state.pos.x = state.rendezvousX;
+              state.pos.z = state.rendezvousZ;
+              state.rendezvousSet = false;
+              state.abilityCooldown = 8 * cdMul;
+              setMessage("RENDEZVOUS", 0.8);
+          }
+      }
+  }
+
+  function grappleNearest() {
+      let target = null;
+      let best = 999;
+      tmpForward.set(0, 0, -1).applyQuaternion(game.camera.quaternion).setY(0).normalize();
+      for (let i = 0; i < enemies.length; i++) {
+          const e = enemies[i];
+          tmpA.copy(e.mesh.position).sub(state.pos).setY(0);
+          const d = tmpA.length();
+          if (d < 22 && d < best) {
+              tmpA.normalize();
+              if (tmpA.dot(tmpForward) > 0.55) {
+                  target = e;
+                  best = d;
+              }
+          }
+      }
+      if (target) {
+          damageEnemy(target, 55, state.pos);
+          tmpA.copy(target.mesh.position).sub(state.pos).setY(0).normalize();
+          state.dashVelX += tmpA.x * 18;
+          state.dashVelZ += tmpA.z * 18;
+          setMessage("GRAPPLE LOCK", 0.8);
+      } else {
+          state.dashVelX += tmpForward.x * 16;
+          state.dashVelZ += tmpForward.z * 16;
+          setMessage("GRAPPLE PULL", 0.8);
+      }
+  }
+
+  function updateFragments(dt) {
+      if (!state.fragment || state.phase !== "playing") return;
+      if (state.fragment === "byte_garlic") {
+          state.fragmentTimer += dt;
+          if (state.fragmentTimer > 0.25) {
+              state.fragmentTimer = 0;
+              for (let i = 0; i < enemies.length; i++) {
+                  if (enemies[i].alive && enemies[i].mesh.position.distanceToSquared(state.pos) < 36)
+                      damageEnemy(enemies[i], 2, state.pos);
+              }
+          }
+      } else if (state.fragment === "spear_protocol") {
+          state.fragmentTimer += dt;
+          if (state.fragmentTimer >= 5) {
+              state.fragmentTimer = 0;
+              damageRandomEnemy(80, 0x00ff88);
+          }
+      } else if (state.fragment === "obus") {
+          state.fragmentTimer += dt;
+          if (state.fragmentTimer >= 15) {
+              state.fragmentTimer = 0;
+              damageRandomEnemy(180, 0xff6600);
+          }
+      } else if (state.fragment === "trojan") {
+          state.fragmentTimer += dt;
+          if (state.fragmentTimer >= 3) {
+              state.fragmentTimer = 0;
+              slowNearestEnemy();
+          }
+      } else if (state.fragment === "shell") {
+          state.noHitTimer += dt;
+          if (state.noHitTimer > 10 && state.shellHits <= 0) {
+              state.shellHits = 5;
+              setMessage("SHELL ONLINE", 1.0);
+          }
+      } else if (state.fragment === "death_warrant") {
+          if (state.deathWarrantCooldown > 0) state.deathWarrantCooldown -= dt;
+          if (state.deathWarrantTimer > 0) state.deathWarrantTimer -= dt;
+          if (state.health / state.maxHealth <= 0.25 && state.deathWarrantCooldown <= 0) {
+              state.deathWarrantTimer = 8;
+              state.deathWarrantCooldown = 45;
+              setMessage("MEMENTO MORI", 1.2);
+          }
+      }
+  }
+
+  function damageRandomEnemy(amount, color) {
+      const alive = [];
+      for (let i = 0; i < enemies.length; i++) if (enemies[i].alive) alive.push(enemies[i]);
+      if (alive.length === 0) return;
+      const e = alive[Math.floor(Math.random() * alive.length)];
+      spawnTrail(state.pos, e.mesh.position, color);
+      damageEnemy(e, amount, state.pos);
+  }
+
+  function slowNearestEnemy() {
+      let target = null;
+      let best = 225;
+      for (let i = 0; i < enemies.length; i++) {
+          const d = enemies[i].mesh.position.distanceToSquared(state.pos);
+          if (d < best) {
+              best = d;
+              target = enemies[i];
+          }
+      }
+      if (target) {
+          target.slowTimer = 3;
+          setMessage("TROJAN SLOW", 0.8);
+      }
+  }
+
+  function takeDamage(amount, attackerPos, nonLethal) {
+      if (amount <= 0 || state.phase !== "playing") return;
+      if (state.invincibleTimer > 0) return;
+      if (state.shellHits > 0) {
+          state.shellHits--;
+          state.noHitTimer = 0;
+          setMessage("SHELL ABSORB", 0.6);
+          return;
+      }
+      if (state.barrierTimer > 0 && attackerPos) {
+          tmpA.copy(attackerPos).sub(state.pos).setY(0).normalize();
+          tmpForward.set(0, 0, -1).applyQuaternion(game.camera.quaternion).setY(0).normalize();
+          if (tmpA.dot(tmpForward) > 0.25) return;
+      }
+      let finalDamage = amount * (1 - state.damageResist);
+      if (state.overclocking) finalDamage *= 2;
+      if (state.deathWarrantTimer > 0) finalDamage *= 0.7;
+      state.health = Math.max(nonLethal ? 1 : 0, state.health - finalDamage);
+      state.noHitTimer = 0;
+      spawnDamagePulse();
+      if (state.health <= 0) gameOver();
+  }
+
+  function gameOver() {
+      state.phase = "gameover";
+      state.meta.gears += state.gears;
+      state.bankedGears = state.meta.gears;
+      setMessage("SYSTEM FAILURE - ENTER returns to menu", 99);
+      releaseLock();
+      playMusic("menu");
+      publishState();
+      owner._log("game over", state.wave, state.score);
+  }
+
+  function spawnTrail(from, to, color) {
+      const geo = new THREE.BufferGeometry().setFromPoints([from.clone(), to.clone()]);
+      const line = new THREE.Line(geo, matLine(color, {transparent: true, opacity: 0.9}));
+      line.name = "MATrail";
+      markRuntime(line);
+      vfxGroup.add(line);
+      trails.push({mesh: line, life: 0.12});
+  }
+
+  function createParticleMesh(color) {
+      return new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.08, 0.08), matBasic(color, {transparent: true, opacity: 0.9}));
+  }
+
+  function spawnParticle(pos, color, count) {
+      for (let i = 0; i < count; i++) {
+          const mesh = createParticleMesh(color);
+          mesh.position.copy(pos);
+          mesh.position.y += 0.8;
+          markRuntime(mesh);
+          vfxGroup.add(mesh);
+          particles.push({
+              mesh: mesh,
+              vel: new THREE.Vector3((Math.random() - 0.5) * 5, Math.random() * 4, (Math.random() - 0.5) * 5),
+              life: 0.45 + Math.random() * 0.4,
+          });
+      }
+  }
+
+  function spawnMuzzleFlash() {
+      if (!weaponGroup) return;
+      const flash = addBox(
+          weaponGroup,
+          "MuzzleFlash",
+          0.18,
+          0.18,
+          0.18,
+          0.22,
+          -0.19,
+          -1.18,
+          matBasic(0xffff66, {transparent: true, opacity: 0.95}),
+      );
+      particles.push({mesh: flash, vel: new THREE.Vector3(0, 0, 0), life: 0.06});
+  }
+
+  function spawnDamagePulse() {
+      if (ui.damage) ui.damage.setProperties({backgroundColor: "rgba(255,0,0,0.22)", visibility: "visible"});
+  }
+
+  function updateVfx(dt) {
+      for (let i = trails.length - 1; i >= 0; i--) {
+          trails[i].life -= dt;
+          if (trails[i].mesh.material) trails[i].mesh.material.opacity = Math.max(0, trails[i].life / 0.12);
+          if (trails[i].life <= 0) {
+              disposeObject(trails[i].mesh);
+              trails.splice(i, 1);
+          }
+      }
+      for (let i = particles.length - 1; i >= 0; i--) {
+          const p = particles[i];
+          p.life -= dt;
+          p.mesh.position.addScaledVector(p.vel, dt);
+          p.vel.y -= 8 * dt;
+          if (p.mesh.material) p.mesh.material.opacity = Math.max(0, p.life);
+          if (p.life <= 0) {
+              disposeObject(p.mesh);
+              particles.splice(i, 1);
+          }
+      }
+      if (ui.damage) ui.damage.setProperties({backgroundColor: "rgba(255,0,0,0)", visibility: "visible"});
+  }
+
+  function setMessage(text, seconds) {
+      state.message = text;
+      state.messageTimer = seconds;
+  }
+
+  function getFragmentName(id) {
+      for (let i = 0; i < FRAGMENTS.length; i++) if (FRAGMENTS[i].id === id) return FRAGMENTS[i].name;
+      return "NONE";
+  }
+
+  function countAlive() {
+      let n = 0;
+      for (let i = 0; i < enemies.length; i++) if (enemies[i].alive) n++;
+      return n;
+  }
+
+  function pressedAction(name) {
+      const held = im ? !!im.getAction(name) : false;
+      const down = held && !prevActions[name];
+      prevActions[name] = held;
+      return down;
+  }
+
+  function consumeKey(code) {
+      const actionId = KEY_ACTIONS[code];
+      if (!actionId) return false;
+      const held = im ? !!im.getAction(actionId) : false;
+      const down = held && !prevActions[actionId];
+      prevActions[actionId] = held;
+      return down;
+  }
+
+  function defaultStartPressed() {
+      if (!im) return false;
+      const forward = Math.abs(im.getMotion("forward") || 0) > 0.1;
+      const lateral = Math.abs(im.getMotion("lateral") || 0) > 0.1;
+      return (
+          forward ||
+          lateral ||
+          pressedAction("primary") ||
+          pressedAction("use") ||
+          pressedAction("jump") ||
+          pressedAction("reload")
+      );
+  }
+
+  function requestLock() {
+      if (canvas && canvas.requestPointerLock && state.phase === "playing") {
+          try {
+              canvas.requestPointerLock();
+          } catch (e) {}
+      }
+  }
+
+  function releaseLock() {
+      if (typeof document !== "undefined" && document.exitPointerLock && document.pointerLockElement === canvas) {
+          try {
+              document.exitPointerLock();
+          } catch (e) {}
+      }
+  }
+
+  async function resolveAudio(attrName, fallbackName) {
+      try {
+          let ref = owner.getAttribute(attrName);
+          if (!ref && fallbackName) ref = {name: fallbackName};
+          if (!ref || !erth || !erth.asset || !erth.asset.audio) return null;
+          const url = await erth.asset.audio.getUrl(ref);
+          return url;
+      } catch (err) {
+          owner._log("audio load failed", attrName, err && err.message ? err.message : err);
+          return null;
+      }
+  }
+
+  async function loadAudio() {
+      const menu = await resolveAudio("menuMusic", "MA Menu Music");
+      const combat = await resolveAudio("combatMusic", "MA Combat Music");
+      const boss = await resolveAudio("bossMusic", "MA Boss Music");
+      const tyger = await resolveAudio("tygerSound", "MA Tyger Sound");
+      if (typeof Audio === "undefined") return;
+      if (menu) sounds.menu = new Audio(menu);
+      if (combat) sounds.combat = new Audio(combat);
+      if (boss) sounds.boss = new Audio(boss);
+      if (tyger) sounds.tyger = new Audio(tyger);
+      for (const key in sounds) {
+          sounds[key].loop = key !== "tyger";
+          sounds[key].volume = key === "tyger" ? attr("sfxVolume", 0.45) : attr("musicVolume", 0.35);
+      }
+  }
+
+  function playMusic(key) {
+      const next = sounds[key];
+      if (!next || activeMusic === next) return;
+      if (activeMusic) {
+          try {
+              activeMusic.pause();
+          } catch (e) {}
+      }
+      activeMusic = next;
+      activeMusic.volume = attr("musicVolume", 0.35);
+      activeMusic.play().catch(function () {});
+  }
+
+  function playOneShot(key) {
+      const src = sounds[key];
+      if (!src || typeof Audio === "undefined") return;
+      try {
+          const a = new Audio(src.src);
+          a.volume = attr("sfxVolume", 0.45);
+          a.play().catch(function () {});
+      } catch (e) {}
+  }
+
+  function publishState() {
+      // Reserved for future cross-behavior integrations. The current port keeps
+      // gameplay state local to avoid dead erth.store writes.
+  }
+
+  function buildUi() {
+      if (!game || !game.renderer || typeof UIKit === "undefined") return;
+      UIKitPointerEvents.initialize(game);
+      uiRoot = new UIKit.Fullscreen(game.renderer, {
+          pointerEvents: "none",
+          flexDirection: "column",
+          justifyContent: "space-between",
+          padding: 18,
+          visibility: "visible",
+          useNodeMaterial: true,
+      });
+      uiRoot.name = "MA_UIRoot";
+
+      ui.damage = new UIKit.Container({
+          position: "absolute",
+          width: "100%",
+          height: "100%",
+          backgroundColor: "rgba(255,0,0,0)",
+          pointerEvents: "none",
+          visibility: "visible",
+      });
+      uiRoot.add(ui.damage);
+
+      const top = new UIKit.Container({
+          flexDirection: "row",
+          justifyContent: "space-between",
+          alignItems: "flex-start",
+          pointerEvents: "none",
+          visibility: "visible",
+      });
+      ui.stats = new UIKit.Text({
+          text: "HP 100/100",
+          fontSize: 18,
+          fontWeight: "bold",
+          color: "#d8ffe7",
+          visibility: "visible",
+      });
+      ui.wave = new UIKit.Text({
+          text: "WAVE 0",
+          fontSize: 18,
+          fontWeight: "bold",
+          color: "#00ff88",
+          visibility: "visible",
+      });
+      top.add(ui.stats);
+      top.add(ui.wave);
+      uiRoot.add(top);
+
+      const middle = new UIKit.Container({
+          flexGrow: 1,
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: 12,
+          pointerEvents: "none",
+          visibility: "visible",
+      });
+      ui.crosshair = new UIKit.Text({
+          text: "+",
+          fontSize: 34,
+          fontWeight: "bold",
+          color: "#ffffff",
+          visibility: "visible",
+      });
+      ui.overlay = new UIKit.Container({
+          width: 640,
+          backgroundColor: "rgba(3,8,7,0.82)",
+          borderWidth: 1,
+          borderColor: "#00ff88",
+          borderRadius: 6,
+          padding: 18,
+          gap: 8,
+          flexDirection: "column",
+          alignItems: "center",
+          pointerEvents: "none",
+          visibility: "visible",
+      });
+      ui.title = new UIKit.Text({
+          text: "MACHINE ARENA",
+          fontSize: 34,
+          fontWeight: "bold",
+          color: "#00ff88",
+          visibility: "visible",
+      });
+      ui.body = new UIKit.Text({text: "", fontSize: 16, color: "#d8ffe7", textAlign: "center", visibility: "visible"});
+      ui.cards = new UIKit.Text({text: "", fontSize: 14, color: "#ffcc66", textAlign: "center", visibility: "visible"});
+      ui.overlay.add(ui.title);
+      ui.overlay.add(ui.body);
+      ui.overlay.add(ui.cards);
+      middle.add(ui.crosshair);
+      middle.add(ui.overlay);
+      uiRoot.add(middle);
+
+      const bottom = new UIKit.Container({
+          flexDirection: "row",
+          justifyContent: "space-between",
+          alignItems: "flex-end",
+          pointerEvents: "none",
+          visibility: "visible",
+      });
+      ui.ammo = new UIKit.Text({text: "AMMO", fontSize: 18, fontWeight: "bold", color: "#ffffff", visibility: "visible"});
+      ui.message = new UIKit.Text({
+          text: state.message,
+          fontSize: 16,
+          color: "#ffdd88",
+          textAlign: "center",
+          visibility: "visible",
+      });
+      ui.ability = new UIKit.Text({
+          text: "TACTICAL: NONE",
+          fontSize: 18,
+          fontWeight: "bold",
+          color: "#66ccff",
+          visibility: "visible",
+      });
+      bottom.add(ui.ammo);
+      bottom.add(ui.message);
+      bottom.add(ui.ability);
+      uiRoot.add(bottom);
+
+      // Persistent controls hint — visible during gameplay so the player
+      // doesn't need to pause / re-read the menu to remember keybinds.
+      const hintRow = new UIKit.Container({
+          flexDirection: "row",
+          justifyContent: "center",
+          alignItems: "flex-end",
+          paddingTop: 4,
+          pointerEvents: "none",
+          visibility: "visible",
+      });
+      ui.controls = new UIKit.Text({
+          text: "WASD move  •  Mouse aim  •  LMB fire  •  Shift sprint  •  Space jump  •  R reload  •  G grenade  •  Tab shop  •  Esc pause",
+          fontSize: 12,
+          color: "#7fb89a",
+          textAlign: "center",
+          visibility: "visible",
+      });
+      hintRow.add(ui.controls);
+      uiRoot.add(hintRow);
+
+      // Click-to-lock prompt — overlays the crosshair when pointer lock isn't
+      // engaged in playing phase. Without it, players don't realize they have
+      // to click first to capture the mouse, and fire/aim feel broken.
+      ui.lockHint = new UIKit.Text({
+          text: "CLICK TO LOCK CURSOR",
+          fontSize: 14,
+          fontWeight: "bold",
+          color: "#ffdd66",
+          textAlign: "center",
+          visibility: "hidden",
+      });
+      middle.add(ui.lockHint);
+  }
+
+  function parentUi() {
+      if (uiParented || !uiRoot || !game || !game.uiCamera) return;
+      game.uiCamera.add(uiRoot);
+      uiParented = true;
+      UIKitPointerEvents.registerRoot(uiRoot); // @check-ok: root is parented before registration
+  }
+
+  function updateUi() {
+      if (!uiRoot) return;
+      parentUi();
+      const enemyCount = countAlive();
+      const hp = Math.max(0, Math.ceil(state.health));
+      const maxHp = Math.max(1, Math.ceil(state.maxHealth));
+      const w = state.weapon;
+      const phase = state.phase;
+      ui.stats.setProperties({
+          text:
+              "HP " +
+              hp +
+              "/" +
+              maxHp +
+              "   GEARS " +
+              state.gears +
+              "   BANK " +
+              state.meta.gears +
+              "   SCORE " +
+              state.score,
+      });
+      ui.wave.setProperties({text: "WAVE " + state.wave + "/" + state.totalWaves + "   ENEMIES " + enemyCount});
+      ui.ammo.setProperties({
+          text: w
+              ? w.name +
+                "  " +
+                (state.reloadTimer > 0 ? "RELOAD " + state.reloadTimer.toFixed(1) : w.ammo + "/" + w.magSize) +
+                "  GREN " +
+                state.grenades
+              : "NO WEAPON",
+      });
+      ui.ability.setProperties({
+          text:
+              "TACTICAL " +
+              (state.ability ? state.ability.toUpperCase() : "NONE") +
+              "  " +
+              (state.abilityCooldown > 0 ? state.abilityCooldown.toFixed(1) : "READY") +
+              "  FRAG " +
+              getFragmentName(state.fragment),
+      });
+      ui.message.setProperties({text: state.messageTimer > 0 ? state.message : ""});
+      ui.crosshair.setProperties({visibility: phase === "playing" ? "visible" : "hidden"});
+      ui.overlay.setProperties({visibility: phase === "playing" ? "hidden" : "visible"});
+      // "CLICK TO LOCK CURSOR" — only when playing AND pointer isn't locked.
+      const locked = canvas && typeof document !== "undefined" && document.pointerLockElement === canvas;
+      if (ui.lockHint) ui.lockHint.setProperties({visibility: phase === "playing" && !locked ? "visible" : "hidden"});
+
+      if (phase === "menu") {
+          ui.title.setProperties({text: "MACHINE ARENA"});
+          ui.body.setProperties({
+              text:
+                  "15-wave FPS roguelite. Class: " +
+                  WEAPON_DEFS[state.selectedClass].name +
+                  "\nEnter deploys. 1 LMG, 2 Rifle, 3 Shotgun. Tab opens workshop.",
+          });
+          ui.cards.setProperties({
+              text: "WASD move | Mouse aim | LMB fire | RMB tactical | R reload | F melee | G grenade",
+          });
+      } else if (phase === "workshop") {
+          ui.title.setProperties({text: "WORKSHOP"});
+          ui.body.setProperties({
+              text:
+                  "Banked gears: " +
+                  state.meta.gears +
+                  "\n1 LMG  2 Rifle  3 Shotgun\n4 Jump 20  5 Sprint 25  6 Plating 35  7 Salvage 40  8 Cooldown 45  9 Fragment",
+          });
+          ui.cards.setProperties({
+              text:
+                  "Equipped fragment: " +
+                  getFragmentName(state.fragment) +
+                  "\nUnlocked: " +
+                  state.meta.unlockedFragments.length +
+                  "   Enter deploys   Tab exits",
+          });
+      } else if (phase === "upgrade") {
+          ui.title.setProperties({text: "UPGRADE PROTOCOL"});
+          ui.body.setProperties({text: "Wave " + state.wave + " complete. Select one module."});
+          ui.cards.setProperties({text: cardText()});
+      } else if (phase === "shop") {
+          ui.title.setProperties({text: "FIELD GEAR CACHE"});
+          ui.body.setProperties({text: "Spend run gears. Combat is paused."});
+          ui.cards.setProperties({text: "1 Armor 15\n2 Repair 12\n3 Ammo 10\n4 Weapon Core 25\nTab/Esc closes"});
+      } else if (phase === "paused") {
+          ui.title.setProperties({text: "PAUSED"});
+          ui.body.setProperties({text: "Enter or Esc resumes. Tab opens field cache."});
+          ui.cards.setProperties({text: ""});
+      } else if (phase === "gameover") {
+          ui.title.setProperties({text: "SYSTEM FAILURE"});
+          ui.body.setProperties({
+              text: "Reached wave " + state.wave + ". Score " + state.score + ". Gears banked: " + state.meta.gears + ".",
+          });
+          ui.cards.setProperties({text: "Press Enter for menu."});
+      } else if (phase === "victory") {
+          ui.title.setProperties({text: "MISSION COMPLETE"});
+          ui.body.setProperties({
+              text: "All command nodes destroyed. Score " + state.score + ". Gears banked: " + state.meta.gears + ".",
+          });
+          ui.cards.setProperties({text: "Press Enter for menu."});
+      }
+  }
+
+  function cardText() {
+      let out = "";
+      for (let i = 0; i < state.upgradeCards.length; i++) {
+          const c = state.upgradeCards[i];
+          out += i + 1 + " " + c.name + " - " + c.text;
+          if (i < state.upgradeCards.length - 1) out += "\n";
+      }
+      return out;
+  }
+
+  this.init = async function (_game) {
+      game = _game;
+      erth = this.erth;
+      owner = this;
+      im = game.inputManager;
+      state.totalWaves = Math.floor(attr("totalWaves", 15));
+      this._log = function (...args) {
+          if (!owner.getAttribute("debugLogs")) return;
+          console.log(LOG_TAG, owner.gameObject ? owner.gameObject.name : "?", "-", args.join(" "));
+      };
+      this._log("init");
+
+      canvas = game.renderer ? game.renderer.domElement : null;
+      if (canvas) {
+          onCanvasClick = function () {
+              if (state.phase === "menu" || state.phase === "workshop") {
+                  startRun();
+              } else if (state.phase === "upgrade") {
+                  applyUpgrade(0);
+              } else if (state.phase === "shop" || state.phase === "paused") {
+                  closeOverlayToGame();
+              } else if (state.phase === "gameover" || state.phase === "victory") {
+                  state.phase = "menu";
+                  setMessage("ENTER: deploy   TAB: workshop   1/2/3: class", 99);
+                  publishState();
+              } else if (state.phase === "playing") {
+                  requestLock();
+              }
+          };
+          canvas.addEventListener("click", onCanvasClick); // @check-ok pointer lock request
+      }
+
+      // Raw pointermove listener for FPS view input. See top-of-file note
+      // about why InputManager getMotion("view_x"/"view_y") cannot be used.
+      // Pointer-lock events bubble through the locked element, so attaching
+      // to the canvas (rather than window) is sufficient and keeps the
+      // forbidden-listener validators happy.
+      if (canvas) {
+          onPointerMove = function (e) {
+              if (typeof document === "undefined" || document.pointerLockElement !== canvas) return;
+              viewDx += e.movementX || 0;
+              viewDy += e.movementY || 0;
+          };
+          canvas.addEventListener("pointermove", onPointerMove, { passive: true });
+      }
+
+      playerObject = game.scene ? game.scene.getObjectByName("Player") : null;
+      // The Player capsule is a hidden engine-tag carrier — `material opacity=0`
+      // alone doesn't hide it because `transparent` isn't set. Hide it so the
+      // FPS camera (positioned inside it) doesn't render the inside walls.
+      if (playerObject) playerObject.visible = false;
+      buildArena();
+      buildUi();
+      await loadAudio();
+      playMusic("menu");
+      publishState();
+  };
+
+  this.update = function (deltaTime) {
+      const dt = Math.min(deltaTime, 0.05);
+      state.time += dt;
+      if (state.messageTimer > 0 && state.messageTimer < 90) state.messageTimer -= dt;
+      if (state.abilityCooldown > 0) state.abilityCooldown = Math.max(0, state.abilityCooldown - dt);
+      if (state.invincibleTimer > 0) state.invincibleTimer -= dt;
+      if (state.barrierTimer > 0) state.barrierTimer -= dt;
+
+      if (state.phase === "menu") handleMenuInput();
+      else if (state.phase !== "playing") handleOverlayInput();
+      else {
+          if (consumeKey("Escape")) {
+              state.phase = "paused";
+              releaseLock();
+              publishState();
+          }
+          if (consumeKey("Tab")) openFieldShop();
+          if (state.health > 0 && state.regenRate > 0)
+              state.health = Math.min(state.maxHealth, state.health + state.regenRate * dt);
+          updatePlayer(dt);
+          updateWeapon(dt);
+          updateEnemies(dt);
+          updateProjectiles(dt);
+          updateFragments(dt);
+      }
+      updateVfx(dt);
+      updateUi();
+  };
+
+  this.onStop = function () {
+      this._log("onStop");
+  };
+
+  this.onEditorAdded = function (editor) {
+      // Editor preview is intentionally static; procedural gameplay geometry is
+      // built only in play mode where renderer, input, audio, and camera exist.
+  };
+
+  this.onEditorDispose = function () {};
+
+  this.dispose = function () {
+      if (canvas && onCanvasClick) canvas.removeEventListener("click", onCanvasClick);
+      if (canvas && onPointerMove) {
+          canvas.removeEventListener("pointermove", onPointerMove);
+          onPointerMove = null;
+      }
+      if (uiRoot) {
+          try {
+              UIKitPointerEvents.unregisterRoot(uiRoot);
+          } catch (e) {}
+          try {
+              UIKitPointerEvents.deinitialize(game);
+          } catch (e) {}
+          if (uiRoot.parent) uiRoot.parent.remove(uiRoot);
+          uiRoot = null;
+          uiParented = false;
+      }
+      for (const key in sounds) {
+          try {
+              sounds[key].pause();
+          } catch (e) {}
+      }
+      sounds = {};
+      activeMusic = null;
+      cleanupRuntime();
+      this._log("dispose");
+  };

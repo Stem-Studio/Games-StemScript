@@ -1,0 +1,244 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Package Quest"
+  id: "tinyskies.packageQuest"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Single-NPC package delivery quest (capped Batch F — 1 of 6 source quest types). Spawns pickup + delivery markers; player flies through to advance."
+  documentation: "Source ships PackageQuest + RaceManager + CarpetLandmarkSelfieQuest + EternalFlameWorld + HotspringPhotoUI + CapybaraFlameShots — 6 quest systems with 14+ NPCs and dialog trees. Capped MVP ships only the package-delivery loop with no NPC dialog: spawn a yellow PICKUP marker on the globe surface, player flies through (radius 0.4) to collect, marker hides, GREEN delivery marker spawns at a new seeded surface point, player flies through to deliver, both markers re-spawn at new positions and the loop repeats. Each marker is a vertical glowing column visible from across the globe. Publishes `tinyskies/carryingPackage` (bool) and `tinyskies/packagesDelivered` (count) for any future HUD."
+  tags:
+    - gameplay
+    - quest
+  priority: 0
+  throttleConfig:
+    throttlePriority: "HIGH"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    globeRadius:
+      name: "Globe Radius"
+      type: "number"
+      default: 5
+      min: 0.5
+      max: 200
+    seed:
+      name: "Quest Seed"
+      type: "number"
+      default: 1337
+      min: 1
+      max: 1000000
+    pickupRadius:
+      name: "Pickup / Delivery Radius"
+      type: "number"
+      default: 0.4
+      min: 0.1
+      max: 2
+    minTargetDistance:
+      name: "Min Distance Pickup ↔ Delivery"
+      type: "number"
+      default: 4
+      min: 1
+      max: 20
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  @import "spherical-math" as S;
+  @import "terrain" as T;
+
+  const LOG_TAG = "[tinyskies.packageQuest]";
+  const PICKUP_COLOR = 0xfff050;
+  const DELIVERY_COLOR = 0x66ff88;
+  const COLUMN_HEIGHT = 1.6;
+
+  function seededRandom(seed) {
+    let s = seed >>> 0;
+    if (s === 0) s = 1;
+    return function () { s = (s * 16807) % 2147483647; return (s - 1) / 2147483646; };
+  }
+
+  function buildMarker(colorHex) {
+    // No editor preview by design — quest markers are runtime-only and depend on
+    // store state that doesn't exist in the editor. Per CLAUDE.md memory
+    // feedback_no_empty_editor_stubs.md, no empty editor stub.
+    const root = new THREE.Group();
+    // Base box (sits on surface).
+    const baseMat = new THREE.MeshStandardNodeMaterial({
+      color: colorHex, roughness: 0.5, metalness: 0.05, flatShading: true,
+    });
+    const base = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.18, 0.18), baseMat);   // @check-ok runtime-only quest marker
+    root.add(base);
+    // Vertical glowing column above the base.
+    const colMat = new THREE.MeshBasicNodeMaterial({
+      color: new THREE.Color(colorHex),
+      transparent: true,
+      opacity: 0.55,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      side: THREE.DoubleSide,
+    });
+    const col = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.06, COLUMN_HEIGHT, 8, 1, true), colMat);
+    col.position.y = COLUMN_HEIGHT * 0.5;
+    root.add(col);
+    root.userData.materials = [baseMat, colMat];
+    root.traverse((c) => { c.userData.isRuntimeOnly = true; });
+    return root;
+  }
+
+  let game;
+
+  this.init = function (_game) {
+    game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._tmpUp = new THREE.Vector3();
+    this._yAxis = new THREE.Vector3(0, 1, 0);
+    this._qAlign = new THREE.Quaternion();
+    this._playerPos = new THREE.Vector3();
+    this._rand = seededRandom(this.getAttribute("seed"));
+    this._packagesDelivered = 0;
+    this._carrying = false;
+
+    this._buildMarkers(this.gameObject._internal.three);
+    this._spawnPair();
+    this._publishState();
+    this._log("init");
+  };
+
+  this.update = function () {
+    if (!this._pickupMarker) return;
+    const globeRadius = this.getAttribute("globeRadius");
+    const pickupRadius = this.getAttribute("pickupRadius");
+    const store = this.erth.store;
+
+    const qx = store.get("tinyskies/qx");
+    const qw = store.get("tinyskies/qw");
+    const altitude = store.get("tinyskies/altitude");
+    if (qx === undefined || qw === undefined || typeof altitude !== "number") return;
+    const qPlayer = new THREE.Quaternion(qx, store.get("tinyskies/qy") || 0, store.get("tinyskies/qz") || 0, qw);  // @check-ok one-shot per frame; minor allocation
+    const playerWorld = S.cartesianFromSpherical(qPlayer, altitude, globeRadius);
+    this._playerPos.copy(playerWorld);
+
+    const activeMarker = this._carrying ? this._deliveryMarker : this._pickupMarker;
+    if (!activeMarker || !activeMarker.visible) return;
+
+    const dist = this._playerPos.distanceTo(activeMarker.position);
+    if (dist < pickupRadius) {
+      if (!this._carrying) {
+        this._carrying = true;
+        this._pickupMarker.visible = false;
+        this._deliveryMarker.visible = true;
+        this._log("package picked up");
+      } else {
+        this._packagesDelivered += 1;
+        this._carrying = false;
+        this._log("package delivered (total:", this._packagesDelivered, ")");
+        this._spawnPair();
+      }
+      this._publishState();
+    }
+  };
+
+  this._spawnPair = function () {
+    const globeRadius = this.getAttribute("globeRadius");
+    const minDist = this.getAttribute("minTargetDistance");
+    const terrainSeed = 42;
+    const terrainType = "default";
+
+    const pickupQ = this._randomLandPoint(terrainSeed, terrainType);
+    let deliveryQ;
+    for (let attempt = 0; attempt < 24; attempt++) {
+      deliveryQ = this._randomLandPoint(terrainSeed, terrainType);
+      const pPos = S.cartesianFromSpherical(pickupQ, 0, globeRadius);
+      const dPos = S.cartesianFromSpherical(deliveryQ, 0, globeRadius);
+      if (pPos.distanceTo(dPos) >= minDist) break;
+    }
+
+    this._poseMarker(this._pickupMarker, pickupQ, terrainSeed, terrainType, globeRadius);
+    this._poseMarker(this._deliveryMarker, deliveryQ, terrainSeed, terrainType, globeRadius);
+    this._pickupMarker.visible = true;
+    this._deliveryMarker.visible = false;
+  };
+
+  this._randomLandPoint = function (terrainSeed, terrainType) {
+    for (let attempt = 0; attempt < 32; attempt++) {
+      const theta = this._rand() * Math.PI * 2;
+      const phi = Math.acos(2 * this._rand() - 1);
+      const nx = Math.sin(phi) * Math.cos(theta);
+      const ny = Math.sin(phi) * Math.sin(theta);
+      const nz = Math.cos(phi);
+      const sample = T.sampleTerrain(terrainSeed, terrainType, nx, ny, nz);
+      if (sample.isLand) {
+        return new THREE.Quaternion().setFromUnitVectors(this._yAxis, new THREE.Vector3(nx, ny, nz));   // @check-ok one-shot per quest
+      }
+    }
+    // Fallback — accept whatever.
+    const theta = this._rand() * Math.PI * 2;
+    const phi = Math.acos(2 * this._rand() - 1);
+    return new THREE.Quaternion().setFromUnitVectors(this._yAxis, new THREE.Vector3(   // @check-ok fallback
+      Math.sin(phi) * Math.cos(theta),
+      Math.sin(phi) * Math.sin(theta),
+      Math.cos(phi),
+    ));
+  };
+
+  this._poseMarker = function (marker, qPos, terrainSeed, terrainType, globeRadius) {
+    const up = this._tmpUp.set(0, 1, 0).applyQuaternion(qPos).normalize();
+    const surfaceAlt = T.surfaceAltitudeAt(terrainSeed, terrainType, up.x, up.y, up.z);
+    const worldPos = S.cartesianFromSpherical(qPos, surfaceAlt + 0.1, globeRadius);
+    marker.position.copy(worldPos);
+    // Orient marker so column points outward (along up axis).
+    this._qAlign.setFromUnitVectors(this._yAxis, up);
+    marker.quaternion.copy(this._qAlign);
+  };
+
+  this._publishState = function () {
+    const s = this.erth.store;
+    s.set("tinyskies/carryingPackage", this._carrying);
+    s.set("tinyskies/packagesDelivered", this._packagesDelivered);
+  };
+
+  this._buildMarkers = function (parent) {
+    const root = new THREE.Group();
+    root.name = "tinyskiesPackageQuestRoot";
+    root.userData.isRuntimeOnly = true;
+    const pickupMarker = buildMarker(PICKUP_COLOR);
+    const deliveryMarker = buildMarker(DELIVERY_COLOR);
+    pickupMarker.userData.isRuntimeOnly = true;
+    deliveryMarker.userData.isRuntimeOnly = true;
+    deliveryMarker.visible = false;
+    root.add(pickupMarker);
+    root.add(deliveryMarker);
+    this._pickupMarker = pickupMarker;
+    this._deliveryMarker = deliveryMarker;
+    parent.add(root);
+    this._root = root;
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    if (this._root) {
+      this._root.traverse((c) => {
+        if (c.geometry && c.geometry.dispose) c.geometry.dispose();
+        if (c.material) {
+          if (Array.isArray(c.material)) {
+            for (const m of c.material) if (m && m.dispose) m.dispose();
+          } else if (c.material.dispose) c.material.dispose();
+        }
+      });
+      if (this._root.parent) this._root.parent.remove(this._root);
+    }
+    this._root = null;
+    this._pickupMarker = null;
+    this._deliveryMarker = null;
+  };

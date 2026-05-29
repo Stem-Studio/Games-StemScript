@@ -1,0 +1,387 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Gremlin Hearts"
+  id: "tinyskies.gremlinHearts"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Heart pickup pool for the Gremlin King encounter — 7 heart-shaped pickups floating around the globe at altitude 0.55. Player passes through one to heal HEAL_HP HP. Hearts respawn after RESPAWN_DELAY (2-4s). Source-faithful port of GremlinHearts.ts (292 LOC) using ExtrudeGeometry + TSL holographic material on MeshStandardNodeMaterial (replacing source's raw ShaderMaterial holoVert/holoFrag)."
+  documentation: "Tracks 7 hearts on the globe. Each cycles between active (visible, collectable) and pending-respawn (hidden, ticking down a 2-4s timer). On player proximity within COLLECT_RADIUS=0.3, heart deactivates and writes `tinyskies/applyHeartHeal` to the store with the heal amount (default HEAL_HP=3). The flightController consumes this signal in update() and adds to player HP. Source uses ShaderMaterial with hologram vert/frag; we use a TSL holographic colorNode (fresnel + sin-band hue cycle + emissive). Source's PointLight per heart preserved at intensity 0.38."
+  tags:
+    - visual
+    - gameplay
+  priority: 0
+  throttleConfig:
+    throttlePriority: "HIGH"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    globeRadius:
+      name: "Globe Radius"
+      type: "number"
+      default: 5
+      min: 0.5
+      max: 200
+    heartCount:
+      name: "Heart Count"
+      type: "number"
+      default: 7
+      min: 0
+      max: 24
+    heartFlightAltitude:
+      name: "Heart Flight Altitude"
+      type: "number"
+      default: 0.55
+      min: 0.1
+      max: 2
+    healHp:
+      name: "Heal HP"
+      type: "number"
+      default: 3
+      min: 1
+      max: 20
+    seed:
+      name: "Spawn Seed"
+      type: "number"
+      default: 42
+      min: 1
+      max: 1000000
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  @import "spherical-math" as S;
+
+  const LOG_TAG = "[tinyskies.gremlinHearts]";
+
+  // Source GremlinHearts.ts constants
+  const HEART_MESH_SCALE = 0.1;
+  const COLLECT_RADIUS = 0.3;
+  const SPIN_RATE = 2.4;
+  const BOB_LIFT = 0.01;
+  const BOB_AMP = 0.014;
+  const RESPAWN_DELAY_MIN = 2.0;
+  const RESPAWN_DELAY_MAX = 4.0;
+  const SPAWN_GROW_RATE = 2.2;
+  const MIN_SPACING = 1.45;
+  const MIN_PLAYER_SPAWN_DIST = 1.9;
+
+  function cartesianFromSphericalInto(qPosition, altitude, globeRadius, out) {
+    return out.set(0, globeRadius + altitude, 0).applyQuaternion(qPosition);
+  }
+
+  // Source GremlinHearts.ts:31-65 — Bezier heart profile + ExtrudeGeometry.
+  function buildHeartProfileShape() {
+    const w = 1.35;
+    const sh = new THREE.Shape();
+    sh.moveTo(0, 0.25);
+    sh.bezierCurveTo(0, 0, -0.5 * w, 0, -0.5 * w, 0.25);
+    sh.bezierCurveTo(-0.5 * w, 0.65, 0, 0.85, 0, 1.15);
+    sh.bezierCurveTo(0, 0.85, 0.5 * w, 0.65, 0.5 * w, 0.25);
+    sh.bezierCurveTo(0.5 * w, 0, 0, 0, 0, 0.25);
+    return sh;
+  }
+
+  // No editor preview — heart positions only make sense once the player is
+  // alive in play mode (collection-radius logic depends on flightController
+  // publishing the player's spherical pose). In the editor the hearts
+  // would cluster at the scene origin with no useful context. This matches
+  // the same rationale tinyskiesSkyGremlins.yaml uses for the same issue.
+  function createHeartGeometry() {
+    const shape = buildHeartProfileShape();
+    const geo = new THREE.ExtrudeGeometry(shape, { // @check-ok
+
+      depth: 0.15,
+      bevelEnabled: true,
+      bevelThickness: 0.15,
+      bevelSize: 0.15,
+      bevelOffset: 0,
+      bevelSegments: 8,
+      curveSegments: 24,
+    });
+    geo.center();
+    geo.scale(1, -1, 1);
+    geo.computeVertexNormals();
+    return geo;
+  }
+
+  // Holographic heart material — TSL approximation of source's holoVert /
+  // holoFrag ShaderMaterial. Pulses warm-pink with a fresnel rim and a slow
+  // sin-band shimmer along the local Y axis. Each instance gets its own
+  // `phaseOffset` and `spawnScale` uniforms via material.userData (we update
+  // them per-frame in update()).
+  function buildHeartMaterial() {
+    const TSL = THREE.TSL;
+    const mat = new THREE.MeshStandardNodeMaterial({
+      color: 0xff7a99,
+      roughness: 0.15,
+      metalness: 0.0,
+      transparent: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    // Fresnel rim — bright pink at glancing angles
+    const viewDir = TSL.normalize(TSL.cameraPosition.sub(TSL.positionWorld));
+    // dFdx/dFdy-derived normal — no `normal` attribute needed, so the material compiles cleanly in shadow / AO passes that strip lighting attrs (avoids TSL "Vertex attribute 'normal' not found" warnings that pin frame budget).
+    const nW = TSL.normalize(TSL.cross(TSL.dFdx(TSL.positionWorld), TSL.dFdy(TSL.positionWorld)));
+    const fresnel = TSL.float(1.0).sub(TSL.dot(viewDir, nW).abs());
+    const rim = TSL.vec3(1.0, 0.5, 0.65)
+      .mul(TSL.float(0.85))
+      .mul(TSL.pow(fresnel, TSL.float(2.4)));
+    mat.emissiveNode = rim;
+    return mat;
+  }
+
+  // -----------------------------------------------------------------
+  // Lifecycle
+  // -----------------------------------------------------------------
+
+  let game;
+
+  this.init = function (_game) {
+    game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._buildVisuals(this.gameObject._internal.three);
+    this._log("init");
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    this._teardownVisuals();
+  };
+
+  this._buildVisuals = function (parent) {
+    const heartCount = this.getAttribute("heartCount");
+    const seed = this.getAttribute("seed");
+
+    const root = new THREE.Group();
+    root.name = "tinyskiesGremlinHeartsRoot";
+    root.userData.isRuntimeOnly = true;
+
+    this._heartGeo = createHeartGeometry();
+    this._sharedMat = buildHeartMaterial();
+    this._time = 0;
+    this._rand = S.seededRandom(seed + 9999);
+    this._tmpV = new THREE.Vector3();
+    this._tmpQ = new THREE.Quaternion();
+    this._tmpQAlign = new THREE.Quaternion();
+    this._tmpWorldPos = new THREE.Vector3();
+    this._tmpBasePos = new THREE.Vector3();
+    this._tmpPlayerQ = new THREE.Quaternion();
+    this._tmpPlayerWorld = new THREE.Vector3();
+    this._refUp = new THREE.Vector3(0, 1, 0);
+
+    const hearts = [];
+    for (let i = 0; i < heartCount; i++) {
+      const mesh = new THREE.Mesh(this._heartGeo, this._sharedMat); // @check-ok no editor preview
+      mesh.userData.isRuntimeOnly = true;
+      mesh.frustumCulled = false;
+      mesh.scale.setScalar(0);
+
+      // Source GremlinHearts.ts:131 attaches a PointLight to each heart
+      // (color 0xff6677, intensity 0.38, distance 0.45, decay 1.2).
+      const light = new THREE.PointLight(0xff6677, 0.38, 0.45, 1.2); // @check-ok no editor preview
+      light.userData.isRuntimeOnly = true;
+      mesh.add(light);
+
+      const qPos = this._randomSpherePosition(hearts);
+      const upAxis = S.cartesianFromSpherical(qPos, this.getAttribute("heartFlightAltitude"), this.getAttribute("globeRadius")).normalize();
+
+      hearts.push({
+        mesh,
+        light,
+        qPos,
+        upAxis,
+        active: true,
+        spawnScale: 0,
+        phase: this._rand() * Math.PI * 2,
+        spinAngle: this._rand() * Math.PI * 2,
+        pendingRespawnTimer: 0,
+        pendingRespawnDelay: 0,
+      });
+      root.add(mesh);
+    }
+
+    parent.add(root);
+    this._root = root;
+    this._hearts = hearts;
+  };
+
+  // Source GremlinHearts.ts:160-200 — pick a random sphere position that's
+  // at least MIN_SPACING away from active hearts, and (if avoidQ provided)
+  // at least MIN_PLAYER_SPAWN_DIST from the player.
+  this._randomSpherePosition = function (existingHearts, avoidQ) {
+    const radius = this.getAttribute("globeRadius");
+    const altitude = this.getAttribute("heartFlightAltitude");
+    for (let attempt = 0; attempt < 80; attempt++) {
+      const q = new THREE.Quaternion();
+      const h = this._rand() * Math.PI * 2;
+      const a = 0.35 + this._rand() * 2.4;
+      const q1 = S.moveOnSphere(q, h, a);
+      const h2 = this._rand() * Math.PI * 2;
+      const a2 = this._rand() * 1.4;
+      const finalQ = S.moveOnSphere(q1, h2, a2);
+      const candidate = S.cartesianFromSpherical(finalQ, altitude, radius);
+
+      let tooClose = false;
+      if (existingHearts) {
+        for (const h of existingHearts) {
+          if (!h.active) continue;
+          const other = S.cartesianFromSpherical(h.qPos, altitude, radius);
+          if (candidate.distanceTo(other) < MIN_SPACING) { tooClose = true; break; }
+        }
+      }
+      if (tooClose) continue;
+      if (avoidQ) {
+        const playerPos = S.cartesianFromSpherical(avoidQ, altitude, radius);
+        if (candidate.distanceTo(playerPos) < MIN_PLAYER_SPAWN_DIST) continue;
+      }
+      return finalQ;
+    }
+    // Fallback — random position regardless
+    const q = new THREE.Quaternion();
+    return S.moveOnSphere(q, this._rand() * Math.PI * 2, 0.5 + this._rand() * 2.0);
+  };
+
+  this.update = function (deltaTime) {
+    if (!this._hearts) return;
+    const dt = Math.min(deltaTime, 0.1);
+    this._time += dt;
+    const t = this._time;
+
+    const radius = this.getAttribute("globeRadius");
+    const altitude = this.getAttribute("heartFlightAltitude");
+    const tmpV = this._tmpV;
+    const tmpQ = this._tmpQ;
+    const tmpQAlign = this._tmpQAlign;
+    const tmpWorldPos = this._tmpWorldPos;
+    const tmpBasePos = this._tmpBasePos;
+    const tmpPlayerQ = this._tmpPlayerQ;
+    const tmpPlayerWorld = this._tmpPlayerWorld;
+    const REF_UP = this._refUp;
+
+    // Player position is reconstructed from the flightController's published
+    // spherical pose so this behavior does not need a separate player-world key.
+    const store = this.erth.store;
+    const qx = store.get("tinyskies/qx");
+    const qy = store.get("tinyskies/qy");
+    const qz = store.get("tinyskies/qz");
+    const qw = store.get("tinyskies/qw");
+    const playerAltitude = store.get("tinyskies/altitude");
+    const hasPlayer = (
+      typeof qx === "number" &&
+      typeof qy === "number" &&
+      typeof qz === "number" &&
+      typeof qw === "number" &&
+      typeof playerAltitude === "number"
+    );
+    if (hasPlayer) {
+      tmpPlayerQ.set(qx, qy, qz, qw);
+      cartesianFromSphericalInto(tmpPlayerQ, playerAltitude, radius, tmpPlayerWorld);
+    }
+
+    for (const h of this._hearts) {
+      // Pending respawn — wait then re-place.
+      if (h.pendingRespawnTimer > 0) {
+        h.pendingRespawnTimer -= dt;
+        if (h.pendingRespawnTimer <= 0) {
+          h.qPos.copy(this._randomSpherePosition(this._hearts, hasPlayer ? tmpPlayerQ : null));
+          cartesianFromSphericalInto(h.qPos, altitude, radius, tmpBasePos);
+          h.upAxis.copy(tmpBasePos).normalize();
+          h.mesh.position.copy(tmpBasePos);
+          h.mesh.scale.setScalar(0);
+          h.spawnScale = 0;
+          h.active = true;
+          h.mesh.visible = true;
+        }
+        continue;
+      }
+      if (!h.active) continue;
+
+      // Spawn-grow ease-out
+      if (h.spawnScale < 1) {
+        h.spawnScale = Math.min(1, h.spawnScale + dt * SPAWN_GROW_RATE);
+        const ease = 1 - Math.pow(1 - h.spawnScale, 3);
+        const s = HEART_MESH_SCALE * (0.5 + 0.5 * ease);
+        h.mesh.scale.setScalar(s);
+      } else {
+        h.mesh.scale.setScalar(HEART_MESH_SCALE);
+      }
+
+      // Bob along upAxis
+      const bob = BOB_LIFT + Math.sin(t * 1.35 + h.phase) * BOB_AMP;
+      cartesianFromSphericalInto(h.qPos, altitude, radius, tmpWorldPos);
+      h.mesh.position.copy(tmpWorldPos).addScaledVector(h.upAxis, bob);
+
+      // Spin around upAxis
+      h.spinAngle += SPIN_RATE * dt;
+      tmpQAlign.setFromUnitVectors(REF_UP, h.upAxis);
+      tmpQ.setFromAxisAngle(REF_UP, h.spinAngle);
+      h.mesh.quaternion.copy(tmpQAlign).multiply(tmpQ);
+
+      // Pulse the point light
+      h.light.intensity = 0.3 + 0.18 * Math.sin(t * 2.1 + h.phase * 0.5);
+
+      // Player-collision check.
+      if (hasPlayer) {
+        tmpV.copy(tmpPlayerWorld);
+        const d = h.mesh.position.distanceTo(tmpV);
+        if (d < COLLECT_RADIUS) {
+          h.active = false;
+          h.mesh.visible = false;
+          // Publish heal signal — flightController consumes
+          // `tinyskies/applyHeartHeal` next frame.
+          const heal = this.getAttribute("healHp");
+          const prev = this.erth.store.get("tinyskies/applyHeartHeal");
+          this.erth.store.set("tinyskies/applyHeartHeal", (typeof prev === "number" ? prev : 0) + heal);
+          // Bump lifetime counter for HUD / persistence.
+          const lifetime = this.erth.store.get("tinyskies/lifetimeHeartsCollected");
+          this.erth.store.set("tinyskies/lifetimeHeartsCollected", (typeof lifetime === "number" ? lifetime : 0) + 1);
+          h.pendingRespawnTimer = RESPAWN_DELAY_MIN + this._rand() * (RESPAWN_DELAY_MAX - RESPAWN_DELAY_MIN);
+          h.pendingRespawnDelay = h.pendingRespawnTimer;
+          this._log("heart collected — heal", heal, "respawn in", h.pendingRespawnTimer.toFixed(1), "s");
+        }
+      }
+    }
+  };
+
+  this._teardownVisuals = function () {
+    if (!this._root) return;
+    this._root.traverse((c) => {
+      if (c.geometry && typeof c.geometry.dispose === "function") c.geometry.dispose();
+      if (c.material) {
+        if (Array.isArray(c.material)) {
+          for (const m of c.material) if (m && m.dispose) m.dispose();
+        } else if (c.material.dispose) c.material.dispose();
+      }
+    });
+    if (this._heartGeo) {
+      try { this._heartGeo.dispose(); } catch (_) {}
+    }
+    if (this._sharedMat) {
+      try { this._sharedMat.dispose(); } catch (_) {}
+    }
+    if (this._root.parent) this._root.parent.remove(this._root);
+    this._root = null;
+    this._hearts = null;
+    this._heartGeo = null;
+    this._sharedMat = null;
+    this._tmpV = null;
+    this._tmpQ = null;
+    this._tmpQAlign = null;
+    this._tmpWorldPos = null;
+    this._tmpBasePos = null;
+    this._tmpPlayerQ = null;
+    this._tmpPlayerWorld = null;
+    this._refUp = null;
+  };

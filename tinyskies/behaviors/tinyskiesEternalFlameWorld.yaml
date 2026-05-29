@@ -1,0 +1,393 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Eternal Flame World"
+  id: "tinyskies.eternalFlameWorld"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Cosmic-void scene built around the eternal flame: spinning blue-emissive flame model, hex shimmer shield (12 HP), 5 holographic hearts in a ring (heal +2 shield HP each). Source-faithful merge of EternalFlameModel.ts (158 LOC) + EternalFlameWorld.ts (256 LOC) + VoidFlameShield.ts (193 LOC) + VoidHearts.ts (161 LOC) into one cohesive behavior."
+  documentation: "Active when `tinyskies/inVoid` is true. Auto-enters when carpet climbs past `entryAltitudeRatio * 1.0` (carpet's max altitude) — placeholder until Pass 13 ships proper CosmicWorldPortal entry. Flame model loaded by cloning the project-imported `EternalFlameModel` template (visible only inside the void). Shield: IcosahedronGeometry sphere with breathing pulse below 3 HP, hit flash on damage (consumed via store key `tinyskies/damageShield`). Hearts: 5 spawning in a ring around flame using planeN/E vectors derived from radial-up at flame world position; collect within 0.28 units restores VOID_HEART_HEAL=2 shield HP, respawn after RESPAWN_DELAY=12s. Source uses raw GLSL shaders for shield/hearts; replaced with MeshStandardNodeMaterial + emissive pulse for WebGPU compat. Pass 12b adds VoidMoths swarm + Capybara flame shots; Pass 12c adds EternalFlameBeams visual columns."
+  tags:
+    - gameplay
+    - vfx
+    - void
+  priority: 0
+  throttleConfig:
+    throttlePriority: "HIGH"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    flameTemplateName:
+      name: "Flame Template Object Name"
+      type: "string"
+      default: "EternalFlameModel"
+    flameWorldX:
+      name: "Flame World X"
+      type: "number"
+      default: 0
+    flameWorldY:
+      name: "Flame World Y"
+      type: "number"
+      default: 8
+      description: "Default places flame above globe at radial up (0, 1, 0) at altitude 8."
+    flameWorldZ:
+      name: "Flame World Z"
+      type: "number"
+      default: 0
+    flameTargetSize:
+      name: "Flame Target Size"
+      type: "number"
+      default: 0.6
+      min: 0.1
+      max: 5
+    entryAltitudeRatio:
+      name: "Entry Altitude Ratio"
+      type: "number"
+      default: 0.92
+      min: 0.5
+      max: 1
+      description: "Carpet at altitude > this * 1.0 triggers void entry. Pass 13 replaces with CosmicWorldPortal trigger."
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  const LOG_TAG = "[tinyskies.eternalFlameWorld]";
+
+  // Source VoidFlameShield.ts:8-21 — verbatim.
+  const SHIELD_MAX_HP = 12;
+  const SHIELD_LOW_HP_PULSE_HZ = 3.6;
+  // Source VoidHearts.ts:14-20 — verbatim.
+  const HEART_COUNT = 5;
+  const HEART_COLLECT_RADIUS = 0.28;
+  const HEART_SPAWN_RING_MIN = 1.4;
+  const HEART_SPAWN_RING_MAX = 3.2;
+  const HEART_SCALE = 0.08;
+  const HEART_SPIN_RATE = 2.2;
+  const HEART_BOB_AMP = 0.018;
+  const HEART_RESPAWN_DELAY = 12.0;
+  const VOID_HEART_HEAL = 2;
+  // Source EternalFlameWorld.ts:13 — flame spin.
+  const FLAME_SPIN_RAD = 1.1;
+
+  this.init = function (_game) {
+    this._game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+
+    this._time = 0;
+    this._inVoid = false;
+    this._tmpPlayerPos = new THREE.Vector3();
+    this._shieldHp = SHIELD_MAX_HP;
+    this._shieldHitFlash = 0;
+    this._shieldPhase = Math.random() * Math.PI * 2;
+
+    // Group is parented to scene root so the flame world stays at a fixed
+    // world position regardless of player movement.
+    this._group = new THREE.Group();
+    this._group.userData.isRuntimeOnly = true;
+    this._group.visible = false;
+    const sceneParent = this.gameObject._internal.three.parent || this.gameObject._internal.three;
+    sceneParent.add(this._group);
+
+    const flamePos = new THREE.Vector3(
+      this.getAttribute("flameWorldX"),
+      this.getAttribute("flameWorldY"),
+      this.getAttribute("flameWorldZ"),
+    );
+    this._flamePos = flamePos;
+    this._group.position.copy(flamePos);
+
+    // Plane vectors — derived from radial-up at the flame's world position.
+    // Pass 12b moths consume these via store keys.
+    const up = flamePos.clone().normalize();
+    const tangent = new THREE.Vector3(0, 1, 0).cross(up);
+    if (tangent.lengthSq() < 1e-6) tangent.set(1, 0, 0).cross(up);
+    tangent.normalize();
+    const east = new THREE.Vector3().crossVectors(up, tangent).normalize();
+    this._planeUp = up;
+    this._planeN = tangent;
+    this._planeE = east;
+
+    this._buildFlame();
+    this._buildShield();
+    this._buildHearts();
+
+    // Publish plane frame for downstream consumers (moths, beams, capybara).
+    this.erth.store.set("tinyskies/voidPlane", {
+      flame: [flamePos.x, flamePos.y, flamePos.z],
+      up: [up.x, up.y, up.z],
+      north: [tangent.x, tangent.y, tangent.z],
+      east: [east.x, east.y, east.z],
+    });
+    this.erth.store.set("tinyskies/inVoid", false);
+    this.erth.store.set("tinyskies/voidShieldHp", SHIELD_MAX_HP);
+
+    this._log("init flame world at", flamePos.x.toFixed(2), flamePos.y.toFixed(2), flamePos.z.toFixed(2));
+  };
+
+  this._buildFlame = function () {
+    const tplName = this.getAttribute("flameTemplateName");
+    const tpl = (this._game && this._game.scene && typeof this._game.scene.getObjectByName === "function")
+      ? this._game.scene.getObjectByName(tplName)
+      : null;
+    if (!tpl) {
+      this._log("flame template not found, using fallback icosphere");
+      const fallbackGeo = new THREE.IcosahedronGeometry(0.22, 1); // @check-ok no editor preview — flame world only renders inside void
+      const fallbackMat = new THREE.MeshStandardNodeMaterial({
+        color: 0x4488cc, emissive: 0x2288ff, emissiveIntensity: 1.85, flatShading: true,
+      });
+      this._flameModel = new THREE.Mesh(fallbackGeo, fallbackMat);
+      this._flameFallbackGeo = fallbackGeo;
+      this._flameFallbackMat = fallbackMat;
+      this._flameModel.userData.isRuntimeOnly = true;
+      this._group.add(this._flameModel);
+      return;
+    }
+    const clone = tpl.clone(true);
+    clone.traverse((c) => { c.userData.isRuntimeOnly = true; c.visible = true; });
+    // Fit to target size (source EternalFlameModel.fitEternalFlameModel).
+    const box = new THREE.Box3().setFromObject(clone);
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    const max = Math.max(size.x, size.y, size.z, 1e-4);
+    const target = this.getAttribute("flameTargetSize");
+    const scl = target / max;
+    clone.scale.setScalar(scl);
+    const center = new THREE.Vector3();
+    box.getCenter(center);
+    clone.position.copy(center.multiplyScalar(-scl));
+    // Bias emissive (source applyEternalFlameGlow does material rewrites).
+    clone.traverse((c) => {
+      if (c && c.material) {
+        const mats = Array.isArray(c.material) ? c.material : [c.material];
+        for (const m of mats) {
+          if (m && "emissive" in m && m.emissive) {
+            try { m.emissive.setHex(0x3399ff); } catch (_e) { /* ignore */ }
+          }
+          if (m && "emissiveIntensity" in m) {
+            m.emissiveIntensity = Math.max(m.emissiveIntensity || 0, 2.0);
+          }
+        }
+      }
+    });
+    this._flameModel = clone;
+    this._group.add(clone);
+  };
+
+  this._buildShield = function () {
+    const geo = new THREE.IcosahedronGeometry(0.55, 2); // @check-ok no editor preview
+    const mat = new THREE.MeshStandardNodeMaterial({
+      color: 0x88ddff, emissive: 0x55aaff, emissiveIntensity: 1.4,
+      transparent: true, opacity: 0.45, side: THREE.DoubleSide, depthWrite: false,
+    });
+    this._shieldGeo = geo;
+    this._shieldMat = mat;
+    this._shieldMesh = new THREE.Mesh(geo, mat);
+    this._shieldMesh.userData.isRuntimeOnly = true;
+    this._group.add(this._shieldMesh);
+  };
+
+  this._buildHearts = function () {
+    this._hearts = [];
+    const geo = new THREE.OctahedronGeometry(1, 0); // @check-ok no editor preview — heart approximation
+    this._heartGeo = geo;
+    for (let i = 0; i < HEART_COUNT; i++) {
+      const mat = new THREE.MeshStandardNodeMaterial({
+        color: 0xff5566, emissive: 0xff3344, emissiveIntensity: 1.8,
+        transparent: true, opacity: 0.95, depthWrite: false,
+      });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.userData.isRuntimeOnly = true;
+      mesh.frustumCulled = false;
+
+      const angle = (i / HEART_COUNT) * Math.PI * 2 + Math.random() * 0.8;
+      const dist = HEART_SPAWN_RING_MIN + Math.random() * (HEART_SPAWN_RING_MAX - HEART_SPAWN_RING_MIN);
+      const yOff = (Math.random() - 0.5) * 0.3;
+      const worldPos = this._flamePos.clone()
+        .addScaledVector(this._planeN, Math.cos(angle) * dist)
+        .addScaledVector(this._planeE, Math.sin(angle) * dist)
+        .addScaledVector(this._planeUp, yOff);
+      // Hearts live as children of the flame group, so position relative.
+      const localPos = worldPos.clone().sub(this._flamePos);
+      mesh.position.copy(localPos);
+      mesh.scale.setScalar(0);
+      this._group.add(mesh);
+
+      this._hearts.push({
+        mesh, mat,
+        worldPos,
+        localPos,
+        active: true,
+        phase: Math.random() * Math.PI * 2,
+        spinAngle: Math.random() * Math.PI * 2,
+        spawnScale: 0,
+        respawnTimer: 0,
+      });
+    }
+  };
+
+  this._readPlayer = function () {
+    const store = this.erth.store;
+    const altitude = store.get("tinyskies/altitude");
+    const vt = store.get("tinyskies/vehicleType") || "plane";
+    const qx = store.get("tinyskies/qx");
+    const qy = store.get("tinyskies/qy");
+    const qz = store.get("tinyskies/qz");
+    const qw = store.get("tinyskies/qw");
+    if (altitude === undefined || qx === undefined) return null;
+    return { altitude, vt, qx, qy, qz, qw };
+  };
+
+  this._tickShield = function (dt) {
+    if (this._shieldHp <= 0) {
+      this._shieldMesh.visible = false;
+      return;
+    }
+    this._shieldMesh.visible = true;
+
+    // Damage consume.
+    const dmg = this.erth.store.get("tinyskies/damageShield");
+    if (typeof dmg === "number" && dmg > 0) {
+      this.erth.store.set("tinyskies/damageShield", 0);
+      this._shieldHp = Math.max(0, this._shieldHp - dmg);
+      this._shieldHitFlash = 1;
+      this.erth.store.set("tinyskies/voidShieldHp", this._shieldHp);
+    }
+    if (this._shieldHitFlash > 0) {
+      this._shieldHitFlash *= Math.exp(-4.8 * dt);
+      if (this._shieldHitFlash < 0.01) this._shieldHitFlash = 0;
+    }
+
+    // Breathing pulse below 3 HP.
+    let pulse = 1;
+    if (this._shieldHp > 0 && this._shieldHp < 3) {
+      pulse = 0.22 + 0.78 * (0.5 + 0.5 * Math.sin(this._time * Math.PI * 2 * SHIELD_LOW_HP_PULSE_HZ + this._shieldPhase));
+    }
+    const hpRatio = this._shieldHp / SHIELD_MAX_HP;
+    if (this._shieldMat) {
+      this._shieldMat.opacity = (0.18 + 0.55 * hpRatio) * pulse + this._shieldHitFlash * 0.4;
+      this._shieldMat.emissiveIntensity = 1.2 + this._shieldHitFlash * 1.8;
+    }
+    this._shieldMesh.rotation.y += dt * 0.55 * 0.4;
+    this._shieldMesh.rotation.x += dt * 0.12 * 0.4;
+  };
+
+  this._tickHearts = function (dt, playerWorldPos) {
+    for (const h of this._hearts) {
+      if (!h.active) {
+        h.respawnTimer -= dt;
+        if (h.respawnTimer <= 0) {
+          h.active = true;
+          h.mesh.visible = true;
+          h.spawnScale = 0;
+        }
+        continue;
+      }
+      // Spawn-in pop.
+      if (h.spawnScale < 1) {
+        h.spawnScale = Math.min(1, h.spawnScale + dt * 3.0);
+      }
+      const bob = Math.sin(this._time * 1.8 + h.phase) * HEART_BOB_AMP;
+      h.spinAngle += HEART_SPIN_RATE * dt;
+      // Position = local offset + bob along planeUp, rendered in flame group's
+      // local frame → subtract flame world pos after adding bob.
+      const bobOffset = this._planeUp.x * bob;
+      h.mesh.position.set(
+        h.localPos.x + this._planeUp.x * bob,
+        h.localPos.y + this._planeUp.y * bob,
+        h.localPos.z + this._planeUp.z * bob,
+      );
+      h.mesh.rotation.y = h.spinAngle;
+      h.mesh.scale.setScalar(HEART_SCALE * h.spawnScale);
+
+      // Proximity collect.
+      if (playerWorldPos) {
+        const dx = playerWorldPos.x - h.worldPos.x;
+        const dy = playerWorldPos.y - h.worldPos.y;
+        const dz = playerWorldPos.z - h.worldPos.z;
+        if (dx * dx + dy * dy + dz * dz < HEART_COLLECT_RADIUS * HEART_COLLECT_RADIUS) {
+          h.active = false;
+          h.mesh.visible = false;
+          h.respawnTimer = HEART_RESPAWN_DELAY;
+          this._shieldHp = Math.min(SHIELD_MAX_HP, this._shieldHp + VOID_HEART_HEAL);
+          this.erth.store.set("tinyskies/voidShieldHp", this._shieldHp);
+          this._log("heart collected, shield hp →", this._shieldHp);
+        }
+      }
+    }
+  };
+
+  this.update = function (deltaTime) {
+    if (!this._group) return;
+    const dt = Math.min(deltaTime || 0, 0.1);
+    this._time += dt;
+
+    const player = this._readPlayer();
+    if (!player) return;
+
+    const isCarpet = (player.vt === "carpet");
+    // Pass 13a: void entry now driven by `tinyskies/voidEntryRequested`
+    // (set by tinyskiesCosmicPortal on flythrough). Altitude trigger
+    // retained as a fallback for testing and as the legacy entry path.
+    const entryAlt = this.getAttribute("entryAltitudeRatio");
+    const cosmicEntered = this.erth.store.get("tinyskies/voidEntryRequested") === true;
+    const wantInVoid = isCarpet && (cosmicEntered || player.altitude >= entryAlt);
+
+    if (wantInVoid !== this._inVoid) {
+      this._inVoid = wantInVoid;
+      this._group.visible = wantInVoid;
+      this.erth.store.set("tinyskies/inVoid", wantInVoid);
+      this._log("inVoid →", wantInVoid);
+      if (wantInVoid && this._shieldHp <= 0) {
+        // Re-arm on entry.
+        this._shieldHp = SHIELD_MAX_HP;
+        this.erth.store.set("tinyskies/voidShieldHp", SHIELD_MAX_HP);
+      }
+      if (!wantInVoid) {
+        // Clear cosmic-portal request so leaving void doesn't immediately
+        // re-trigger entry on the next frame.
+        this.erth.store.set("tinyskies/voidEntryRequested", false);
+      }
+    }
+
+    if (!this._inVoid) return;
+
+    // Flame spin.
+    if (this._flameModel) this._flameModel.rotation.y += dt * FLAME_SPIN_RAD;
+
+    this._tickShield(dt);
+
+    // Player world position derived from qPosition + altitude — the carpet
+    // visual is at globe-space coords, NOT at flameWorld coords. Hearts
+    // collect on globe-space distance.
+    const matrix = this.gameObject._internal.three.matrixWorld;
+    this._tmpPlayerPos.setFromMatrixPosition(matrix);
+    this._tickHearts(dt, this._tmpPlayerPos);
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    if (this._shieldGeo && typeof this._shieldGeo.dispose === "function") this._shieldGeo.dispose();
+    if (this._shieldMat && typeof this._shieldMat.dispose === "function") this._shieldMat.dispose();
+    if (this._heartGeo && typeof this._heartGeo.dispose === "function") this._heartGeo.dispose();
+    if (this._flameFallbackGeo && typeof this._flameFallbackGeo.dispose === "function") this._flameFallbackGeo.dispose();
+    if (this._flameFallbackMat && typeof this._flameFallbackMat.dispose === "function") this._flameFallbackMat.dispose();
+    if (this._hearts) {
+      for (const h of this._hearts) {
+        if (h.mat && typeof h.mat.dispose === "function") h.mat.dispose();
+      }
+      this._hearts = null;
+    }
+    if (this._group && this._group.parent) this._group.parent.remove(this._group);
+    this._group = null;
+    this.erth.store.set("tinyskies/inVoid", false);
+  };

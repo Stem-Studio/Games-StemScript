@@ -1,0 +1,139 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Sky Streaks"
+  id: "tinyskies.skyStreaks"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Background skydome — large inverted sphere with a procedural canvas texture of diagonal white streak clouds on a sky-blue gradient. Slowly rotates. Captures the source title-screen sky look (white streaks + cyan gradient backdrop)."
+  documentation: "Built once at init, parented to scene root. Inverted SphereGeometry at sky radius (default 80) with side=BackSide so the inside surface is shaded. Texture: 1024×512 canvas with vertical sky-blue → pale-cyan gradient and ~30 hand-painted diagonal soft streaks at varying angles. Rotation: yaw at rotationSpeed=0.012 rad/s. Independent of globe — sits behind everything. Dispose-safe; texture & geometry & material released on dispose."
+  tags:
+    - vfx
+    - environment
+  priority: 0
+  throttleConfig:
+    throttlePriority: "LOW"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    skyRadius:
+      name: "Sky Radius"
+      type: "number"
+      default: 80
+      min: 10
+      max: 500
+    rotationSpeed:
+      name: "Rotation Speed (rad/s)"
+      type: "number"
+      default: 0.012
+      min: 0
+      max: 1
+    streakCount:
+      name: "Streak Count"
+      type: "number"
+      default: 32
+      min: 0
+      max: 200
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  const LOG_TAG = "[tinyskies.skyStreaks]";
+
+  function buildSkyStreakTexture(streakCount) {
+    const canvas = document.createElement("canvas");
+    canvas.width = 1024;
+    canvas.height = 512;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+
+    // Vertical gradient: deeper sky at top → pale cyan at horizon.
+    const grad = ctx.createLinearGradient(0, 0, 0, 512);
+    grad.addColorStop(0, "#7ab9e8");
+    grad.addColorStop(0.55, "#aedaf2");
+    grad.addColorStop(1, "#e6f4fb");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, 1024, 512);
+
+    // Diagonal soft streaks.
+    ctx.globalAlpha = 0.55;
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineCap = "round";
+    for (let i = 0; i < streakCount; i++) {
+      const t = i / streakCount;
+      const cx = (Math.random() * 1.4 - 0.2) * 1024;
+      const cy = Math.random() * 512;
+      const angle = (Math.random() * 0.4 - 0.2) + Math.PI * 0.18;
+      const len = 80 + Math.random() * 320;
+      const w = 2 + Math.random() * 6;
+      const dx = Math.cos(angle) * len;
+      const dy = Math.sin(angle) * len * 0.4;
+      ctx.lineWidth = w;
+      ctx.globalAlpha = 0.18 + Math.random() * 0.42;
+      ctx.beginPath();
+      ctx.moveTo(cx - dx * 0.5, cy - dy * 0.5);
+      ctx.lineTo(cx + dx * 0.5, cy + dy * 0.5);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    return new THREE.CanvasTexture(canvas);
+  }
+
+  this.init = function (_game) {
+    this._game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+
+    this._time = 0;
+
+    const radius = this.getAttribute("skyRadius");
+    const tex = buildSkyStreakTexture(this.getAttribute("streakCount"));
+    if (tex && THREE.SRGBColorSpace) tex.colorSpace = THREE.SRGBColorSpace;
+    this._tex = tex;
+    this._geo = new THREE.SphereGeometry(radius, 32, 24); // @check-ok no editor preview — sky renders during play
+    this._mat = new THREE.MeshBasicNodeMaterial({
+      map: tex || null,
+      color: tex ? 0xffffff : 0xaedaf2,
+      side: THREE.BackSide,
+      depthWrite: false,
+      depthTest: true,
+      fog: false,
+    });
+    this._mesh = new THREE.Mesh(this._geo, this._mat);
+    this._mesh.frustumCulled = false;
+    this._mesh.userData.isRuntimeOnly = true;
+    this._mesh.renderOrder = -1000;
+
+    const sceneParent = this.gameObject._internal.three.parent || this.gameObject._internal.three;
+    sceneParent.add(this._mesh);
+
+    this._log("init r=", radius);
+  };
+
+  this.update = function (deltaTime) {
+    if (!this._mesh) return;
+    const dt = Math.min(deltaTime || 0, 0.1);
+    this._time += dt;
+    this._mesh.rotation.y = this._time * this.getAttribute("rotationSpeed");
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    if (this._geo && typeof this._geo.dispose === "function") this._geo.dispose();
+    if (this._mat && typeof this._mat.dispose === "function") this._mat.dispose();
+    if (this._tex && typeof this._tex.dispose === "function") this._tex.dispose();
+    if (this._mesh && this._mesh.parent) this._mesh.parent.remove(this._mesh);
+    this._mesh = null;
+    this._geo = null;
+    this._mat = null;
+    this._tex = null;
+  };

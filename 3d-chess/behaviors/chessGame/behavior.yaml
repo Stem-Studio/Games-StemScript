@@ -1,0 +1,1431 @@
+# StemStudio Export File
+# Do not edit manually unless you know what you're doing
+
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+  exportedAt: 2026-04-30T17:38:40.465Z
+config:
+  name: Chess Game
+  id: 69eab9e55b53803168c082a8
+  author: chess
+  isScript: true
+  main: script.js
+  version: 1.0.0
+  description: Complete 3D chess game with full rules, piece rendering, input handling, animations, and turn management.
+  tags:
+    - gameplay
+  priority: 0
+  attributes:
+    pawnModel:
+      name: Pawn Model
+      type: modelAsset
+      description: GLTF model for the pawn piece
+    rookModel:
+      name: Rook Model
+      type: modelAsset
+      description: GLTF model for the rook piece
+    knightModel:
+      name: Knight Model
+      type: modelAsset
+      description: GLTF model for the knight piece
+    bishopModel:
+      name: Bishop Model
+      type: modelAsset
+      description: GLTF model for the bishop piece
+    queenModel:
+      name: Queen Model
+      type: modelAsset
+      description: GLTF model for the queen piece
+    kingModel:
+      name: King Model
+      type: modelAsset
+      description: GLTF model for the king piece
+    pieceScale:
+      name: Piece Scale
+      type: number
+      default: 0.15
+      min: 0.05
+      max: 0.5
+    boardWhiteColor:
+      name: White Tile Color
+      type: string
+      default: "#aaaaaa"
+    boardBlackColor:
+      name: Black Tile Color
+      type: string
+      default: "#5a5a5a"
+    whitePieceColor:
+      name: White Piece Color
+      type: string
+      default: "#d9d9d9"
+    blackPieceColor:
+      name: Black Piece Color
+      type: string
+      default: "#7c7c7c"
+    validMoveColor:
+      name: Valid Move Highlight
+      type: string
+      default: "#ff0101"
+    selectionEmissive:
+      name: Selection Glow Color
+      type: string
+      default: "#733535"
+    moveArcHeight:
+      name: Move Arc Height
+      type: number
+      default: 1.2
+      min: 0.2
+      max: 3
+    moveDuration:
+      name: Move Duration
+      type: number
+      default: 0.6
+      min: 0.2
+      max: 2
+    borderColor:
+      name: Border Color
+      type: string
+      default: "#3a3a3a"
+    mainLightColor:
+      name: Main Light Color
+      type: string
+      default: "#ffe0ec"
+    mainLightIntensity:
+      name: Main Light Intensity
+      type: number
+      default: 0.65
+      min: 0
+      max: 5
+    enableBoardRotation:
+      name: Enable Board Rotation
+      type: boolean
+      default: true
+    boardRotationSpeed:
+      name: Board Rotation Speed
+      type: number
+      default: 2
+      min: 0.5
+      max: 5
+  throttleConfig:
+    throttlePriority: HIGH
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  documentation: Complete 3D chess game with full rules, piece rendering, input handling, animations, and turn management. Configure attributes in the editor to tune gameplay behavior.
+code: |-
+  /* 3D Chess — ported from joshwrn/3d-chess (React Three Fiber) */
+
+  // ===================== CONSTANTS =====================
+  let game;
+  let erth;
+
+  // `animatePieceMove`, `createPieceMesh` and other plain-function helpers are hoisted
+  // (mutually recursive) and need to read behavior attributes. We capture the behavior
+  // via a closure so those helpers can read attrs without `this` rebinding inside them.
+  let behaviorRef = null;
+  const getAttr = (key) => behaviorRef ? behaviorRef.getAttribute(key) : undefined;
+  let ownerObject; // raw THREE.Object3D for this.gameObject._internal.three
+  const BOARD_SIZE = 8;
+  const TILE_HEIGHT = 0.5;
+  const PIECE_Y = 0.5;
+  const TILE_Y = 0.25;
+  const BORDER_Y = -0.1;
+
+  const PIECE_TYPES = { PAWN: "pawn", ROOK: "rook", KNIGHT: "knight", BISHOP: "bishop", QUEEN: "queen", KING: "king" };
+  const COLORS = { WHITE: "white", BLACK: "black" };
+
+  // Initial board layout: [type, color] or null
+  const INITIAL_SETUP = [
+    [["rook", "white"], ["knight", "white"], ["bishop", "white"], ["king", "white"], ["queen", "white"], ["bishop", "white"], ["knight", "white"], ["rook", "white"]],
+    [["pawn", "white"], ["pawn", "white"], ["pawn", "white"], ["pawn", "white"], ["pawn", "white"], ["pawn", "white"], ["pawn", "white"], ["pawn", "white"]],
+    [null, null, null, null, null, null, null, null],
+    [null, null, null, null, null, null, null, null],
+    [null, null, null, null, null, null, null, null],
+    [null, null, null, null, null, null, null, null],
+    [["pawn", "black"], ["pawn", "black"], ["pawn", "black"], ["pawn", "black"], ["pawn", "black"], ["pawn", "black"], ["pawn", "black"], ["pawn", "black"]],
+    [["rook", "black"], ["knight", "black"], ["bishop", "black"], ["king", "black"], ["queen", "black"], ["bishop", "black"], ["knight", "black"], ["rook", "black"]]
+  ];
+
+  // ===================== STATE =====================
+  let pieceColor = null;
+  let isGameStarted = false;
+  let isGamePaused = false;
+  let board = [];           // 8x8 array: { piece: {type,color,hasMoved}, file, rank }
+  let selectedTile = null;  // {file, rank}
+  let validMoves = [];      // [{file, rank, special}]
+  let currentTurn = COLORS.WHITE;
+  let gameOverState = null; // null | {winner, type}
+  let moveHistory = [];     // [{from, to, piece, captured, special}]
+  let animating = false;
+  let animData = null;      // {mesh, startPos, endPos, elapsed, duration, arcHeight, callback}
+  let captureAnim = null;   // {mesh, startPos, elapsed, duration}
+  let piecesLoaded = false;
+  let boardPivot = null;
+  let boardRotTarget = 0;
+  let boardRotCurrent = 0;
+  let moveNotations = [];
+  let promoteData = null;
+
+  // ===================== VISUALS =====================
+  let boardGroup = null;
+  let tileMeshes = [];      // 8x8 array of tile meshes
+  let pieceMeshes = [];     // 8x8 array (null or mesh group)
+  let borderMesh = null;
+  let mainLight = null;
+  let selectionLight = null;
+  let disposables = [];
+
+  // Materials
+  let whiteTileMat = null;
+  let blackTileMat = null;
+  let validMoveMat = null;
+  let whitePieceMat = null;
+  let blackPieceMat = null;
+  let whiteSelectedMat = null;
+  let blackSelectedMat = null;
+  let borderMat = null;
+
+  // Template geometries from loaded models
+  let pieceGeometries = {};  // { pawn: geometry, rook: geometry, ... }
+
+  // Pre-allocated for raycasting (no hot-path allocation)
+  let raycaster = new THREE.Raycaster();
+  let pointerVec = new THREE.Vector2();
+
+  // ===================== MATERIALS =====================
+  const createMaterials = () => {
+    const whiteColor = this.getAttribute("boardWhiteColor");
+    const blackColor = this.getAttribute("boardBlackColor");
+    const validColor = this.getAttribute("validMoveColor");
+    const borderColor = this.getAttribute("borderColor");
+    const wp = this.getAttribute("whitePieceColor");
+    const bp = this.getAttribute("blackPieceColor");
+    const selEmissive = this.getAttribute("selectionEmissive");
+
+    whiteTileMat = new THREE.MeshStandardNodeMaterial({ color: whiteColor, metalness: 0.8, roughness: 0.7 });
+    blackTileMat = new THREE.MeshStandardNodeMaterial({ color: blackColor, metalness: 0.8, roughness: 0.7 });
+    validMoveMat = new THREE.MeshStandardNodeMaterial({ color: validColor, emissive: new THREE.Color(validColor), metalness: 0.8, roughness: 0.7 });
+    borderMat = new THREE.MeshStandardNodeMaterial({ color: borderColor, metalness: 0.6, roughness: 0.8 });
+
+    whitePieceMat = new THREE.MeshPhysicalNodeMaterial({ color: wp, metalness: 1, roughness: 0.5, reflectivity: 0.5 });
+    blackPieceMat = new THREE.MeshPhysicalNodeMaterial({ color: bp, metalness: 1, roughness: 0.5, reflectivity: 0.5 });
+    whiteSelectedMat = new THREE.MeshPhysicalNodeMaterial({ color: wp, emissive: new THREE.Color(selEmissive), metalness: 1, roughness: 0.5, reflectivity: 0.5 });
+    blackSelectedMat = new THREE.MeshPhysicalNodeMaterial({ color: bp, emissive: new THREE.Color(selEmissive), metalness: 1, roughness: 0.5, reflectivity: 0.5 });
+
+    disposables.push(whiteTileMat, blackTileMat, validMoveMat, borderMat, whitePieceMat, blackPieceMat, whiteSelectedMat, blackSelectedMat);
+  }
+
+  // ===================== BOARD VISUALS =====================
+  const buildBoardVisuals = () => {
+    boardPivot = new THREE.Group();
+    boardPivot.userData.isRuntimeOnly = true;
+
+    boardGroup = new THREE.Group();
+    boardGroup.position.set(-3.5, -0.5, -3.5);
+    boardGroup.userData.isRuntimeOnly = true;
+
+    // Border
+    let borderGeo = new THREE.BoxGeometry(9, TILE_HEIGHT, 9);
+    borderMesh = new THREE.Mesh(borderGeo, borderMat);
+    borderMesh.position.set(3.5, BORDER_Y, 3.5);
+    borderMesh.receiveShadow = true;
+    borderMesh.userData.isRuntimeOnly = true;
+    boardGroup.add(borderMesh);
+    disposables.push(borderGeo);
+
+    // Tiles
+    let tileGeo = new THREE.BoxGeometry(1, TILE_HEIGHT, 1);
+    disposables.push(tileGeo);
+
+    tileMeshes = [];
+    for (let rank = 0; rank < BOARD_SIZE; rank++) {
+      tileMeshes[rank] = [];
+      for (let file = 0; file < BOARD_SIZE; file++) {
+        let isWhite = (file + rank) % 2 === 0;
+        let mat = isWhite ? whiteTileMat : blackTileMat;
+        let tile = new THREE.Mesh(tileGeo, mat);
+        tile.position.set(file, TILE_Y, rank);
+        tile.receiveShadow = true;
+        tile.userData.isRuntimeOnly = true;
+        tile.userData.tileFile = file;
+        tile.userData.tileRank = rank;
+        boardGroup.add(tile);
+        tileMeshes[rank][file] = tile;
+      }
+    }
+
+    // Main point light (source: position [3.5, 10, 3.5], intensity 0.65, color #ffe0ec)
+    mainLight = new THREE.PointLight(this.getAttribute("mainLightColor"), this.getAttribute("mainLightIntensity"));
+    mainLight.position.set(3.5, 10, 3.5);
+    mainLight.castShadow = true;
+    mainLight.shadow.mapSize.set(2048, 2048);
+    mainLight.userData.isRuntimeOnly = true;
+    boardGroup.add(mainLight);
+
+    // Selection light (red, follows selected piece)
+    selectionLight = new THREE.PointLight("#ff0000", 0, 10);
+    selectionLight.position.set(0, 1, 0);
+    selectionLight.userData.isRuntimeOnly = true;
+    boardGroup.add(selectionLight);
+
+    boardPivot.add(boardGroup);
+    ownerObject.add(boardPivot);
+  }
+
+  // ===================== PIECE LOADING =====================
+  const loadPieceModels = async () => {
+    let modelMap = {
+      pawn: this.getAttribute("pawnModel"),
+      rook: this.getAttribute("rookModel"),
+      knight: this.getAttribute("knightModel"),
+      bishop: this.getAttribute("bishopModel"),
+      queen: this.getAttribute("queenModel"),
+      king: this.getAttribute("kingModel")
+    };
+
+    // Try attributes first, fallback to findByName
+    for (let type in modelMap) {
+      let ref = modelMap[type];
+      if (!ref) {
+        let name = type.charAt(0).toUpperCase() + type.slice(1);
+        ref = await erth.asset.model.findByName(name);
+        if (!ref) {
+          ref = await erth.asset.model.findByName(type);
+        }
+      }
+      if (ref) {
+        try {
+          let instance = await erth.asset.model.createInstance(ref);
+          let threeObj = instance._internal.three;
+          // Extract geometry from the first mesh found
+          threeObj.traverse(function (child) {
+            if (child.isMesh && !pieceGeometries[type]) {
+              pieceGeometries[type] = child.geometry.clone();
+              // Normalize origin so bottom of piece is at Y=0
+              pieceGeometries[type].computeBoundingBox();
+              if (pieceGeometries[type].boundingBox) {
+                pieceGeometries[type].translate(0, -pieceGeometries[type].boundingBox.min.y, 0);
+              }
+
+              // copy origin mesh scale
+              pieceGeometries[type].userData.scale = child.scale.x;
+              disposables.push(pieceGeometries[type]);
+            }
+          });
+          // Remove the template instance
+          if (threeObj.parent) threeObj.parent.remove(threeObj);
+        } catch (e) {
+          console.warn("Chess: failed to load model for " + type, e);
+        }
+      }
+    }
+
+    // Fallback: create simple geometries for any missing pieces
+    if (!pieceGeometries.pawn) {
+      pieceGeometries.pawn = createFallbackGeometry("pawn");
+    }
+    if (!pieceGeometries.rook) {
+      pieceGeometries.rook = createFallbackGeometry("rook");
+    }
+    if (!pieceGeometries.knight) {
+      pieceGeometries.knight = createFallbackGeometry("knight");
+    }
+    if (!pieceGeometries.bishop) {
+      pieceGeometries.bishop = createFallbackGeometry("bishop");
+    }
+    if (!pieceGeometries.queen) {
+      pieceGeometries.queen = createFallbackGeometry("queen");
+    }
+    if (!pieceGeometries.king) {
+      pieceGeometries.king = createFallbackGeometry("king");
+    }
+  }
+
+  function createFallbackGeometry(type) {
+    // Simple procedural shapes as fallback if models not found
+    let geo;
+    switch (type) {
+      case "pawn":
+        geo = new THREE.CylinderGeometry(0.25, 0.35, 1.5, 16);
+        break;
+      case "rook":
+        geo = new THREE.CylinderGeometry(0.3, 0.35, 2.0, 8);
+        break;
+      case "knight":
+        geo = new THREE.ConeGeometry(0.35, 2.2, 8);
+        break;
+      case "bishop":
+        geo = new THREE.ConeGeometry(0.3, 2.5, 16);
+        break;
+      case "queen":
+        geo = new THREE.SphereGeometry(0.35, 16, 12);
+        geo.scale(1, 2.2, 1);
+        break;
+      case "king":
+        geo = new THREE.CylinderGeometry(0.2, 0.35, 2.8, 16);
+        break;
+      default:
+        geo = new THREE.BoxGeometry(0.5, 1.5, 0.5);
+    }
+    // Normalize origin so bottom of piece is at Y=0
+    geo.computeBoundingBox();
+    if (geo.boundingBox) {
+      geo.translate(0, -geo.boundingBox.min.y, 0);
+    }
+    disposables.push(geo);
+    return geo;
+  }
+
+  // ===================== PLACE PIECES =====================
+  const placePieces = () => {
+    let scale = this.getAttribute("pieceScale");
+    pieceMeshes = [];
+
+    for (let rank = 0; rank < BOARD_SIZE; rank++) {
+      pieceMeshes[rank] = [];
+      for (let file = 0; file < BOARD_SIZE; file++) {
+        let setup = INITIAL_SETUP[rank][file];
+        if (setup) {
+          let type = setup[0];
+          let color = setup[1];
+          let mesh = createPieceMesh(type, color, scale);
+          mesh.position.set(file, PIECE_Y, rank);
+          mesh.userData.isRuntimeOnly = true;
+          mesh.userData.pieceType = type;
+          mesh.userData.pieceColor = color;
+          boardGroup.add(mesh);
+          mesh.updateMatrixWorld(true);
+          pieceMeshes[rank][file] = mesh;
+        } else {
+          pieceMeshes[rank][file] = null;
+        }
+      }
+    }
+  }
+
+  function createPieceMesh(type, color, scale) {
+    let geo = pieceGeometries[type];
+    let mat = color === COLORS.WHITE ? whitePieceMat : blackPieceMat;
+    let mesh = new THREE.Mesh(geo, mat);
+
+    // Since we copied the original scale to pieceGeometries
+    // Instead of setting the scale directly,
+    // we will multiply the attribute.pieceScale to the current scale
+    // ex: if the original mesh scale is 3.7:
+    // -- it wiil be 3.7 * 0.5 = 1.85
+    // -- 3.7 * 0.25 = 0.925
+    const finalScale = geo.userData.scale * scale;
+    mesh.scale.setScalar(finalScale);
+
+    mesh.castShadow = true;
+    return mesh;
+  }
+
+  // ===================== BOARD STATE =====================
+  function initBoardState() {
+    board = [];
+    for (let rank = 0; rank < BOARD_SIZE; rank++) {
+      board[rank] = [];
+      for (let file = 0; file < BOARD_SIZE; file++) {
+        let setup = INITIAL_SETUP[rank][file];
+        if (setup) {
+          board[rank][file] = { piece: { type: setup[0], color: setup[1], hasMoved: false }, file: file, rank: rank };
+        } else {
+          board[rank][file] = { piece: null, file: file, rank: rank };
+        }
+      }
+    }
+    currentTurn = COLORS.WHITE;
+    gameOverState = null;
+    moveHistory = [];
+    selectedTile = null;
+    validMoves = [];
+  }
+
+  function getTile(file, rank) {
+    if (file < 0 || file > 7 || rank < 0 || rank > 7) return null;
+    return board[rank][file];
+  }
+
+  function getPiece(file, rank) {
+    let tile = getTile(file, rank);
+    return tile ? tile.piece : null;
+  }
+
+  // ===================== CHESS LOGIC =====================
+
+  function getMovesForPiece(file, rank) {
+    let piece = getPiece(file, rank);
+    if (!piece) return [];
+    let moves = [];
+
+    switch (piece.type) {
+      case PIECE_TYPES.PAWN:
+        moves = getPawnMoves(file, rank, piece);
+        break;
+      case PIECE_TYPES.ROOK:
+        moves = getRookMoves(file, rank, piece);
+        break;
+      case PIECE_TYPES.KNIGHT:
+        moves = getKnightMoves(file, rank, piece);
+        break;
+      case PIECE_TYPES.BISHOP:
+        moves = getBishopMoves(file, rank, piece);
+        break;
+      case PIECE_TYPES.QUEEN:
+        moves = getQueenMoves(file, rank, piece);
+        break;
+      case PIECE_TYPES.KING:
+        moves = getKingMoves(file, rank, piece);
+        break;
+    }
+
+    // Filter out moves that leave own king in check
+    let legalMoves = [];
+    for (let i = 0; i < moves.length; i++) {
+      let m = moves[i];
+      if (!wouldBeInCheck(file, rank, m.file, m.rank, piece.color)) {
+        legalMoves.push(m);
+      }
+    }
+    return legalMoves;
+  }
+
+  // Pawn moves
+  function getPawnMoves(file, rank, piece) {
+    let moves = [];
+    let dir = piece.color === COLORS.WHITE ? 1 : -1;
+    let startRank = piece.color === COLORS.WHITE ? 1 : 6;
+
+    // Forward one
+    let fwd = getTile(file, rank + dir);
+    if (fwd && !fwd.piece) {
+      moves.push({ file: file, rank: rank + dir });
+      // Forward two from start
+      if (rank === startRank) {
+        let fwd2 = getTile(file, rank + dir * 2);
+        if (fwd2 && !fwd2.piece) {
+          moves.push({ file: file, rank: rank + dir * 2, special: "doublePush" });
+        }
+      }
+    }
+
+    // Diagonal captures
+    for (let df = -1; df <= 1; df += 2) {
+      let cap = getTile(file + df, rank + dir);
+      if (cap && cap.piece && cap.piece.color !== piece.color) {
+        moves.push({ file: file + df, rank: rank + dir });
+      }
+    }
+
+    // En passant
+    if (moveHistory.length > 0) {
+      let lastMove = moveHistory[moveHistory.length - 1];
+      if (lastMove.piece.type === PIECE_TYPES.PAWN && lastMove.special === "doublePush") {
+        if (lastMove.to.rank === rank && Math.abs(lastMove.to.file - file) === 1) {
+          moves.push({ file: lastMove.to.file, rank: rank + dir, special: "enPassant" });
+        }
+      }
+    }
+
+    // Check for promotion (mark moves to last rank)
+    let promoRank = piece.color === COLORS.WHITE ? 7 : 0;
+    for (let i = 0; i < moves.length; i++) {
+      if (moves[i].rank === promoRank) {
+        moves[i].special = "promotion";
+      }
+    }
+
+    return moves;
+  }
+
+  // Sliding moves (rook, bishop, queen)
+  function getSlidingMoves(file, rank, piece, directions) {
+    let moves = [];
+    for (let d = 0; d < directions.length; d++) {
+      let dx = directions[d][0];
+      let dy = directions[d][1];
+      let f = file + dx;
+      let r = rank + dy;
+      while (f >= 0 && f < 8 && r >= 0 && r < 8) {
+        let tile = getTile(f, r);
+        if (!tile) break;
+        if (tile.piece) {
+          if (tile.piece.color !== piece.color) {
+            moves.push({ file: f, rank: r });
+          }
+          break;
+        }
+        moves.push({ file: f, rank: r });
+        f += dx;
+        r += dy;
+      }
+    }
+    return moves;
+  }
+
+  function getRookMoves(file, rank, piece) {
+    return getSlidingMoves(file, rank, piece, [[1, 0], [-1, 0], [0, 1], [0, -1]]);
+  }
+
+  function getBishopMoves(file, rank, piece) {
+    return getSlidingMoves(file, rank, piece, [[1, 1], [-1, 1], [1, -1], [-1, -1]]);
+  }
+
+  function getQueenMoves(file, rank, piece) {
+    return getSlidingMoves(file, rank, piece, [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, 1], [1, -1], [-1, -1]]);
+  }
+
+  function getKnightMoves(file, rank, piece) {
+    let moves = [];
+    let offsets = [[-2, -1], [-2, 1], [-1, -2], [-1, 2], [1, -2], [1, 2], [2, -1], [2, 1]];
+    for (let i = 0; i < offsets.length; i++) {
+      let f = file + offsets[i][0];
+      let r = rank + offsets[i][1];
+      let tile = getTile(f, r);
+      if (tile && (!tile.piece || tile.piece.color !== piece.color)) {
+        moves.push({ file: f, rank: r });
+      }
+    }
+    return moves;
+  }
+
+  function getKingMoves(file, rank, piece) {
+    let moves = [];
+    for (let df = -1; df <= 1; df++) {
+      for (let dr = -1; dr <= 1; dr++) {
+        if (df === 0 && dr === 0) continue;
+        let tile = getTile(file + df, rank + dr);
+        if (tile && (!tile.piece || tile.piece.color !== piece.color)) {
+          moves.push({ file: file + df, rank: rank + dr });
+        }
+      }
+    }
+
+    // Castling
+    if (!piece.hasMoved && !isInCheck(piece.color)) {
+      // Kingside (file 7 rook)
+      let rookK = getPiece(7, rank);
+      if (rookK && rookK.type === PIECE_TYPES.ROOK && !rookK.hasMoved) {
+        if (!getPiece(5, rank) && !getPiece(6, rank)) {
+          if (!isSquareAttacked(5, rank, piece.color) && !isSquareAttacked(6, rank, piece.color)) {
+            moves.push({ file: 6, rank: rank, special: "castleKing" });
+          }
+        }
+      }
+      // Queenside (file 0 rook)
+      let rookQ = getPiece(0, rank);
+      if (rookQ && rookQ.type === PIECE_TYPES.ROOK && !rookQ.hasMoved) {
+        if (!getPiece(1, rank) && !getPiece(2, rank) && !getPiece(3, rank)) {
+          if (!isSquareAttacked(2, rank, piece.color) && !isSquareAttacked(3, rank, piece.color)) {
+            moves.push({ file: 2, rank: rank, special: "castleQueen" });
+          }
+        }
+      }
+    }
+    return moves;
+  }
+
+  // Check detection
+  function findKing(color) {
+    for (let r = 0; r < 8; r++) {
+      for (let f = 0; f < 8; f++) {
+        let p = getPiece(f, r);
+        if (p && p.type === PIECE_TYPES.KING && p.color === color) {
+          return { file: f, rank: r };
+        }
+      }
+    }
+    return null;
+  }
+
+  function isSquareAttacked(file, rank, byColor) {
+    // byColor = the color of the pieces that MIGHT be attacked
+    // We check if the OPPONENT can attack this square
+    let opColor = byColor === COLORS.WHITE ? COLORS.BLACK : COLORS.WHITE;
+    for (let r = 0; r < 8; r++) {
+      for (let f = 0; f < 8; f++) {
+        let p = getPiece(f, r);
+        if (!p || p.color !== opColor) continue;
+        let rawMoves = getRawMoves(f, r, p);
+        for (let i = 0; i < rawMoves.length; i++) {
+          if (rawMoves[i].file === file && rawMoves[i].rank === rank) return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  // Raw moves without check filtering (to avoid recursion)
+  function getRawMoves(file, rank, piece) {
+    switch (piece.type) {
+      case PIECE_TYPES.PAWN: return getPawnCaptures(file, rank, piece);
+      case PIECE_TYPES.ROOK: return getSlidingMoves(file, rank, piece, [[1, 0], [-1, 0], [0, 1], [0, -1]]);
+      case PIECE_TYPES.KNIGHT: return getKnightMoves(file, rank, piece);
+      case PIECE_TYPES.BISHOP: return getSlidingMoves(file, rank, piece, [[1, 1], [-1, 1], [1, -1], [-1, -1]]);
+      case PIECE_TYPES.QUEEN: return getSlidingMoves(file, rank, piece, [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, 1], [1, -1], [-1, -1]]);
+      case PIECE_TYPES.KING: return getKingBasicMoves(file, rank, piece);
+    }
+    return [];
+  }
+
+  function getPawnCaptures(file, rank, piece) {
+    // Only diagonal captures for attack detection
+    let moves = [];
+    let dir = piece.color === COLORS.WHITE ? 1 : -1;
+    for (let df = -1; df <= 1; df += 2) {
+      let f = file + df;
+      let r = rank + dir;
+      if (f >= 0 && f < 8 && r >= 0 && r < 8) {
+        moves.push({ file: f, rank: r });
+      }
+    }
+    return moves;
+  }
+
+  function getKingBasicMoves(file, rank, piece) {
+    let moves = [];
+    for (let df = -1; df <= 1; df++) {
+      for (let dr = -1; dr <= 1; dr++) {
+        if (df === 0 && dr === 0) continue;
+        let tile = getTile(file + df, rank + dr);
+        if (tile && (!tile.piece || tile.piece.color !== piece.color)) {
+          moves.push({ file: file + df, rank: rank + dr });
+        }
+      }
+    }
+    return moves;
+  }
+
+  function isInCheck(color) {
+    let king = findKing(color);
+    if (!king) return false;
+    return isSquareAttacked(king.file, king.rank, color);
+  }
+
+  function wouldBeInCheck(fromFile, fromRank, toFile, toRank, color) {
+    // Simulate the move
+    let fromTile = board[fromRank][fromFile];
+    let toTile = board[toRank][toFile];
+    let capturedPiece = toTile.piece;
+    let movingPiece = fromTile.piece;
+
+    // Execute move temporarily
+    toTile.piece = movingPiece;
+    fromTile.piece = null;
+
+    let inCheck = isInCheck(color);
+
+    // Undo
+    fromTile.piece = movingPiece;
+    toTile.piece = capturedPiece;
+
+    return inCheck;
+  }
+
+  function detectGameOver() {
+    // Check if current player has any legal moves
+    let hasLegalMove = false;
+    for (let r = 0; r < 8 && !hasLegalMove; r++) {
+      for (let f = 0; f < 8 && !hasLegalMove; f++) {
+        let p = getPiece(f, r);
+        if (p && p.color === currentTurn) {
+          let moves = getMovesForPiece(f, r);
+          if (moves.length > 0) hasLegalMove = true;
+        }
+      }
+    }
+
+    if (!hasLegalMove) {
+      if (isInCheck(currentTurn)) {
+        let winner = currentTurn === COLORS.WHITE ? COLORS.BLACK : COLORS.WHITE;
+        gameOverState = { winner: winner, type: "checkmate" };
+      } else {
+        gameOverState = { winner: null, type: "stalemate" };
+      }
+      return true;
+    }
+    return false;
+  }
+
+  // ===================== MOVE EXECUTION =====================
+  function executeMove(fromFile, fromRank, toFile, toRank, moveInfo, promoteInfo = null) {
+    let fromTile = board[fromRank][fromFile];
+    let toTile = board[toRank][toFile];
+    let piece = fromTile.piece;
+    let captured = toTile.piece;
+    const promoteToPiece = promoteInfo ? promoteInfo.pieceType : "queen"; // default to queen
+    const isPromote = moveInfo && moveInfo.special === "promotion";
+
+    // If queued for promotion but there is no promoteInfo,
+    // Call to open promotion modal
+    if (isPromote && !promoteInfo) {
+      game.behaviorManager.sendEventToObjectBehaviors(ownerObject, "openPromotionModal", {});
+      promoteData = { fromFile, fromRank, toFile, toRank, moveInfo };
+      isGamePaused = true;
+
+      return;
+    }
+
+    // Record history
+    let histEntry = {
+      from: { file: fromFile, rank: fromRank },
+      to: { file: toFile, rank: toRank },
+      piece: { type: piece.type, color: piece.color },
+      captured: captured,
+      special: moveInfo ? moveInfo.special : null
+    };
+    moveHistory.push(histEntry);
+
+    if (captured) {
+      removePieceMesh(toFile, toRank, true);
+    }
+
+    // Handle en passant capture
+    if (moveInfo && moveInfo.special === "enPassant") {
+      let capturedRank = piece.color === COLORS.WHITE ? toRank - 1 : toRank + 1;
+      board[capturedRank][toFile].piece = null;
+      removePieceMesh(toFile, capturedRank, true);
+    }
+
+    // Move piece in board state
+    toTile.piece = piece;
+    fromTile.piece = null;
+    piece.hasMoved = true;
+
+    // Handle castling - move the rook too
+    if (moveInfo && moveInfo.special === "castleKing") {
+      let rook = board[fromRank][7].piece;
+      board[fromRank][7].piece = null;
+      board[fromRank][5].piece = rook;
+      rook.hasMoved = true;
+      animateRookCastle(7, fromRank, 5, fromRank);
+    } else if (moveInfo && moveInfo.special === "castleQueen") {
+      let rook = board[fromRank][0].piece;
+      board[fromRank][0].piece = null;
+      board[fromRank][3].piece = rook;
+      rook.hasMoved = true;
+      animateRookCastle(0, fromRank, 3, fromRank);
+    }
+
+    // Pawn promotion
+    if (isPromote && promoteInfo) {
+      toTile.piece = { type: promoteToPiece, color: piece.color, hasMoved: true };
+    }
+
+    // Animate piece movement
+    animatePieceMove(fromFile, fromRank, toFile, toRank, moveInfo, promoteToPiece);
+  }
+
+  function removePieceMesh(file, rank, withAnimation) {
+    let mesh = pieceMeshes[rank][file];
+    if (!mesh) return;
+    if (withAnimation) {
+      // Fly off animation
+      captureAnim = {
+        mesh: mesh,
+        startPos: mesh.position.clone(),
+        elapsed: 0,
+        duration: 0.8
+      };
+    } else {
+      boardGroup.remove(mesh);
+    }
+    pieceMeshes[rank][file] = null;
+  }
+
+  // ===================== MOVE NOTATION =====================
+  const FILES_STR = "abcdefgh";
+  const PIECE_LETTERS = { rook: "R", knight: "N", bishop: "B", queen: "Q", king: "K" };
+
+  function moveToNotation(entry, inCheck, isMate) {
+    if (entry.special === "castleKing") return "O-O" + (isMate ? "#" : inCheck ? "+" : "");
+    if (entry.special === "castleQueen") return "O-O-O" + (isMate ? "#" : inCheck ? "+" : "");
+
+    let n = "";
+    if (entry.piece.type !== "pawn") {
+      n += PIECE_LETTERS[entry.piece.type] || "";
+    } else if (entry.captured || entry.special === "enPassant") {
+      n += FILES_STR[entry.from.file];
+    }
+
+    if (entry.captured || entry.special === "enPassant") n += "x";
+
+    n += FILES_STR[entry.to.file] + (entry.to.rank + 1);
+
+    if (entry.special === "promotion") n += "=Q";
+    if (isMate) n += "#";
+    else if (inCheck) n += "+";
+
+    return n;
+  }
+
+  // ===================== ANIMATION =====================
+  function animatePieceMove(fromFile, fromRank, toFile, toRank, moveInfo, promoteToPiece = "queen") {
+    let mesh = pieceMeshes[fromRank][fromFile];
+    if (!mesh) return;
+
+    animating = true;
+    let startPos = new THREE.Vector3(fromFile, PIECE_Y, fromRank);
+    let endPos = new THREE.Vector3(toFile, PIECE_Y, toRank);
+
+    animData = {
+      mesh: mesh,
+      startPos: startPos,
+      endPos: endPos,
+      elapsed: 0,
+      duration: getAttr("moveDuration"),
+      arcHeight: getAttr("moveArcHeight"),
+      callback: function () {
+        // After animation completes
+        pieceMeshes[fromRank][fromFile] = null;
+        pieceMeshes[toRank][toFile] = mesh;
+        mesh.position.set(toFile, PIECE_Y, toRank);
+
+        // Handle promotion visual
+        if (moveInfo && moveInfo.special === "promotion") {
+          let piece = board[toRank][toFile].piece;
+          let scale = getAttr("pieceScale");
+          let newMesh = createPieceMesh(promoteToPiece, piece.color, scale);
+          newMesh.position.set(toFile, PIECE_Y, toRank);
+          newMesh.userData.isRuntimeOnly = true;
+          newMesh.userData.pieceType = promoteToPiece;
+          newMesh.userData.pieceColor = piece.color;
+          newMesh.material.opacity = 1;
+          newMesh.material.transparent = false;
+          boardGroup.add(newMesh);
+          boardGroup.remove(mesh);
+          pieceMeshes[toRank][toFile] = newMesh;
+        }
+
+        animating = false;
+        animData = null;
+
+        // Switch turns
+        currentTurn = currentTurn === COLORS.WHITE ? COLORS.BLACK : COLORS.WHITE;
+
+        // Check for game over
+        detectGameOver();
+
+        // Generate notation for the last move
+        let lastEntry = moveHistory[moveHistory.length - 1];
+        let checkNow = isInCheck(currentTurn);
+        let isMate = gameOverState && gameOverState.type === "checkmate";
+        moveNotations.push(moveToNotation(lastEntry, checkNow, isMate));
+
+        // Rotate board for current player
+        if (getAttr("enableBoardRotation")) {
+          boardRotTarget = currentTurn === COLORS.WHITE ? 0 : Math.PI;
+        }
+
+        // Notify HUD
+        if (game) {
+          game.behaviorManager.sendEventToObjectBehaviors(ownerObject, "turnChanged", {
+            turn: currentTurn,
+            inCheck: checkNow,
+            gameOver: gameOverState,
+            moveNotations: moveNotations.slice()
+          });
+        }
+      }
+    };
+  }
+
+  function animateRookCastle(fromFile, fromRank, toFile, toRank) {
+    let mesh = pieceMeshes[fromRank][fromFile];
+    if (!mesh) return;
+    // Simple slide without arc
+    pieceMeshes[fromRank][fromFile] = null;
+    pieceMeshes[toRank][toFile] = mesh;
+    mesh.position.set(toFile, PIECE_Y, toRank);
+  }
+
+  function updateAnimations(deltaTime) {
+    // Piece move animation
+    if (animData) {
+      animData.elapsed += deltaTime;
+      let t = Math.min(animData.elapsed / animData.duration, 1);
+      // Ease out cubic
+      let ease = 1 - Math.pow(1 - t, 3);
+
+      let x = animData.startPos.x + (animData.endPos.x - animData.startPos.x) * ease;
+      let z = animData.startPos.z + (animData.endPos.z - animData.startPos.z) * ease;
+      // Parabolic arc for y
+      let arcT = Math.sin(t * Math.PI);
+      let y = animData.startPos.y + animData.arcHeight * arcT;
+
+      animData.mesh.position.set(x, y, z);
+
+      if (t >= 1 && animData.callback) {
+        animData.callback();
+      }
+    }
+
+    // Capture fly-off animation
+    if (captureAnim) {
+      captureAnim.elapsed += deltaTime;
+      let t = Math.min(captureAnim.elapsed / captureAnim.duration, 1);
+      let ease = t;
+
+      captureAnim.mesh.position.y = captureAnim.startPos.y + 20 * ease;
+      captureAnim.mesh.rotation.x += deltaTime * 3 * (Math.random() - 0.5 + 0.5);
+      captureAnim.mesh.rotation.z += deltaTime * 2 * (Math.random() - 0.5 + 0.5);
+
+      let opacity = 1 - ease;
+      captureAnim.mesh.traverse(function (child) {
+        if (child.isMesh && child.material) {
+          child.material.transparent = true;
+          child.material.opacity = opacity;
+        }
+      });
+
+      if (t >= 1) {
+        boardGroup.remove(captureAnim.mesh);
+        captureAnim = null;
+      }
+    }
+  }
+
+  // ===================== SELECTION & INPUT =====================
+  function clearSelection() {
+    // Reset tile highlights
+    for (let i = 0; i < validMoves.length; i++) {
+      let m = validMoves[i];
+      let isWhiteTile = (m.file + m.rank) % 2 === 0;
+      tileMeshes[m.rank][m.file].material = isWhiteTile ? whiteTileMat : blackTileMat;
+    }
+
+    // Reset piece material
+    if (selectedTile) {
+      let mesh = pieceMeshes[selectedTile.rank][selectedTile.file];
+      if (mesh) {
+        let piece = getPiece(selectedTile.file, selectedTile.rank);
+        if (piece) {
+          mesh.material = piece.color === COLORS.WHITE ? whitePieceMat : blackPieceMat;
+          // Lower piece back down
+          mesh.position.y = PIECE_Y;
+        }
+      }
+    }
+
+    // Reset selection light
+    if (selectionLight) {
+      selectionLight.intensity = 0;
+    }
+
+    selectedTile = null;
+    validMoves = [];
+  }
+
+  function selectPiece(file, rank) {
+    let piece = getPiece(file, rank);
+    if (!piece || piece.color !== currentTurn) return;
+
+    clearSelection();
+
+    selectedTile = { file: file, rank: rank };
+    validMoves = getMovesForPiece(file, rank);
+
+    // Highlight piece
+    let mesh = pieceMeshes[rank][file];
+    if (mesh) {
+      mesh.material = piece.color === COLORS.WHITE ? whiteSelectedMat : blackSelectedMat;
+      mesh.position.y = PIECE_Y + 0.9; // Lift selected piece (source: y=1.4, base is 0.5)
+    }
+
+    // Highlight valid moves on tiles
+    for (let i = 0; i < validMoves.length; i++) {
+      let m = validMoves[i];
+      tileMeshes[m.rank][m.file].material = validMoveMat;
+    }
+
+    // Position selection light
+    if (selectionLight) {
+      selectionLight.position.set(file, 1, rank);
+      selectionLight.intensity = 0.35;
+    }
+  }
+
+  function tryMove(file, rank) {
+    if (!selectedTile) return false;
+
+    // Check if this is a valid move
+    for (let i = 0; i < validMoves.length; i++) {
+      let m = validMoves[i];
+      if (m.file === file && m.rank === rank) {
+        let fromFile = selectedTile.file;
+        let fromRank = selectedTile.rank;
+        clearSelection();
+
+        const moveData = {
+          fromFile,
+          fromRank,
+          file,
+          rank,
+          m
+        }
+        executeMove(fromFile, fromRank, file, rank, m);
+        if (!m || m.special !== "promotion") broadcastData(MP_EVENTS.PLAY.EXECUTE_MOVE, moveData);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Pointer handling
+  let onPointerDown = null;
+
+  function setupInput() {
+    let canvas = (game.renderer && game.renderer.domElement) || null;
+
+    if (!canvas) {
+      console.warn("Chess: could not find canvas for input");
+      return;
+    }
+
+    onPointerDown = function (event) {
+      if (animating || gameOverState) return;
+      if (!isGameStarted || isGamePaused) return;
+      if (pieceColor && pieceColor !== currentTurn) return;
+
+      let rect = canvas.getBoundingClientRect();
+      pointerVec.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      pointerVec.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(pointerVec, game.camera);
+
+      // Collect all tile meshes for raycasting
+      let allTiles = [];
+      for (let r = 0; r < BOARD_SIZE; r++) {
+        for (let f = 0; f < BOARD_SIZE; f++) {
+          allTiles.push(tileMeshes[r][f]);
+        }
+      }
+
+      let intersects = raycaster.intersectObjects(allTiles);
+      if (intersects.length > 0) {
+        let hit = intersects[0].object;
+        let file = hit.userData.tileFile;
+        let rank = hit.userData.tileRank;
+
+        // Try to move if a piece is selected
+        if (selectedTile) {
+          if (!tryMove(file, rank)) {
+            // If not a valid move, select the piece on this tile (or deselect)
+            let piece = getPiece(file, rank);
+            if (piece && piece.color === currentTurn) {
+              selectPiece(file, rank);
+            } else {
+              clearSelection();
+            }
+          }
+        } else {
+          // No piece selected, try to select one
+          selectPiece(file, rank);
+        }
+      }
+    };
+
+    canvas.addEventListener("pointerdown", onPointerDown) // @check-ok
+  }
+
+  function teardownInput() {
+    if (onPointerDown) {
+      const canvas = (game && game.renderer && game.renderer.domElement) || null;
+      if (canvas) {
+        canvas.removeEventListener("pointerdown", onPointerDown) // @check-ok complex input
+      }
+      onPointerDown = null;
+    }
+  }
+
+  // ===================== GAME RESET =====================
+  function resetGame() {
+    clearSelection();
+    // Remove all piece meshes
+    for (let r = 0; r < BOARD_SIZE; r++) {
+      for (let f = 0; f < BOARD_SIZE; f++) {
+        if (pieceMeshes[r] && pieceMeshes[r][f]) {
+          boardGroup.remove(pieceMeshes[r][f]);
+          pieceMeshes[r][f] = null;
+        }
+      }
+    }
+    animating = false;
+    animData = null;
+    captureAnim = null;
+
+    // Reset material opacity = 1 and transparent = false to make sure all piece are visible on reset
+    resetMaterial(whitePieceMat);
+    resetMaterial(blackPieceMat);
+
+    initBoardState();
+    placePieces();
+
+    boardRotTarget = 0;
+    boardRotCurrent = 0;
+    if (boardPivot) boardPivot.rotation.y = 0;
+    moveNotations = [];
+
+    if (game) {
+      game.behaviorManager.sendEventToObjectBehaviors(ownerObject, "turnChanged", {
+        turn: currentTurn,
+        inCheck: false,
+        gameOver: null,
+        moveNotations: []
+      });
+    }
+  }
+
+  function resetMaterial(material) {
+    material.opacity = 1;
+    material.transparent = false;
+  }
+
+  // ===================== CLEANUP =====================
+  function cleanup() {
+    teardownInput();
+    if (boardPivot && boardPivot.parent) {
+      boardPivot.parent.remove(boardPivot);
+    } else if (boardGroup && boardGroup.parent) {
+      boardGroup.parent.remove(boardGroup);
+    }
+    for (let i = 0; i < disposables.length; i++) {
+      if (disposables[i] && typeof disposables[i].dispose === "function") {
+        disposables[i].dispose();
+      }
+    }
+    disposables = [];
+    boardGroup = null;
+    boardPivot = null;
+    tileMeshes = [];
+    pieceMeshes = [];
+    pieceGeometries = {};
+  }
+
+  // ===================== EDITOR CALLBACKS =====================
+  this.onEditorAdded = function (editor) {
+    behaviorRef = this;
+    ownerObject = this.gameObject._internal.three;
+    createMaterials();
+    buildBoardVisuals();
+
+    // Place static preview pieces using fallback geometry
+    pieceGeometries.pawn = createFallbackGeometry("pawn");
+    pieceGeometries.rook = createFallbackGeometry("rook");
+    pieceGeometries.knight = createFallbackGeometry("knight");
+    pieceGeometries.bishop = createFallbackGeometry("bishop");
+    pieceGeometries.queen = createFallbackGeometry("queen");
+    pieceGeometries.king = createFallbackGeometry("king");
+
+    initBoardState();
+    placePieces();
+  };
+
+  this.onEditorAttributesUpdated = function () {
+    behaviorRef = this;
+    cleanup();
+    ownerObject = this.gameObject._internal.three;
+    createMaterials();
+    buildBoardVisuals();
+
+    pieceGeometries.pawn = createFallbackGeometry("pawn");
+    pieceGeometries.rook = createFallbackGeometry("rook");
+    pieceGeometries.knight = createFallbackGeometry("knight");
+    pieceGeometries.bishop = createFallbackGeometry("bishop");
+    pieceGeometries.queen = createFallbackGeometry("queen");
+    pieceGeometries.king = createFallbackGeometry("king");
+
+    initBoardState();
+    placePieces();
+  };
+
+  this.onEditorDispose = function () {
+    cleanup();
+  };
+
+  // ===================== LIFECYCLE =====================
+  this.init = function (_game) {
+    behaviorRef = this;
+    game = _game;
+    multiplayerState = game.multiplayerState;
+    erth = this.erth;
+    ownerObject = this.gameObject._internal.three;
+
+    subscribeEventListeners();
+
+    // Remove any leftover children (editor preview clones or prior runs)
+    for (let i = ownerObject.children.length - 1; i >= 0; i--) {
+      ownerObject.remove(ownerObject.children[i]);
+    }
+
+    cleanup();
+    createMaterials();
+    buildBoardVisuals();
+    initBoardState();
+
+    // Load models then place pieces
+    loadPieceModels().then(function () {
+      placePieces();
+      piecesLoaded = true;
+      setupInput();
+
+      // Notify HUD of initial state
+      if (game) {
+        game.behaviorManager.sendEventToObjectBehaviors(ownerObject, "turnChanged", {
+          turn: currentTurn,
+          inCheck: false,
+          gameOver: null,
+          moveNotations: []
+        });
+      }
+    }).catch(function (err) {
+      console.error("Chess: error loading pieces, using fallbacks", err);
+      // Use fallback geometries
+      pieceGeometries.pawn = pieceGeometries.pawn || createFallbackGeometry("pawn");
+      pieceGeometries.rook = pieceGeometries.rook || createFallbackGeometry("rook");
+      pieceGeometries.knight = pieceGeometries.knight || createFallbackGeometry("knight");
+      pieceGeometries.bishop = pieceGeometries.bishop || createFallbackGeometry("bishop");
+      pieceGeometries.queen = pieceGeometries.queen || createFallbackGeometry("queen");
+      pieceGeometries.king = pieceGeometries.king || createFallbackGeometry("king");
+
+      placePieces();
+      piecesLoaded = true;
+      setupInput();
+    });
+  };
+
+  this.update = function (deltaTime) {
+    updateAnimations(deltaTime);
+
+    // Smooth board rotation
+    if (boardPivot && Math.abs(boardRotCurrent - boardRotTarget) > 0.001) {
+      let speed = this.getAttribute("boardRotationSpeed") || 2.0;
+      boardRotCurrent += (boardRotTarget - boardRotCurrent) * Math.min(speed * deltaTime, 1);
+      if (Math.abs(boardRotCurrent - boardRotTarget) < 0.001) {
+        boardRotCurrent = boardRotTarget;
+      }
+      boardPivot.rotation.y = boardRotCurrent;
+    }
+  };
+
+  this.onEvent = function (msg, data) {
+    if (msg === "promotePiece") {
+      isGamePaused = false;
+
+      if (data.promoteToPiece === "UNDO") {
+        promoteData = null;
+        return;
+      }
+
+      const { fromFile, fromRank, toFile, toRank, moveInfo } = promoteData;
+      const pieceType = PIECE_TYPES[data.promoteToPiece];
+
+      const moveData = {
+        fromFile: fromFile,
+        fromRank: fromRank,
+        file: toFile,
+        rank: toRank,
+        m: moveInfo,
+        pieceType: pieceType,
+      }
+      broadcastData(MP_EVENTS.PLAY.EXECUTE_MOVE, moveData);
+      executeMove(fromFile, fromRank, toFile, toRank, moveInfo, { pieceType });
+
+      promoteData = null;
+    } else if (msg === "resetGame") {
+      resetGame();
+    } else if (msg === "enterLobby") {
+      resetGame();
+      isGameStarted = false;
+      isGamePaused = false;
+    } else if (msg === "startGame") {
+      onStartGame();
+    }
+  };
+
+  this.dispose = function () {
+    cleanup();
+    removeEventListeners();
+  };
+
+  function onStartGame() {
+    isGameStarted = true;
+    isGamePaused = false;
+    const playerCount = pieceColor = erth.store.get("playerCount");
+
+    // If there is 1 player, there will be no assigned pieceColor
+    pieceColor = playerCount >= 2 ? erth.store.get("pieceColor") : null;
+
+    game.behaviorManager.sendEventToObjectBehaviors(ownerObject, "resetCamera", {});
+    boardRotTarget = pieceColor === COLORS.BLACK ? -Math.PI / 2 : Math.PI / 2;
+  }
+
+  function subscribeEventListeners() {
+    if (multiplayerState) {
+      //mp.onAdded = multiplayerState.addOnPlayerAddedListener(onPlayerAdded);
+      mp.onRemoved = multiplayerState.addOnPlayerRemovedListener(onPlayerRemoved);
+      mp.onDataChanged = multiplayerState.addOnPlayerDataChangedListener(onPlayerDataChanged);
+      //mp.onHostChange = multiplayerState.addOnHostChangedListener(onHostChange);
+    }
+  }
+
+  function removeEventListeners() {
+    if (multiplayerState) {
+      //multiplayerState.removeOnPlayerAddedListener(mp.onAdded);
+      multiplayerState.removeOnPlayerRemovedListener(mp.onRemoved);
+      multiplayerState.removeOnPlayerDataChangedListener(mp.onDataChanged);
+      //multiplayerState.removeOnHostChangedListener(mp.onHostChange);
+    }
+  }
+
+  // ===================== MULTIPLAYER =====================
+  let multiplayerState = undefined;
+
+  const MP_EVENTS = {
+    PLAY: {
+      EXECUTE_MOVE: 'mpEvent:execute-move',
+      PROMOTE_MOVE: 'mpEvent:promote-move',
+      RESET_GAME: 'mpEvent:reset-game',
+      RETURN_TO_LOBBY: 'mpEvent:return-to-lobby',
+    }
+  }
+
+  const mp = {
+    onAdded: undefined,
+    onRemoved: undefined,
+    onDataChanged: undefined,
+    onHostChange: undefined,
+  }
+
+  function onPlayerDataChanged(_player, _key) {
+    switch (_key) {
+      case MP_EVENTS.PLAY.EXECUTE_MOVE:
+        const value = _player.data.get(_key);
+        if (!value) return;
+        const moveData = JSON.parse(value);
+        executeMove(moveData.fromFile, moveData.fromRank, moveData.file, moveData.rank, moveData.m, { pieceType: moveData.pieceType ?? null });
+        return;
+      case MP_EVENTS.PLAY.RESET_GAME:
+        resetGame();
+        return;
+      case MP_EVENTS.PLAY.RETURN_TO_LOBBY:
+        isGameStarted = false;
+        game.behaviorManager.sendEventToObjectBehaviors(ownerObject, "enterLobby", {});
+        return;
+    }
+  }
+
+  function onPlayerRemoved(_player) {
+    isGameStarted = false;
+    game.behaviorManager.sendEventToObjectBehaviors(ownerObject, "enterLobby", {});
+
+    console.warn("Player has left the game. Returning to Lobby");
+  }
+
+  function broadcastData(mpKey, data = {}) {
+    const payload = JSON.stringify(data);
+    multiplayerState.setPlayerData(mpKey, payload);
+  }

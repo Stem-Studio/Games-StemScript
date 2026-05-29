@@ -1,0 +1,517 @@
+meta:
+  tool: "StemStudio"
+  type: "behavior"
+  exportVersion: 1
+
+config:
+  name: "HGL Ship Effects"
+  id: "hgl.shipEffects"
+  author: "HexGL-Port"
+  isScript: true
+  main: "script.js"
+  priority: 0
+  version: "1.0.0"
+  description: "Booster flame animation, collision spark and cloud particle
+    systems — port of ShipEffects.js"
+  tags:
+    - gameplay
+  throttleConfig:
+    throttlePriority: "MEDIUM"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    sparkTexture:
+      name: "Spark Texture"
+      type: "imageAsset"
+      description: "Texture for spark particles"
+    cloudTexture:
+      name: "Cloud Texture"
+      type: "imageAsset"
+      description: "Texture for cloud/smoke particles"
+    boosterTexture:
+      name: "Booster Texture"
+      type: "imageAsset"
+      description: "Texture for booster flame mesh"
+    boosterSpriteTexture:
+      name: "Booster Sprite Texture"
+      type: "imageAsset"
+      description: "Texture for booster glow sprite"
+    maxSparks:
+      name: "Max Sparks"
+      type: "number"
+      default: 200
+      description: "Maximum spark particles per side"
+    maxClouds:
+      name: "Max Clouds"
+      type: "number"
+      default: 200
+      description: "Maximum cloud particles per side"
+    sparkSize:
+      name: "Spark Size"
+      type: "number"
+      default: 2
+      description: "Spark particle size"
+    cloudSize:
+      name: "Cloud Size"
+      type: "number"
+      default: 6
+      description: "Cloud particle size"
+  documentation: Booster flame animation, collision spark and cloud particle systems — port
+    of ShipEffects.js Configure attributes in the editor to tune gameplay
+    behavior.
+
+code: |
+  /* HGL Ship Effects — port of ShipEffects.js + Particles.js */
+
+  /* ── Pre-allocated vectors ── */
+  let game;
+  const _pVel    = new THREE.Vector3(0.5, 0, 0);
+  const _pOffset = new THREE.Vector3(-3, -0.3, 0);
+  const _pRad    = new THREE.Vector3(0, 0, 1.5);
+  const _shipVel = new THREE.Vector3();
+  const _tmpV    = new THREE.Vector3();
+  const _worldPos = new THREE.Vector3();
+  const _lastWorldPos = new THREE.Vector3();
+  const _boosterSize = new THREE.Vector3();
+  const _boosterBox = new THREE.Box3();
+
+  const pVelS    = _pVel.length();
+  const pOffsetS = _pOffset.length();
+  const pRadS    = _pRad.length();
+  _pVel.normalize();
+  _pOffset.normalize();
+  _pRad.normalize();
+
+  /* ── Simple particle system (port of bkcore.threejs.Particles) ── */
+  function ParticleSystem(opts) {
+    this.max = opts.max || 200;
+    this.life = opts.life || 60;
+    this.size = opts.size || 2;
+    this.opacity = opts.opacity !== undefined ? opts.opacity : 1.0;
+    this.color1 = new THREE.Color(opts.color || 0xffc000);
+    this.color2 = new THREE.Color(opts.color2 || 0xffffff);
+    this.randomness = opts.randomness || new THREE.Vector3(0.4, 0.4, 0.4);
+    this.friction = opts.friction !== undefined ? opts.friction : 1.0;
+    this.blending = opts.blending !== undefined ? opts.blending : THREE.AdditiveBlending;
+    this.depthTest = opts.depthTest !== undefined ? opts.depthTest : false;
+    this.spawn = (opts.spawn || new THREE.Vector3()).clone();
+    this.velocity = (opts.velocity || new THREE.Vector3()).clone();
+    this.spawnRadius = (opts.spawnRadius || new THREE.Vector3()).clone();
+    this.force = new THREE.Vector3(0, -0.01, 0);
+
+    this.positions = [];
+    this.velocities = [];
+    this.colors = [];
+    this.lives = [];
+    this.pool = [];
+    this.active = [];
+    this.ageing = 1.0 / this.life;
+
+    for (let i = 0; i < this.max; i++) {
+      this.positions.push(new THREE.Vector3());
+      this.velocities.push(new THREE.Vector3());
+      this.colors.push(new THREE.Color());
+      this.lives.push(0);
+      this.pool.push(i);
+    }
+
+    this.geometry = null;
+    this.material = null;
+    this.points = null;
+    this.texture = null;
+  }
+
+  ParticleSystem.prototype.build = function(parent, texture) {
+    this.texture = texture;
+    let posArray = new Float32Array(this.max * 3);
+    let colArray = new Float32Array(this.max * 3);
+    this.geometry = new THREE.BufferGeometry();
+    this.geometry.setAttribute("position", new THREE.BufferAttribute(posArray, 3));
+    this.geometry.setAttribute("color", new THREE.BufferAttribute(colArray, 3));
+
+    this.material = new THREE.PointsNodeMaterial({
+      size: this.size,
+      vertexColors: true,
+      transparent: true,
+      depthWrite: false,
+      depthTest: this.depthTest,
+      blending: this.blending,
+      opacity: this.opacity,
+      sizeAttenuation: true
+    });
+
+    if (texture) {
+      this.material.map = texture;
+    }
+
+    this.points = new THREE.Points(this.geometry, this.material);
+    this.points.frustumCulled = false;
+    this.points.userData.isRuntimeOnly = true;
+    parent.add(this.points);
+  };
+
+  ParticleSystem.prototype.emit = function(count) {
+    for (let i = 0; i < count && this.pool.length > 0; i++) {
+      let idx = this.pool.pop();
+      this.active.push(idx);
+      this.lives[idx] = 1.0;
+
+      this.positions[idx].copy(this.spawn);
+      this.positions[idx].x += (Math.random() - 0.5) * this.spawnRadius.x;
+      this.positions[idx].y += (Math.random() - 0.5) * this.spawnRadius.y;
+      this.positions[idx].z += (Math.random() - 0.5) * this.spawnRadius.z;
+
+      this.velocities[idx].copy(this.velocity);
+      this.velocities[idx].x += (Math.random() - 0.5) * this.randomness.x;
+      this.velocities[idx].y += (Math.random() - 0.5) * this.randomness.y;
+      this.velocities[idx].z += (Math.random() - 0.5) * this.randomness.z;
+
+      this.colors[idx].copy(this.color1).lerp(this.color2, Math.random());
+    }
+  };
+
+  ParticleSystem.prototype.update = function(dt) {
+    let posAttr = this.geometry.getAttribute("position");
+    let colAttr = this.geometry.getAttribute("color");
+    let newActive = [];
+
+    for (let j = 0; j < this.active.length; j++) {
+      let i = this.active[j];
+      this.lives[i] -= this.ageing * dt;
+      if (this.lives[i] <= 0) {
+        this.lives[i] = 0;
+        this.pool.push(i);
+        posAttr.setXYZ(i, 0, -9999, 0);
+      } else {
+        newActive.push(i);
+        if (this.friction !== 1.0) {
+          this.velocities[i].multiplyScalar(this.friction);
+        }
+        this.velocities[i].addScaledVector(this.force, dt);
+        this.positions[i].addScaledVector(this.velocities[i], dt);
+        let a = this.lives[i] > 0.5 ? 1.0 : this.lives[i] + 0.5;
+        posAttr.setXYZ(i, this.positions[i].x, this.positions[i].y, this.positions[i].z);
+        colAttr.setXYZ(i, this.colors[i].r * a, this.colors[i].g * a, this.colors[i].b * a);
+      }
+    }
+
+    this.active = newActive;
+    posAttr.needsUpdate = true;
+    colAttr.needsUpdate = true;
+  };
+
+  ParticleSystem.prototype.dispose = function() {
+    if (this.points && this.points.parent) this.points.parent.remove(this.points);
+    if (this.geometry) this.geometry.dispose();
+    if (this.material) this.material.dispose();
+  };
+
+  /* ── Systems ── */
+  let leftSparks, rightSparks, leftClouds, rightClouds;
+  let shipMesh = null;
+  let boosterMesh = null;
+  let boosterSprite = null;
+  let boosterLight = null;
+  let originalBoosterMaterials = [];
+
+  function findShipMesh(root) {
+    if (!root || !root.children || root.children.length === 0) return root;
+    return root.children[0];
+  }
+
+  function findBoosterMesh(root) {
+    let found = null;
+    if (!root || !root.traverse) return null;
+
+    root.traverse(function(child) {
+      if (found) return;
+      if (child.name && child.name.toLowerCase().indexOf("booster") !== -1) {
+        found = child;
+      }
+    });
+
+    return found;
+  }
+
+  function collectBoosterVisualMeshes(root) {
+    let meshes = [];
+    if (!root || !root.traverse) return meshes;
+
+    root.traverse(function(child) {
+      if (child.isMesh) meshes.push(child);
+    });
+
+    return meshes;
+  }
+
+  function applyBoosterMaterial(texture) {
+    if (!boosterMesh) return;
+
+    let boosterVisualMeshes = collectBoosterVisualMeshes(boosterMesh);
+    for (let i = 0; i < boosterVisualMeshes.length; i++) {
+      let mesh = boosterVisualMeshes[i];
+      originalBoosterMaterials.push({ mesh: mesh, material: mesh.material });
+      mesh.material = new THREE.MeshBasicNodeMaterial({
+        map: texture || null,
+        color: 0xffffff,
+        transparent: true,
+        opacity: 0.3,
+        depthWrite: false,
+        side: THREE.DoubleSide
+      });
+      mesh.renderOrder = 10;
+    }
+  }
+
+  function createBoosterSprite(texture) {
+    if (!boosterMesh || !texture) return;
+
+    boosterSprite = new THREE.Sprite(new THREE.SpriteNodeMaterial({
+      map: texture,
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0.3,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending
+    }));
+    boosterSprite.userData.isRuntimeOnly = true;
+
+    _boosterBox.setFromObject(boosterMesh);
+    _boosterBox.getSize(_boosterSize);
+    let spriteSize = Math.max(_boosterSize.x, _boosterSize.y, _boosterSize.z) * 0.75;
+    if (!isFinite(spriteSize) || spriteSize <= 0) spriteSize = 1.5;
+
+    boosterSprite.scale.set(spriteSize, spriteSize, spriteSize);
+    boosterMesh.add(boosterSprite);
+  }
+
+  this.init = function(_game) {
+      game = _game;
+    let maxSparks = this.getAttribute("maxSparks") || 200;
+    let maxClouds = this.getAttribute("maxClouds") || 60;
+    let sparkSize = this.getAttribute("sparkSize") || 2;
+    let cloudSize = this.getAttribute("cloudSize") || 6;
+
+    leftSparks = new ParticleSystem({
+      randomness: new THREE.Vector3(0.4, 0.4, 0.4),
+      color: 0xffc000, color2: 0xffffff,
+      depthTest: false,
+      size: sparkSize, life: 60, max: maxSparks
+    });
+    rightSparks = new ParticleSystem({
+      randomness: new THREE.Vector3(0.4, 0.4, 0.4),
+      color: 0xffc000, color2: 0xffffff,
+      depthTest: false,
+      size: sparkSize, life: 60, max: maxSparks
+    });
+    leftClouds = new ParticleSystem({
+      opacity: 0.8,
+      randomness: new THREE.Vector3(0.05, 0.05, 0.1),
+      color: 0x666666, color2: 0xa4f1ff,
+      size: cloudSize, life: 60, max: maxClouds,
+      blending: THREE.NormalBlending
+      ,spawn: new THREE.Vector3(3, -0.3, 0)
+      ,spawnRadius: new THREE.Vector3(1, 1, 2)
+      ,velocity: new THREE.Vector3(0, 0, -0.4)
+    });
+    rightClouds = new ParticleSystem({
+      opacity: 0.8,
+      randomness: new THREE.Vector3(0.05, 0.05, 0.1),
+      color: 0x666666, color2: 0xa4f1ff,
+      size: cloudSize, life: 60, max: maxClouds,
+      blending: THREE.NormalBlending
+      ,spawn: new THREE.Vector3(-3, -0.3, 0)
+      ,spawnRadius: new THREE.Vector3(1, 1, 2)
+      ,velocity: new THREE.Vector3(0, 0, -0.4)
+    });
+
+    let scene = game.scene;
+    let dummy = this.gameObject._internal.three;
+    shipMesh = findShipMesh(dummy);
+    boosterMesh = findBoosterMesh(dummy);
+
+    if (dummy && dummy.getWorldPosition) {
+      dummy.getWorldPosition(_lastWorldPos);
+    }
+
+    // Load spark texture
+    let sparkAttr = this.getAttribute("sparkTexture");
+    if (sparkAttr) {
+      this.erth.asset.image.createTexture(sparkAttr).then(function(tex) {
+        leftSparks.build(scene, tex);
+        rightSparks.build(scene, tex);
+      });
+    } else {
+      leftSparks.build(scene, null);
+      rightSparks.build(scene, null);
+    }
+
+    // Load cloud texture
+    let cloudAttr = this.getAttribute("cloudTexture");
+    if (cloudAttr) {
+      this.erth.asset.image.createTexture(cloudAttr).then(function(tex) {
+        let cloudParent = shipMesh || dummy || scene;
+        leftClouds.build(cloudParent, tex);
+        rightClouds.build(cloudParent, tex);
+      });
+    } else {
+      let cloudParent = shipMesh || dummy || scene;
+      leftClouds.build(cloudParent, null);
+      rightClouds.build(cloudParent, null);
+    }
+
+    let boosterAttr = this.getAttribute("boosterTexture");
+    if (boosterAttr) {
+      this.erth.asset.image.createTexture(boosterAttr).then(function(tex) {
+        applyBoosterMaterial(tex);
+      });
+    }
+
+    let boosterSpriteAttr = this.getAttribute("boosterSpriteTexture") || this.getAttribute("boosterTexture");
+    if (boosterSpriteAttr) {
+      this.erth.asset.image.createTexture(boosterSpriteAttr).then(function(tex) {
+        createBoosterSprite(tex);
+      });
+    }
+
+    // Create booster point light
+    boosterLight = new THREE.PointLight(0x00a2ff, 4, 60);
+    boosterLight.userData.isRuntimeOnly = true;
+    if (shipMesh) {
+      shipMesh.add(boosterLight);
+      boosterLight.position.set(0, 0.665, -4);
+    } else {
+      dummy.add(boosterLight);
+      boosterLight.position.set(0, 0.665, -4);
+    }
+  };
+
+  this.update = function(deltaTime) {
+    let dt = Math.min(deltaTime, 0.1) * 60;
+    let speedRatio = this.erth.store.get("hgl_speedRatio") || 0;
+    let col = this.erth.store.get("hgl_collision") || { left: false, right: false, front: false };
+    let boost = this.erth.store.get("hgl_boost") || 0;
+    let forward = !!this.erth.store.get("hgl_forward");
+    let boostRatio = Math.max(0, this.erth.store.get("hgl_boostRatio") || 0);
+
+    // Hide booster when destroyed
+    let isDestroyed = this.erth.store.get("hgl_destroyed");
+    if (isDestroyed) {
+      if (boosterMesh) boosterMesh.scale.set(0, 0, 0);
+      if (boosterSprite) boosterSprite.visible = false;
+      if (boosterLight) boosterLight.intensity = 0;
+      return;
+    }
+
+    // Booster visual effects
+    if (boosterMesh) {
+      let opacity = forward ? 0.8 : 0.3 + boostRatio * 0.4;
+      let random = Math.random() * 0.2;
+      let s = (forward ? 1.0 : 0.8) + boostRatio * 0.5;
+
+      boosterMesh.rotation.z += dt;
+      boosterMesh.scale.set(s, s, s);
+
+      let boosterVisualMeshes = collectBoosterVisualMeshes(boosterMesh);
+      for (let i = 0; i < boosterVisualMeshes.length; i++) {
+        if (boosterVisualMeshes[i].material) {
+          boosterVisualMeshes[i].material.opacity = random + opacity;
+        }
+      }
+
+      if (boosterSprite) {
+        boosterSprite.visible = true;
+        boosterSprite.material.opacity = random + opacity;
+      }
+    }
+
+    if (boosterLight) {
+      let random = Math.random() * 0.2;
+      let intensity = forward ? 4.0 : 2.0;
+      boosterLight.intensity = intensity * (random + 0.8);
+    }
+
+    // Particles — transform spawn/velocity vectors by ship world matrix
+    let dummy = this.gameObject._internal.three;
+    if (!dummy) return;
+
+    let shipVisual = shipMesh || findShipMesh(dummy) || dummy;
+    let matrix = shipVisual.matrixWorld;
+
+    if (dummy.getWorldPosition) {
+      dummy.getWorldPosition(_worldPos);
+      _shipVel.copy(_worldPos).sub(_lastWorldPos).multiplyScalar(0.7);
+      _lastWorldPos.copy(_worldPos);
+    } else {
+      _shipVel.set(0, 0, 0);
+      _worldPos.copy(dummy.position);
+    }
+
+    if (col.right || col.left) {
+      // RIGHT side
+      rightSparks.velocity.copy(_pVel);
+      rightSparks.spawnRadius.copy(_pRad);
+      rightSparks.spawn.copy(_pOffset);
+
+      leftSparks.velocity.copy(_pVel);
+      leftSparks.velocity.x *= -1;
+      leftSparks.spawn.copy(_pOffset);
+      leftSparks.spawn.x *= -1;
+
+      _tmpV.copy(rightSparks.spawn).normalize();
+      rightSparks.spawn.copy(_tmpV).transformDirection(matrix).multiplyScalar(pOffsetS).add(_worldPos);
+
+      _tmpV.copy(rightSparks.velocity).normalize();
+      rightSparks.velocity.copy(_tmpV).transformDirection(matrix).multiplyScalar(pVelS).add(_shipVel);
+
+      _tmpV.copy(rightSparks.spawnRadius).normalize();
+      rightSparks.spawnRadius.copy(_tmpV).transformDirection(matrix).multiplyScalar(pRadS);
+
+      _tmpV.copy(leftSparks.spawn).normalize();
+      leftSparks.spawn.copy(_tmpV).transformDirection(matrix).multiplyScalar(pOffsetS).add(_worldPos);
+
+      _tmpV.copy(leftSparks.velocity).normalize();
+      leftSparks.velocity.copy(_tmpV).transformDirection(matrix).multiplyScalar(pVelS).add(_shipVel);
+
+      leftSparks.spawnRadius.copy(rightSparks.spawnRadius);
+    }
+
+    if (col.right) {
+      rightSparks.emit(10);
+      rightClouds.emit(5);
+    }
+    if (col.left) {
+      leftSparks.emit(10);
+      leftClouds.emit(5);
+    }
+
+    if (rightSparks.geometry) rightSparks.update(dt);
+    if (rightClouds.geometry) rightClouds.update(dt);
+    if (leftSparks.geometry) leftSparks.update(dt);
+    if (leftClouds.geometry) leftClouds.update(dt);
+  };
+
+  /* Editor preview stubs — particles are play-only but the checker flags
+     geometry creation, so we provide empty editor hooks. */
+  this.onEditorAdded = function() {};
+  this.onEditorDispose = function() {};
+
+  this.dispose = function() {
+    if (leftSparks) leftSparks.dispose();
+    if (rightSparks) rightSparks.dispose();
+    if (leftClouds) leftClouds.dispose();
+    if (rightClouds) rightClouds.dispose();
+    if (boosterSprite && boosterSprite.parent) boosterSprite.parent.remove(boosterSprite);
+    if (boosterLight && boosterLight.parent) boosterLight.parent.remove(boosterLight);
+
+    for (let i = 0; i < originalBoosterMaterials.length; i++) {
+      originalBoosterMaterials[i].mesh.material = originalBoosterMaterials[i].material;
+    }
+
+    originalBoosterMaterials = [];
+    boosterSprite = null;
+    boosterLight = null;
+    boosterMesh = null;
+    shipMesh = null;
+  };

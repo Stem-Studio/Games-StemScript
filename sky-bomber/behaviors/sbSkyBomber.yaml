@@ -1,0 +1,185 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "Sky Bomber"
+  id: "sb.skyBomber"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "StemStudio port of Skybomber: grid-stepped Bomberman combat on procedural floating voxel islands."
+  documentation: "Attach to SkyBomber.Root. The behavior delegates procedural world, bombs, enemies, pickups, camera follow, and UIKit HUD/menu rendering to the sky-bomber-runtime script import. Use attributes to tune source-derived movement, camera, island, obstacle, and enemy values."
+  tags:
+    - gameplay
+    - conversion
+    - bomberman
+  priority: 0
+  throttleConfig:
+    throttlePriority: "CRITICAL"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+    seed:
+      name: "Base Seed"
+      type: "number"
+      default: 552
+      min: 0
+      max: 99999
+    islandSize:
+      name: "Main Island Size"
+      type: "number"
+      default: 24
+      min: 16
+      max: 48
+    mainDensity:
+      name: "Main Crate Density"
+      type: "number"
+      default: 0.15
+      min: 0
+      max: 0.6
+    secondaryDensity:
+      name: "Secondary Crate Density"
+      type: "number"
+      default: 0.1
+      min: 0
+      max: 0.3
+    bridgeArc:
+      name: "Bridge Arc Per Tile"
+      type: "number"
+      default: -0.1
+      min: -0.6
+      max: 0.6
+    playerSpeed:
+      name: "Player Step Speed"
+      type: "number"
+      default: 6
+      min: 2
+      max: 12
+    baseEnemyCount:
+      name: "Base Enemy Count"
+      type: "number"
+      default: 3
+      min: 0
+      max: 12
+    enemySpeed:
+      name: "Base Enemy Speed"
+      type: "number"
+      default: 1.8
+      min: 0.5
+      max: 8
+    maxBombs:
+      name: "Base Max Bombs"
+      type: "number"
+      default: 3
+      min: 1
+      max: 8
+    fuseSeconds:
+      name: "Bomb Fuse Seconds"
+      type: "number"
+      default: 2
+      min: 0.5
+      max: 5
+    blastDuration:
+      name: "Blast Duration"
+      type: "number"
+      default: 0.45
+      min: 0.1
+      max: 2
+    cameraDistance:
+      name: "Camera Distance"
+      type: "number"
+      default: 32
+      min: 12
+      max: 60
+    cameraPitch:
+      name: "Camera Pitch Degrees"
+      type: "number"
+      default: 35
+      min: 15
+      max: 65
+    cameraYaw:
+      name: "Camera Yaw Degrees"
+      type: "number"
+      default: 135
+      min: 0
+      max: 360
+    cameraStiffness:
+      name: "Camera Follow Stiffness"
+      type: "number"
+      default: 5
+      min: 1
+      max: 16
+  inputs:
+    sb_Enter:
+      action: true
+      bindings:
+        - keyboard: Enter
+
+code: |-
+  @import "uikit-dual-mode" as uikit;
+  @import "sky-bomber-runtime" as core;
+
+  let game;
+  const LOG_TAG = "[sb.skyBomber]";
+
+  this._buildUIKitContent = function () {
+      core.buildUi(this);
+  };
+
+  this.init = function (_game) {
+      game = _game;
+      this._log = (...args) => {
+          if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "-", ...args);
+      };
+      this._uikitCtx = uikit.createPlayContext(game);
+      this._uiRoot = uikit.buildRoot(this._uikitCtx);
+      core.init(this, game);
+      this._buildUIKitContent();
+      uikit.attach(this, this._uikitCtx);
+      this._log("init");
+  };
+
+  this.update = function (deltaTime) {
+      const dt = Math.min(deltaTime, 0.1);
+      uikit.tick(this, dt);
+      core.update(this, dt);
+  };
+
+  this.onEvent = function (msg, data) {
+      this._log("onEvent", msg, data && data.type ? data.type : "");
+  };
+
+  this.dispose = function () {
+      this._log("dispose");
+      core.dispose(this);
+      uikit.teardown(this);
+  };
+
+  this.onEditorAdded = async function (editor) {
+      this._log = (...args) => {
+          if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "-", ...args);
+      };
+      this._uikitCtx = await uikit.createEditorContext(editor);
+      this._uiRoot = uikit.buildRoot(this._uikitCtx);
+      core.initEditor(this, editor);
+      this._buildUIKitContent();
+      uikit.attach(this, this._uikitCtx);
+  };
+
+  this.onEditorAttributesUpdated = function () {
+      core.dispose(this);
+      uikit.teardown(this);
+  };
+
+  this.onEditorDispose = function () {
+      core.dispose(this);
+      uikit.teardown(this);
+  };

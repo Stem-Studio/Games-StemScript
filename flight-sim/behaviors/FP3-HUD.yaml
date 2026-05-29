@@ -1,0 +1,434 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+config:
+  priority: 0
+  name: FP3 HUD
+  id: fp3.hud
+  author: flight-sim
+  isScript: true
+  main: script.js
+  version: 1.0.0
+  description: "Full flight HUD — speed, altitude, throttle, heading, health, stall/gear/speedbrake indicators, artificial horizon. Reads fp3_flightState and fp3_health store keys."
+  tags:
+    - gameplay
+    - ui
+    - hud
+  attributes: {}
+  documentation: "Renders a complete flight HUD using UIKit. Bottom-left panel shows speed, altitude, throttle bar, and vertical speed. Bottom-right shows health bar. Top-center shows heading compass. Center shows stall/speedbrake/gear warnings. Includes a simplified artificial horizon. Updates at 20Hz for performance."
+code: |
+  // ============================================================
+  // FP3 HUD
+  // Full flight heads-up display using UIKit.
+  // Reads fp3_flightState and fp3_health from erth.store.
+  // ============================================================
+
+  let game;
+  let store;
+  let fullscreen = null;
+  let ui = {};
+  let updateTimer = 0;
+  let stallFlashTimer = 0;
+  let stallVisible = false;
+  let MAX_HEALTH = 100;
+  let UPDATE_INTERVAL = 0.05; // 20Hz
+  let cameraRetryId = null;
+
+  // Cardinal direction helper
+  function getCardinal(heading) {
+    let h = ((heading % 360) + 360) % 360;
+    if (h >= 337.5 || h < 22.5) return 'N';
+    if (h >= 22.5 && h < 67.5) return 'NE';
+    if (h >= 67.5 && h < 112.5) return 'E';
+    if (h >= 112.5 && h < 157.5) return 'SE';
+    if (h >= 157.5 && h < 202.5) return 'S';
+    if (h >= 202.5 && h < 247.5) return 'SW';
+    if (h >= 247.5 && h < 292.5) return 'W';
+    return 'NW';
+  }
+
+  function getHealthColor(pct) {
+    if (pct > 0.6) return '#00cc00';
+    if (pct > 0.3) return '#cccc00';
+    return '#cc0000';
+  }
+
+  this.init = function(_game) {
+    game = _game;
+    store = this.erth.store;
+  };
+
+  this.onStart = function() {
+    fullscreen = new UIKit.Fullscreen(game.renderer, { visibility: 'visible' });
+
+    let addToCamera = function() {
+      if (game.uiCamera) {
+        game.uiCamera.add(fullscreen);
+        cameraRetryId = null;
+      } else {
+        cameraRetryId = setTimeout(addToCamera, 100);
+      }
+    };
+    addToCamera();
+
+    // ── Bottom-left: Flight instruments panel ──
+    ui.flightPanel = new UIKit.Container({
+      width: 210,
+      height: 140,
+      backgroundColor: 'rgba(0,0,0,0.6)',
+      borderRadius: 8,
+      flexDirection: 'column',
+      padding: 8,
+      gap: 4,
+      justifyContent: 'flex-start',
+      alignItems: 'flex-start',
+      visibility: 'visible'
+    });
+    fullscreen.add(ui.flightPanel);
+    ui.flightPanel.position.set(-0.42, -0.32, 0);
+
+    ui.speedText = new UIKit.Text({
+      text: 'SPD: 0 kts',
+      fontSize: 14,
+      color: '#00ff00',
+      fontFamily: 'monospace',
+      visibility: 'visible'
+    });
+    ui.flightPanel.add(ui.speedText);
+
+    ui.altText = new UIKit.Text({
+      text: 'ALT: 0 ft',
+      fontSize: 14,
+      color: '#00ff00',
+      fontFamily: 'monospace',
+      visibility: 'visible'
+    });
+    ui.flightPanel.add(ui.altText);
+
+    ui.vsText = new UIKit.Text({
+      text: 'VS: +0 fpm',
+      fontSize: 14,
+      color: '#00ff00',
+      fontFamily: 'monospace',
+      visibility: 'visible'
+    });
+    ui.flightPanel.add(ui.vsText);
+
+    // Throttle row
+    ui.throttleRow = new UIKit.Container({
+      width: 194,
+      height: 20,
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 6,
+      visibility: 'visible'
+    });
+    ui.flightPanel.add(ui.throttleRow);
+
+    ui.throttleLabel = new UIKit.Text({
+      text: 'THR',
+      fontSize: 12,
+      color: '#aaaaaa',
+      fontFamily: 'monospace',
+      visibility: 'visible'
+    });
+    ui.throttleRow.add(ui.throttleLabel);
+
+    ui.throttleBg = new UIKit.Container({
+      width: 140,
+      height: 12,
+      backgroundColor: 'rgba(50,50,50,0.8)',
+      borderRadius: 3,
+      visibility: 'visible'
+    });
+    ui.throttleRow.add(ui.throttleBg);
+
+    ui.throttleFill = new UIKit.Container({
+      width: 0,
+      height: 12,
+      backgroundColor: '#00cc44',
+      borderRadius: 3,
+      visibility: 'visible'
+    });
+    ui.throttleBg.add(ui.throttleFill);
+
+    // ── Bottom-right: Health panel ──
+    ui.healthPanel = new UIKit.Container({
+      width: 210,
+      height: 60,
+      backgroundColor: 'rgba(0,0,0,0.6)',
+      borderRadius: 8,
+      flexDirection: 'column',
+      padding: 8,
+      gap: 4,
+      justifyContent: 'center',
+      alignItems: 'flex-start',
+      visibility: 'visible'
+    });
+    fullscreen.add(ui.healthPanel);
+    ui.healthPanel.position.set(0.42, -0.32, 0);
+
+    ui.healthLabel = new UIKit.Text({
+      text: 'HP: 100/100',
+      fontSize: 13,
+      color: '#ffffff',
+      fontFamily: 'monospace',
+      visibility: 'visible'
+    });
+    ui.healthPanel.add(ui.healthLabel);
+
+    ui.healthBarBg = new UIKit.Container({
+      width: 190,
+      height: 16,
+      backgroundColor: 'rgba(100,0,0,0.5)',
+      borderRadius: 4,
+      visibility: 'visible'
+    });
+    ui.healthPanel.add(ui.healthBarBg);
+
+    ui.healthBarFill = new UIKit.Container({
+      width: 190,
+      height: 16,
+      backgroundColor: '#00cc00',
+      borderRadius: 4,
+      visibility: 'visible'
+    });
+    ui.healthBarBg.add(ui.healthBarFill);
+
+    // ── Top-center: Heading compass ──
+    ui.headingPanel = new UIKit.Container({
+      width: 160,
+      height: 32,
+      backgroundColor: 'rgba(0,0,0,0.5)',
+      borderRadius: 6,
+      justifyContent: 'center',
+      alignItems: 'center',
+      visibility: 'visible'
+    });
+    fullscreen.add(ui.headingPanel);
+    ui.headingPanel.position.set(0, 0.44, 0);
+
+    ui.headingText = new UIKit.Text({
+      text: 'HDG 360\u00B0 N',
+      fontSize: 14,
+      color: '#ffffff',
+      fontFamily: 'monospace',
+      visibility: 'visible'
+    });
+    ui.headingPanel.add(ui.headingText);
+
+    // ── Center: Stall warning ──
+    ui.stallWarning = new UIKit.Text({
+      text: 'STALL',
+      fontSize: 32,
+      color: '#ff0000',
+      fontFamily: 'monospace',
+      visibility: 'hidden'
+    });
+    fullscreen.add(ui.stallWarning);
+    ui.stallWarning.position.set(0, 0.1, 0);
+
+    // ── Center-left: Gear indicator ──
+    ui.gearIndicator = new UIKit.Text({
+      text: 'GEAR DOWN',
+      fontSize: 14,
+      color: '#00ccff',
+      fontFamily: 'monospace',
+      visibility: 'hidden'
+    });
+    fullscreen.add(ui.gearIndicator);
+    ui.gearIndicator.position.set(-0.25, -0.05, 0);
+
+    // ── Center-left: Speedbrake indicator ──
+    ui.speedbrakeIndicator = new UIKit.Text({
+      text: 'SPEEDBRAKES',
+      fontSize: 14,
+      color: '#ffaa00',
+      fontFamily: 'monospace',
+      visibility: 'hidden'
+    });
+    fullscreen.add(ui.speedbrakeIndicator);
+    ui.speedbrakeIndicator.position.set(-0.25, -0.10, 0);
+
+    // ── Artificial horizon ──
+    ui.horizonContainer = new UIKit.Container({
+      width: 120,
+      height: 120,
+      backgroundColor: 'rgba(0,40,80,0.4)',
+      borderRadius: 60,
+      overflow: 'hidden',
+      justifyContent: 'center',
+      alignItems: 'center',
+      visibility: 'visible'
+    });
+    fullscreen.add(ui.horizonContainer);
+    ui.horizonContainer.position.set(0, -0.08, 0);
+
+    // Sky half
+    ui.horizonSky = new UIKit.Container({
+      width: 120,
+      height: 60,
+      backgroundColor: 'rgba(50,100,200,0.5)',
+      visibility: 'visible'
+    });
+    ui.horizonContainer.add(ui.horizonSky);
+
+    // Ground half
+    ui.horizonGround = new UIKit.Container({
+      width: 120,
+      height: 60,
+      backgroundColor: 'rgba(100,70,30,0.5)',
+      visibility: 'visible'
+    });
+    ui.horizonContainer.add(ui.horizonGround);
+
+    // Center horizon line
+    ui.horizonLine = new UIKit.Container({
+      width: 80,
+      height: 2,
+      backgroundColor: '#ffffff',
+      visibility: 'visible'
+    });
+    ui.horizonContainer.add(ui.horizonLine);
+    ui.horizonLine.position.set(0, 0, 0.001);
+
+    // Pitch ladder marks (-20, -10, +10, +20)
+    ui.pitchMarks = [];
+    let pitchAngles = [-20, -10, 10, 20];
+    for (let i = 0; i < pitchAngles.length; i++) {
+      let mark = new UIKit.Container({
+        width: 40,
+        height: 1,
+        backgroundColor: 'rgba(255,255,255,0.5)',
+        visibility: 'visible'
+      });
+      ui.horizonContainer.add(mark);
+      mark.position.set(0, 0, 0.001);
+      ui.pitchMarks.push({ element: mark, angle: pitchAngles[i] });
+    }
+
+    // Aircraft reference (small fixed marker at center)
+    ui.aircraftRef = new UIKit.Container({
+      width: 30,
+      height: 2,
+      backgroundColor: '#ffff00',
+      visibility: 'visible'
+    });
+    ui.horizonContainer.add(ui.aircraftRef);
+    ui.aircraftRef.position.set(0, 0, 0.002);
+  };
+
+  this.update = function(deltaTime) {
+    updateTimer += deltaTime;
+    if (updateTimer < UPDATE_INTERVAL) return;
+    updateTimer = 0;
+
+    let state = store.get('fp3_flightState');
+    if (!state) return;
+
+    let health = store.get('fp3_health');
+    if (health === undefined || health === null) health = MAX_HEALTH;
+
+    // ── Speed ──
+    let speedKts = Math.round((state.speedKmh || 0) * 0.54);
+    ui.speedText.setProperties({ content: 'SPD: ' + speedKts + ' kts' });
+
+    // ── Altitude ──
+    let altFt = Math.round((state.altitude || 0) * 3.28);
+    ui.altText.setProperties({ content: 'ALT: ' + altFt + ' ft' });
+
+    // ── Vertical speed ──
+    let vsFpm = Math.round((state.verticalSpeed || 0) * 197);
+    let vsSign = vsFpm >= 0 ? '+' : '';
+    ui.vsText.setProperties({ content: 'VS: ' + vsSign + vsFpm + ' fpm' });
+
+    // ── Throttle bar ──
+    let throttlePct = (state.throttle || 0) * 100;
+    let throttleWidth = Math.max(0, Math.min(140, (state.throttle || 0) * 140));
+    let throttleColor = throttlePct > 90 ? '#ff4400' : '#00cc44';
+    ui.throttleFill.setProperties({
+      width: throttleWidth,
+      backgroundColor: throttleColor
+    });
+
+    // ── Heading ──
+    let heading = Math.round(((state.heading || 0) + 360) % 360);
+    let cardinal = getCardinal(heading);
+    let hdgStr = heading < 100 ? (heading < 10 ? '00' + heading : '0' + heading) : '' + heading;
+    ui.headingText.setProperties({ content: 'HDG ' + hdgStr + '\u00B0 ' + cardinal });
+
+    // ── Health ──
+    let healthPct = health / MAX_HEALTH;
+    let healthWidth = Math.max(0, Math.min(190, healthPct * 190));
+    let healthColor = getHealthColor(healthPct);
+    ui.healthBarFill.setProperties({
+      width: healthWidth,
+      backgroundColor: healthColor
+    });
+    ui.healthLabel.setProperties({ content: 'HP: ' + Math.round(health) + '/' + MAX_HEALTH });
+
+    // ── Stall warning (flash at 4Hz) ──
+    if (state.isStalling) {
+      stallFlashTimer += UPDATE_INTERVAL;
+      if (stallFlashTimer >= 0.25) {
+        stallFlashTimer = 0;
+        stallVisible = !stallVisible;
+      }
+      ui.stallWarning.setProperties({
+        visibility: stallVisible ? 'visible' : 'hidden'
+      });
+    } else {
+      stallFlashTimer = 0;
+      stallVisible = false;
+      ui.stallWarning.setProperties({ visibility: 'hidden' });
+    }
+
+    // ── Gear indicator ──
+    let gearDown = store.get('fp3_landingGearDown') !== false;
+    ui.gearIndicator.setProperties({
+      content: gearDown ? 'GEAR DOWN' : 'GEAR UP',
+      color: gearDown ? '#00ccff' : '#888888',
+      visibility: 'visible'
+    });
+
+    // ── Speedbrakes ──
+    ui.speedbrakeIndicator.setProperties({
+      visibility: state.speedbrakesDeployed ? 'visible' : 'hidden'
+    });
+
+    // ── Artificial horizon ──
+    // Shift sky/ground based on pitch (AoA as proxy)
+    let pitchDeg = (state.currentAoA || 0);
+    let pitchOffset = pitchDeg * 1.0; // 1px per degree
+    let clampedOffset = Math.max(-40, Math.min(40, pitchOffset));
+
+    ui.horizonSky.setProperties({
+      height: Math.max(10, 60 + clampedOffset)
+    });
+    ui.horizonGround.setProperties({
+      height: Math.max(10, 60 - clampedOffset)
+    });
+
+    // Position pitch ladder marks
+    for (let i = 0; i < ui.pitchMarks.length; i++) {
+      let pm = ui.pitchMarks[i];
+      let markY = (pm.angle - pitchDeg) * 1.0;
+      let markClamped = Math.max(-50, Math.min(50, markY));
+      pm.element.position.set(0, markClamped / 120 * 0.1, 0.001);
+    }
+  };
+
+  this.dispose = function() {
+    if (cameraRetryId !== null) {
+      clearTimeout(cameraRetryId);
+      cameraRetryId = null;
+    }
+    if (fullscreen && fullscreen.parent) {
+      fullscreen.parent.remove(fullscreen);
+    }
+    fullscreen = null;
+    ui = {};
+    game = null;
+    store = null;
+  };

@@ -1,0 +1,74 @@
+# ============================================================
+# Small World — StemStudio Conversion
+# Source: https://github.com/brunosimon/small-world
+# Genre: Interactive Diorama / 3D Art Piece
+# ============================================================
+
+project title "Small World"
+
+# --- Import Matcap Textures ---
+import image name="MCBrass" filepath="textures/matcaps/brass.png" comment="Matcap: brass/metal"
+import image name="MCFabricPinkDark" filepath="textures/matcaps/fabricPinkDark.png" comment="Matcap: dark pink fabric"
+import image name="MCFabricPinkLight" filepath="textures/matcaps/fabricPinkLight.png" comment="Matcap: light pink fabric"
+import image name="MCFoliage" filepath="textures/matcaps/foliage.png" comment="Matcap: green foliage"
+import image name="MCGlobe" filepath="textures/matcaps/globe.png" comment="Matcap: globe/glass"
+import image name="MCLens" filepath="textures/matcaps/lens.png" comment="Matcap: lens/glass"
+import image name="MCMetal" filepath="textures/matcaps/metal.png" comment="Matcap: generic metal"
+import image name="MCPaper" filepath="textures/matcaps/paper.png" comment="Matcap: paper/matte"
+import image name="MCStone" filepath="textures/matcaps/stone.png" comment="Matcap: light stone"
+import image name="MCStoneDark" filepath="textures/matcaps/stoneDark.png" comment="Matcap: dark stone"
+import image name="MCWood" filepath="textures/matcaps/wood.png" comment="Matcap: wood grain"
+
+# --- Import Floor & Entrance Textures ---
+import image name="SWFloorShadowTex" filepath="textures/bakedFloorShadowTexture.png" comment="Floor shadow alpha mask"
+import image name="SWFloorLightTex" filepath="textures/bakedFloorLightTexture.png" comment="Floor light alpha mask"
+import image name="SWEntranceStrokeTex" filepath="textures/entranceStrokeTexture.png" comment="Entrance stroke alpha map"
+
+# --- Import Models ---
+import model name="SWDiorama" filepath="models/model.glb" comment="Main diorama world model (DRACO compressed)"
+import model name="SWFloorShadow" filepath="models/bakedFloorShadowModel.glb" comment="Floor shadow overlay mesh"
+import model name="SWFloorLight" filepath="models/bakedFloorLightModel.glb" comment="Floor light overlay mesh"
+import model name="SWEntrance" filepath="models/entranceModel.glb" comment="Entrance portal model"
+import model name="SWWindStroke1" filepath="models/windStroke1Model.glb" comment="Wind stroke template 1"
+import model name="SWWindStroke2" filepath="models/windStroke2Model.glb" comment="Wind stroke template 2"
+
+# --- Import Behaviors ---
+import behavior name="SW Small World" filepath="behaviors/swSmallWorld.yaml" comment="Diorama content: matcap shaders, animations, floor, entrance, wind"
+import behavior name="SW Orbit Camera" filepath="behaviors/swOrbitCamera.yaml" comment="Spherical orbit camera with smooth easing"
+
+# --- Scene Settings ---
+
+# Olive-green background (visible only briefly before gradient quad renders)
+scene background type=Color color=#8B9430
+
+# No fog (diorama is viewed from close range)
+scene fog type=none
+
+# Minimal ambient — matcap materials are self-lit
+scene lighting ambient={skyColor:#444444,groundColor:#222222,intensity:0.3}
+
+# Disable shadows (matcap shading, no dynamic lights)
+render settings useShadows=false
+
+# --- Camera Settings ---
+# Camera is fully driven by the orbit behavior at runtime
+# Set clipping planes and disable built-in camera controls
+camera "DefaultCamera" cameraType=NONE fov=25 near=0.1 far=150
+
+# --- Attach Behaviors ---
+behavior attach SWDiorama behaviorId=sw.smallWorld config={floorShadowTexture:"SWFloorShadowTex",floorLightTexture:"SWFloorLightTex",entranceStrokeTexture:"SWEntranceStrokeTex"}
+behavior attach SWDiorama behaviorId=sw.orbitCamera config={fov:25,centerY:2}
+
+# ============================================================
+# NOTES:
+# - The swSmallWorld behavior handles all visual content:
+#   custom matcap shaders, telescope/gear animation, floor
+#   gradient + baked overlays, entrance strokes, wind VFX
+# - The swOrbitCamera behavior provides smooth spherical orbit
+#   navigation with mouse/touch/wheel controls
+# - Original depth of field (BokehPass) is NOT ported — Stem
+#   does not have a DOF postprocessing pass. This is purely
+#   visual polish and does not affect the experience feel.
+# - All models are DRACO-compressed GLBs from the original repo
+# - 11 matcap textures drive the scene's distinctive art style
+# ============================================================

@@ -1,0 +1,650 @@
+meta:
+  tool: "StemStudio"
+  type: "behavior"
+  exportVersion: 1
+
+config:
+  name: "HGL Ship Controller"
+  id: "hgl.shipController"
+  author: "HexGL-Port"
+  isScript: true
+  main: "script.js"
+  priority: 0
+  version: "1.0.0"
+  description: "Faithful port of HexGL ShipControls.js — kinematic ship physics
+    with pixel-based collision/height maps, boost pads, shield, and difficulty
+    presets."
+  tags:
+    - gameplay
+  inputs:
+    hgl_AirBrakeL: { action: true, bindings: [ { keyboard: KeyA }, { keyboard: KeyQ } ] }
+    hgl_AirBrakeR: { action: true, bindings: [ { keyboard: KeyD }, { keyboard: KeyE } ] }
+  attributes:
+    collisionMapAsset:
+      name: "Collision Map"
+      type: "imageAsset"
+      description: "PNG collision map — red=boost, green channel=walls"
+    heightMapAsset:
+      name: "Height Map"
+      type: "imageAsset"
+      description: "PNG packed RGB height map for terrain following"
+    difficulty:
+      name: "Difficulty"
+      type: "enum"
+      default: "easy"
+      options:
+        - label: "Easy"
+          value: "easy"
+        - label: "Hard"
+          value: "hard"
+      description: "Switches full parameter preset — easy (source default) or hard"
+    godmode:
+      name: "God Mode"
+      type: "boolean"
+      default: false
+      description: "Disable shield damage"
+    maxSpeed:
+      name: "Max Speed"
+      type: "number"
+      default: 7.0
+      description: "Maximum forward speed"
+    thrust:
+      name: "Thrust"
+      type: "number"
+      default: 0.02
+      description: "Forward acceleration per frame"
+    airResist:
+      name: "Air Resistance"
+      type: "number"
+      default: 0.02
+      description: "Speed decay when not thrusting"
+    airBrake:
+      name: "Air Brake"
+      type: "number"
+      default: 0.025
+      description: "Deceleration when braking"
+    angularSpeed:
+      name: "Angular Speed"
+      type: "number"
+      default: 0.0125
+      description: "Base turn rate"
+    airAngularSpeed:
+      name: "Air Angular Speed"
+      type: "number"
+      default: 0.0135
+      description: "Turn rate when drifting"
+    rollAngle:
+      name: "Roll Angle"
+      type: "number"
+      default: 0.6
+      description: "Visual roll amount on turn"
+    shieldDamage:
+      name: "Shield Damage"
+      type: "number"
+      default: 0.06
+      description: "Base collision damage multiplier"
+    heightBias:
+      name: "Height Bias"
+      type: "number"
+      default: 4.0
+      description: "Vertical offset from height map"
+    heightScale:
+      name: "Height Scale"
+      type: "number"
+      default: 10.0
+      description: "Height map value divisor"
+    pixelRatio:
+      name: "Pixel Ratio"
+      type: "number"
+      default: 0.3413
+      description: "World-to-pixel scale (2048/6000)"
+  documentation: Faithful port of HexGL ShipControls.js — kinematic ship physics
+    with pixel-based collision/height maps, boost pads, shield, and difficulty
+    presets. Configure attributes in the editor to tune gameplay behavior.
+
+code: |
+  /* HGL Ship Controller — faithful port of ShipControls.js */
+  let game;
+  const EPSILON = 0.00000001;
+
+  /* ── Pre-allocated vectors (hot-path rule) ── */
+  const _zero     = new THREE.Vector3(0, 0, 0);
+  const _movement = new THREE.Vector3();
+  const _rotation = new THREE.Vector3();
+  const _currentVelocity = new THREE.Vector3();
+  const _repulsionForce  = new THREE.Vector3();
+  const _repulsionVLeft  = new THREE.Vector3(1, 0, 0);
+  const _repulsionVRight = new THREE.Vector3(-1, 0, 0);
+  const _repulsionVFront = new THREE.Vector3(0, 0, 1);
+  const _gradientAxis    = new THREE.Vector3(1, 0, 0);
+  const _gradientVector  = new THREE.Vector3(0, 0, 5);
+  const _tiltAxis        = new THREE.Vector3(0, 0, 1);
+  const _tiltVector      = new THREE.Vector3(5, 0, 0);
+  const _rollAxis        = new THREE.Vector3(0, 0, 1);
+  const _rollDir         = new THREE.Vector3(0, 0, 1);
+  const _fallVector      = new THREE.Vector3(0, -20, 0);
+  const _dir             = new THREE.Vector3();
+  const _up              = new THREE.Vector3();
+  const _tmpV            = new THREE.Vector3();
+  const _quat            = new THREE.Quaternion();
+  const _identityMatrix  = new THREE.Matrix4();
+
+  /* ── State ── */
+  let speed = 0, speedRatio = 0, boost = 0, shield = 1.0;
+  let roll = 0, drift = 0, angular = 0;
+  let gradient = 0, gradientTarget = 0;
+  let tilt = 0, tiltTarget = 0;
+  let shieldDelay = 0;
+  let falling = false, destroyed = false, active = false;
+  let collision = { left: false, right: false, front: false };
+
+  /* ── Difficulty presets (source: tweakShipControls) ── */
+  const PRESETS = {
+    easy: {
+      airResist: 0.02, airDrift: 0.06, thrust: 0.02, airBrake: 0.025,
+      maxSpeed: 7.0, boosterSpeed: 3.5, boosterDecay: 0.007,
+      angularSpeed: 0.0125, airAngularSpeed: 0.0135, rollAngle: 0.6,
+      shieldDamage: 0.06, collisionSpeedDecrease: 0.8, collisionSpeedDecreaseCoef: 0.5,
+      rollLerp: 0.07, driftLerp: 0.3, angularLerp: 0.4
+    },
+    hard: {
+      airResist: 0.035, airDrift: 0.07, thrust: 0.035, airBrake: 0.04,
+      maxSpeed: 9.6, boosterSpeed: 3.36, boosterDecay: 0.007,
+      angularSpeed: 0.014, airAngularSpeed: 0.0165, rollAngle: 0.6,
+      shieldDamage: 0.03, collisionSpeedDecrease: 0.8, collisionSpeedDecreaseCoef: 0.5,
+      rollLerp: 0.1, driftLerp: 0.4, angularLerp: 0.4
+    }
+  };
+
+  let P; // active parameter set
+
+  /* ── Collision / height map data ── */
+  let collisionPixels = null, collisionW = 0, collisionH = 0;
+  let heightPixels = null, heightW = 0, heightH = 0;
+  let pixelRatio = 0.3413; // 2048/6000
+
+  /* ── Input state ── */
+  const key = { forward: false, backward: false, left: false, right: false, ltrigger: false, rtrigger: false };
+  // Touch-driven brake state (OR'd with keyboard actions). Set by onEvent from
+  // the built-in touchControls customEvent buttons; see hexgl.stemscript.
+  let touchBrakeL = false;
+  let touchBrakeR = false;
+
+  /* ── Helpers ── */
+  function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+  function getPixel(pixels, w, h, x, y) {
+    let px = clamp(Math.round(x), 0, w - 1);
+    let py = clamp(Math.round(y), 0, h - 1);
+    let i = (py * w + px) * 4;
+    return { r: pixels[i], g: pixels[i + 1], b: pixels[i + 2], a: pixels[i + 3] };
+  }
+
+  function getPixelBilinear(pixels, w, h, x, y) {
+    let fx = Math.floor(x), fy = Math.floor(y);
+    let cx = fx + 1, cy = fy + 1;
+    let tx = x - fx, ty = y - fy;
+    let tl = getPixel(pixels, w, h, fx, fy);
+    let tr = getPixel(pixels, w, h, cx, fy);
+    let bl = getPixel(pixels, w, h, fx, cy);
+    let br = getPixel(pixels, w, h, cx, cy);
+    return {
+      r: (tl.r * (1 - tx) * (1 - ty) + tr.r * tx * (1 - ty) + bl.r * (1 - tx) * ty + br.r * tx * ty),
+      g: (tl.g * (1 - tx) * (1 - ty) + tr.g * tx * (1 - ty) + bl.g * (1 - tx) * ty + br.g * tx * ty),
+      b: (tl.b * (1 - tx) * (1 - ty) + tr.b * tx * (1 - ty) + bl.b * (1 - tx) * ty + br.b * tx * ty),
+      a: 255
+    };
+  }
+
+  function getPixelFBilinear(pixels, w, h, x, y) {
+    let c = getPixelBilinear(pixels, w, h, x, y);
+    return c.r + c.g * 255 + c.b * 255 * 255;
+  }
+
+  function loadImageData(attr, erth, callback) {
+    if (!attr) { console.warn("[HGL-SHIP] loadImageData: attr is falsy, skipping"); return; }
+    erth.asset.image.createTexture(attr).then(function(texture) {
+      let img = texture.image;
+      if (!img) { console.warn("[HGL-SHIP] loadImageData: texture.image is null"); return; }
+      let canvas = document.createElement("canvas"); // @check-ok
+      canvas.width = img.width;
+      canvas.height = img.height;
+      let ctx = canvas.getContext("2d");
+      ctx.drawImage(img, 0, 0);
+      let data = ctx.getImageData(0, 0, img.width, img.height);
+      callback(data.data, img.width, img.height);
+    }).catch(function(err) {
+      console.error("[HGL-SHIP] Map load FAILED:", err);
+    });
+  }
+
+  /* ── Keyboard handlers ── */
+  function pollShipKeys() {
+    if (!game || !game.inputManager) return;
+    const im = game.inputManager;
+    const fwd = im.getMotion('forward') || 0;
+    const lat = im.getMotion('lateral') || 0;
+    key.forward = fwd > 0.1;
+    key.backward = fwd < -0.1;
+    key.right = lat > 0.1;
+    key.left = lat < -0.1;
+    key.ltrigger = !!im.getAction('hgl_AirBrakeL') || touchBrakeL;
+    key.rtrigger = !!im.getAction('hgl_AirBrakeR') || touchBrakeR;
+  }
+
+  /* ═══════════ LIFECYCLE ═══════════ */
+
+  this.init = function(_game) {
+      game = _game;
+    console.log("[HGL-SHIP] init called");
+
+    // Apply difficulty preset
+    let diff = this.getAttribute("difficulty") || "easy";
+    P = Object.assign({}, PRESETS[diff] || PRESETS.easy);
+
+    // Override individual attributes if the user changed them from defaults.
+    // Kept as a per-key override list to match the source's tweakShipControls
+    // semantics — defaults come from the preset, the editor is just an escape hatch.
+    const override = (key, presetDefault) => {
+      const v = this.getAttribute(key);
+      if (v !== undefined && v !== presetDefault) P[key] = v;
+    };
+    override("maxSpeed", 7.0);
+    override("thrust", 0.02);
+    override("airResist", 0.02);
+    override("airBrake", 0.025);
+    override("angularSpeed", 0.0125);
+    override("airAngularSpeed", 0.0135);
+    override("rollAngle", 0.6);
+    override("shieldDamage", 0.06);
+    if (this.getAttribute("godmode")) P.shieldDamage = 0;
+
+    pixelRatio = this.getAttribute("pixelRatio") || 0.3413;
+    P.heightBias = this.getAttribute("heightBias") || 4.0;
+    P.heightScale = this.getAttribute("heightScale") || 10.0;
+    P.heightLerp = 0.4;
+    P.heightRiseLerp = 7.5;
+    P.heightFallLerp = 5.0;
+    P.repulsionRatio = 0.5;
+    P.repulsionCap = 2.5;
+    P.repulsionLerp = 0.1;
+    P.repulsionVScale = 4.0;
+    P.gradientLerp = 0.05;
+    P.gradientScale = 4.0;
+    P.tiltLerp = 0.05;
+    P.tiltScale = 4.0;
+    P.heightDeadzone = 0.05;
+    P.shieldDelayMax = 60;
+
+    shield = 1.0;
+    speed = 0;
+    boost = 0;
+    falling = false;
+    destroyed = false;
+    active = false;
+
+    // Load collision map
+    const collisionAsset = this.getAttribute("collisionMapAsset");
+    console.log("[HGL-SHIP] loading collision map, attr:", collisionAsset);
+    loadImageData(collisionAsset, this.erth, function(data, w, h) {
+      collisionPixels = data;
+      collisionW = w;
+      collisionH = h;
+      console.log("[HGL-SHIP] Collision map loaded:", w, "x", h);
+    });
+
+    // Load height map
+    const heightAsset = this.getAttribute("heightMapAsset");
+    console.log("[HGL-SHIP] loading height map, attr:", heightAsset);
+    loadImageData(heightAsset, this.erth, function(data, w, h) {
+      heightPixels = data;
+      heightW = w;
+      heightH = h;
+      console.log("[HGL-SHIP] Height map loaded:", w, "x", h);
+    });
+
+    // Keyboard polled per-frame in update() via InputManager
+  };
+
+  this.onStart = function() {
+    active = false; // race manager will activate us
+    speed = 0;
+    boost = 0;
+    shield = 1.0;
+    falling = false;
+    destroyed = false;
+    _movement.set(0, 0, 0);
+    _rotation.set(0, 0, 0);
+    _repulsionForce.set(0, 0, 0);
+    _currentVelocity.set(0, 0, 0);
+    gradient = 0; gradientTarget = 0;
+    tilt = 0; tiltTarget = 0;
+    roll = 0; drift = 0; angular = 0;
+    shieldDelay = P.shieldDelayMax;
+    collision.left = false;
+    collision.right = false;
+    collision.front = false;
+  };
+
+  this.update = function(deltaTime) {
+    if (!this.gameObject) return;
+    pollShipKeys();
+    // Normalize dt to ~16.6ms baseline like source, capped for tab-switch spikes.
+    let dt = Math.min(deltaTime, 0.1) * 60; // deltaTime in seconds → frame-equivalent
+    if (dt > 1.5) dt = 1.0; // Cap to prevent physics blowup on frame spike
+
+    // Diagnostic: log every 120 frames (~2s)
+    if (this._fc === undefined) this._fc = 0;
+    this._fc++;
+    if (this._fc % 120 === 0) {
+      console.log("[HGL-SHIP] update:", { active: active, speed: speed.toFixed(3), y: this.gameObject.position.y.toFixed(1), falling: falling, destroyed: destroyed, hasCMap: !!collisionPixels, hasHMap: !!heightPixels });
+    }
+
+    let dummy = this.gameObject._internal.three; // Player group = physics proxy
+
+    if (falling) {
+      dummy.position.add(_tmpV.copy(_fallVector).multiplyScalar(deltaTime));
+      return;
+    }
+
+    _rotation.y = 0;
+    _movement.set(0, 0, 0);
+    drift += (0 - drift) * P.driftLerp;
+    angular += (0 - angular) * P.angularLerp * 0.5;
+
+    let rollAmount = 0;
+    let angularAmount = 0;
+
+    if (active) {
+      // Steering
+      if (key.left) {
+        angularAmount += P.angularSpeed * dt;
+        rollAmount -= P.rollAngle;
+      }
+      if (key.right) {
+        angularAmount -= P.angularSpeed * dt;
+        rollAmount += P.rollAngle;
+      }
+
+      // Thrust / brake
+      if (key.forward) {
+        speed += P.thrust * dt;
+      } else {
+        speed -= P.airResist * dt;
+      }
+      if (key.backward) {
+        speed -= P.airBrake * dt;
+      }
+
+      // Drift triggers
+      if (key.ltrigger) {
+        if (key.left) angularAmount += P.airAngularSpeed * dt;
+        else angularAmount += P.airAngularSpeed * 0.5 * dt;
+        speed -= P.airBrake * dt;
+        drift += (P.airDrift - drift) * P.driftLerp;
+        _movement.x += speed * drift * dt;
+        if (drift > 0) _movement.z -= speed * drift * dt;
+        rollAmount -= P.rollAngle * 0.7;
+      }
+      if (key.rtrigger) {
+        if (key.right) angularAmount -= P.airAngularSpeed * dt;
+        else angularAmount -= P.airAngularSpeed * 0.5 * dt;
+        speed -= P.airBrake * dt;
+        drift += (-P.airDrift - drift) * P.driftLerp;
+        _movement.x += speed * drift * dt;
+        if (drift < 0) _movement.z += speed * drift * dt;
+        rollAmount += P.rollAngle * 0.7;
+      }
+
+      // Speed clamping
+      if (speed > P.maxSpeed) speed = P.maxSpeed;
+      if (speed < 0) speed = 0;
+
+      // Angular lerp
+      angular += (angularAmount - angular) * P.angularLerp;
+      _rotation.y = angular;
+
+      // Forward movement
+      _movement.z += speed * dt;
+
+      // Repulsion force decay
+      _repulsionForce.multiplyScalar(1 - P.repulsionLerp);
+
+      // Apply repulsion
+      _movement.add(_repulsionForce);
+
+      // Speed ratio
+      speedRatio = speed / P.maxSpeed;
+    }
+
+    // --- Below runs EVERY frame (even when not active) matching original ---
+
+    // Boost check (outside active — original line 112)
+    boosterCheck(dt);
+
+    // Translate using CURRENT quaternion (before updating it — original order)
+    _currentVelocity.copy(_movement);
+    _currentVelocity.applyQuaternion(dummy.quaternion);
+    dummy.position.add(_currentVelocity);
+
+    // Height map terrain following (outside active — original line 121)
+    heightCheck(dt);
+
+    // Collision detection (outside active — original line 126)
+    collisionCheck(dt);
+
+    // NOW update quaternion for next frame (original line 128-129)
+    _quat.set(_rotation.x, _rotation.y, _rotation.z, 1).normalize();
+    dummy.quaternion.multiply(_quat);
+
+    // Now apply visual mesh transforms (roll, gradient, tilt) to Ship child
+    let shipMesh = dummy.children && dummy.children[0] ? dummy.children[0] : null;
+    if (shipMesh) {
+      // Reset ship local rotation to identity
+      shipMesh.quaternion.identity();
+      shipMesh.position.set(0, 0, 0);
+
+      // Gradient (pitch)
+      let gradientDelta = (gradientTarget - gradient) * P.gradientLerp;
+      if (Math.abs(gradientDelta) > EPSILON) gradient += gradientDelta;
+      if (Math.abs(gradient) > EPSILON) {
+        _tmpV.set(1, 0, 0);
+        _quat.setFromAxisAngle(_tmpV, gradient);
+        shipMesh.quaternion.premultiply(_quat);
+      }
+
+      // Tilt (side lean from terrain)
+      let tiltDelta = (tiltTarget - tilt) * P.tiltLerp;
+      if (Math.abs(tiltDelta) > EPSILON) tilt += tiltDelta;
+      if (Math.abs(tilt) > EPSILON) {
+        _tmpV.set(0, 0, 1);
+        _quat.setFromAxisAngle(_tmpV, tilt);
+        shipMesh.quaternion.premultiply(_quat);
+      }
+
+      // Roll (visual turn lean)
+      let rollDelta = (rollAmount - roll) * P.rollLerp;
+      if (Math.abs(rollDelta) > EPSILON) roll += rollDelta;
+      if (Math.abs(roll) > EPSILON) {
+        _tmpV.set(0, 0, 1);
+        _quat.setFromAxisAngle(_tmpV, roll);
+        shipMesh.quaternion.premultiply(_quat);
+      }
+    }
+
+    // Publish state to store for other behaviors
+    this.erth.store.set("hgl_speed", Math.round(speed / P.maxSpeed * 100));
+    this.erth.store.set("hgl_speedRatio", speedRatio);
+    this.erth.store.set("hgl_boost", boost);
+    this.erth.store.set("hgl_boostRatio", P.boosterSpeed > 0 ? boost / P.boosterSpeed : 0);
+    this.erth.store.set("hgl_shield", Math.round(shield * 100));
+    this.erth.store.set("hgl_shieldRatio", shield);
+    this.erth.store.set("hgl_collision", collision);
+    this.erth.store.set("hgl_destroyed", destroyed);
+    this.erth.store.set("hgl_active", active);
+    this.erth.store.set("hgl_forward", key.forward);
+  };
+
+  /* ── Boost pad detection ── */
+  function boosterCheck(dt) {
+    if (!collisionPixels) return;
+
+    boost -= P.boosterDecay * dt;
+    if (boost < 0) boost = 0;
+
+    let dummy = this.gameObject._internal.three;
+    let x = Math.round(collisionW / 2 + dummy.position.x * pixelRatio);
+    let z = Math.round(collisionH / 2 + dummy.position.z * pixelRatio);
+    let color = getPixel(collisionPixels, collisionW, collisionH, x, z);
+
+    if (color.r === 255 && color.g < 127 && color.b < 127) {
+      boost = P.boosterSpeed;
+      this.erth.store.set("hgl_boostHit", true);
+    }
+
+    _movement.z += boost * dt;
+  }
+  boosterCheck = boosterCheck.bind(this);
+
+  /* ── Height map terrain following ── */
+  function heightCheck(dt) {
+    if (!heightPixels) return;
+
+    let dummy = this.gameObject._internal.three;
+    let x = heightW / 2 + dummy.position.x * pixelRatio;
+    let z = heightH / 2 + dummy.position.z * pixelRatio;
+
+    let nheight = getPixelFBilinear(heightPixels, heightW, heightH, x, z) / P.heightScale + P.heightBias;
+    if (nheight < -200) {
+      // Off track → falling
+      falling = true;
+      destroyed = true;
+      return;
+    }
+
+    let lheight = dummy.position.y;
+    let delta = nheight - lheight;
+    if (Math.abs(delta) <= P.heightDeadzone) {
+      return;
+    }
+    let heightAlpha = delta > 0
+      ? 1 - Math.exp(-P.heightRiseLerp * dt)
+      : 1 - Math.exp(-P.heightFallLerp * dt);
+    dummy.position.y += delta * heightAlpha;
+
+    // Forward gradient (pitch)
+    _gradientVector.set(0, 0, 5);
+    _gradientVector.applyQuaternion(dummy.quaternion);
+    let gx = heightW / 2 + (dummy.position.x + _gradientVector.x) * pixelRatio;
+    let gz = heightH / 2 + (dummy.position.z + _gradientVector.z) * pixelRatio;
+    let fh = getPixelFBilinear(heightPixels, heightW, heightH, gx, gz) / P.heightScale + P.heightBias;
+    gradientTarget = -(fh - nheight) * P.gradientScale * 0.01;
+
+    // Side tilt
+    _tiltVector.set(5, 0, 0);
+    _tiltVector.applyQuaternion(dummy.quaternion);
+    let tx = heightW / 2 + (dummy.position.x + _tiltVector.x) * pixelRatio;
+    let tz = heightH / 2 + (dummy.position.z + _tiltVector.z) * pixelRatio;
+    let sh = getPixelFBilinear(heightPixels, heightW, heightH, tx, tz) / P.heightScale + P.heightBias;
+    tiltTarget = -(sh - nheight) * P.tiltScale * 0.01;
+  }
+  heightCheck = heightCheck.bind(this);
+
+  /* ── Wall collision detection ── */
+  function collisionCheck(dt) {
+    if (!collisionPixels) return;
+
+    if (shieldDelay > 0) shieldDelay -= dt;
+
+    collision.left = false;
+    collision.right = false;
+    collision.front = false;
+
+    let dummy = this.gameObject._internal.three;
+    let x = Math.round(collisionW / 2 + dummy.position.x * pixelRatio);
+    let z = Math.round(collisionH / 2 + dummy.position.z * pixelRatio);
+
+    let col = getPixelBilinear(collisionPixels, collisionW, collisionH, x, z);
+
+    if (col.r < 255) {
+      // Wall collision — apply damage only when shield delay has elapsed
+      if (shieldDelay <= 0) {
+        let sr = speed / P.maxSpeed;
+        shield -= sr * sr * 0.8 * P.shieldDamage;
+        shieldDelay = P.shieldDelayMax;
+      }
+
+      if (shield <= 0) {
+        shield = 0;
+        destroyed = true;
+        active = false;
+        return;
+      }
+
+      // Determine repulsion direction
+      _repulsionVLeft.set(1, 0, 0);
+      _repulsionVRight.set(-1, 0, 0);
+      _repulsionVLeft.applyQuaternion(dummy.quaternion).multiplyScalar(P.repulsionVScale);
+      _repulsionVRight.applyQuaternion(dummy.quaternion).multiplyScalar(P.repulsionVScale);
+
+      let lx = Math.round(collisionW / 2 + (dummy.position.x + _repulsionVLeft.x) * pixelRatio);
+      let lz = Math.round(collisionH / 2 + (dummy.position.z + _repulsionVLeft.z) * pixelRatio);
+      let rx = Math.round(collisionW / 2 + (dummy.position.x + _repulsionVRight.x) * pixelRatio);
+      let rz = Math.round(collisionH / 2 + (dummy.position.z + _repulsionVRight.z) * pixelRatio);
+
+      let lCol = getPixel(collisionPixels, collisionW, collisionH, lx, lz).r;
+      let rCol = getPixel(collisionPixels, collisionW, collisionH, rx, rz).r;
+
+      let repulsionAmount = Math.max(0.8, Math.min(P.repulsionCap, speed * P.repulsionRatio));
+
+      if (rCol > lCol) {
+        _repulsionForce.x += -repulsionAmount;
+        collision.left = true;
+      } else if (rCol < lCol) {
+        _repulsionForce.x += repulsionAmount;
+        collision.right = true;
+      } else {
+        _repulsionForce.z += -repulsionAmount * 4;
+        collision.front = true;
+        speed = 0;
+      }
+
+      // Double speed penalty (source applies both) + zero boost on collision
+      speed *= P.collisionSpeedDecrease;
+      speed *= (1 - P.collisionSpeedDecreaseCoef * (1 - col.r / 255));
+      boost = 0;
+    }
+  }
+  collisionCheck = collisionCheck.bind(this);
+
+  /* ── Public methods for race manager ── */
+  this.onEvent = function(msg, data) {
+    console.log("[HGL-SHIP] onEvent:", msg);
+    if (msg === "hgl_activate") {
+      active = true;
+    } else if (msg === "hgl_deactivate") {
+      active = false;
+    } else if (msg === "hgl_touchLeftDown") {
+      touchBrakeL = true;
+    } else if (msg === "hgl_touchLeftUp") {
+      touchBrakeL = false;
+    } else if (msg === "hgl_touchRightDown") {
+      touchBrakeR = true;
+    } else if (msg === "hgl_touchRightUp") {
+      touchBrakeR = false;
+    } else if (msg === "hgl_reset") {
+      speed = 0; boost = 0; shield = 1.0;
+      falling = false; destroyed = false;
+      _movement.set(0, 0, 0);
+      _repulsionForce.set(0, 0, 0);
+      gradient = 0; gradientTarget = 0;
+      tilt = 0; tiltTarget = 0;
+      roll = 0; drift = 0; angular = 0;
+      shieldDelay = P.shieldDelayMax;
+    }
+  };
+
+  this.dispose = function() {
+    collisionPixels = null;
+    heightPixels = null;
+  };

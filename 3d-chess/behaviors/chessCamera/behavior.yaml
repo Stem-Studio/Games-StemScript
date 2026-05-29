@@ -1,0 +1,466 @@
+# StemStudio Export File
+# Do not edit manually unless you know what you're doing
+
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+  exportedAt: 2026-04-30T17:38:38.668Z
+config:
+  name: Chess Camera
+  id: 69eab9da5b53803168c082a5
+  author: chess
+  isScript: true
+  main: script.js
+  version: 1.0.0
+  description: Orbit camera for the chess board. Rotates around the board center with zoom support.
+  tags:
+    - gameplay
+  priority: 1
+  attributes:
+    initialDistance:
+      name: Initial Distance
+      type: number
+      default: 14
+      min: 5
+      max: 30
+    minDistance:
+      name: Min Distance
+      type: number
+      default: 7
+      min: 2
+      max: 20
+    maxDistance:
+      name: Max Distance
+      type: number
+      default: 25
+      min: 10
+      max: 50
+    initialPolarAngle:
+      name: Initial Polar Angle
+      type: number
+      default: 1.15
+      min: 0.2
+      max: 1.5
+    minPolarAngle:
+      name: Min Polar Angle
+      type: number
+      default: 0.2
+      min: 0.1
+      max: 1
+    maxPolarAngle:
+      name: Max Polar Angle
+      type: number
+      default: 1.5
+      min: 0.5
+      max: 1.57
+    initialAzimuthAngle:
+      name: Initial Azimuth Angle
+      type: number
+      default: -1.1
+      min: -3.14
+      max: 3.14
+    rotateSpeed:
+      name: Rotate Speed
+      type: number
+      default: 0.005
+      min: 0.001
+      max: 0.02
+    zoomSpeed:
+      name: Zoom Speed
+      type: number
+      default: 0.5
+      min: 0.1
+      max: 2
+    smoothing:
+      name: Smoothing
+      type: number
+      default: 0.08
+      min: 0.01
+      max: 0.3
+    fov:
+      name: FOV
+      type: number
+      default: 50
+      min: 30
+      max: 90
+    lookAtY:
+      name: Look At Y Offset
+      type: number
+      default: 0
+      min: -2
+      max: 2
+  documentation: Orbit camera for the chess board. Rotates around the board center with zoom support. Configure attributes in the editor to tune gameplay behavior.
+code: "/* Orbit camera for chess board — matches source OrbitControls behavior */\r
+
+  \r
+
+  // Spherical coordinates\r
+
+  let game;\r
+
+  let azimuth = 0;\r
+
+  let polar = 0;\r
+
+  let distance = 0;\r
+
+  \r
+
+  // Target values for smooth interpolation\r
+
+  let targetAzimuth = 0;\r
+
+  let targetPolar = 0;\r
+
+  let targetDistance = 0;\r
+
+  \r
+
+  // Drag state\r
+
+  let isDragging = false;\r
+
+  let lastPointerX = 0;\r
+
+  let lastPointerY = 0;\r
+
+  \r
+
+  // Pre-allocated vectors\r
+
+  let camPos = new THREE.Vector3();\r
+
+  let lookTarget = new THREE.Vector3(0, 0, 0);\r
+
+  \r
+
+  // Event handlers\r
+
+  let onPointerDownFn = null;\r
+
+  let onPointerMoveFn = null;\r
+
+  let onPointerUpFn = null;\r
+
+  let onWheelFn = null;\r
+
+  let canvas = null;\r
+
+  \r
+
+  function updateCameraPosition(camera, smooth) {\r
+
+  \  let lerp = smooth;\r
+
+  \  azimuth += (targetAzimuth - azimuth) * lerp;\r
+
+  \  polar += (targetPolar - polar) * lerp;\r
+
+  \  distance += (targetDistance - distance) * lerp;\r
+
+  \r
+
+  \  let sinP = Math.sin(polar);\r
+
+  \  let cosP = Math.cos(polar);\r
+
+  \  let sinA = Math.sin(azimuth);\r
+
+  \  let cosA = Math.cos(azimuth);\r
+
+  \r
+
+  \  camPos.set(\r
+
+  \    distance * sinP * cosA + lookTarget.x,\r
+
+  \    distance * cosP + lookTarget.y,\r
+
+  \    distance * sinP * sinA + lookTarget.z\r
+
+  \  );\r
+
+  \r
+
+  \  camera.position.copy(camPos);\r
+
+  \  camera.lookAt(lookTarget);\r
+
+  }\r
+
+  \r
+
+  this.init = function (_game) {\r
+
+  \  game = _game;\r
+
+  \  azimuth = this.getAttribute(\"initialAzimuthAngle\");\r
+
+  \  polar = this.getAttribute(\"initialPolarAngle\");\r
+
+  \  distance = this.getAttribute(\"initialDistance\");\r
+
+  \  targetAzimuth = azimuth;\r
+
+  \  targetPolar = polar;\r
+
+  \  targetDistance = distance;\r
+
+  \  lookTarget.y = this.getAttribute(\"lookAtY\");\r
+
+  \r
+
+  \  // Set FOV\r
+
+  \  if (game.camera && game.camera.fov !== undefined) {\r
+
+  \    game.camera.fov = this.getAttribute(\"fov\");\r
+
+  \    game.camera.updateProjectionMatrix();\r
+
+  \  }\r
+
+  \r
+
+  \  // Set initial position immediately (no smoothing)\r
+
+  \  if (game.camera) {\r
+
+  \    updateCameraPosition(game.camera, 1.0);\r
+
+  \  }\r
+
+  \r
+
+  \  // Input setup — use the engine renderer's canvas only (no DOM lookup).\r
+
+  \  canvas = (game.renderer && game.renderer.domElement) || null;\r
+
+  \  if (!canvas) return;\r
+
+  \r
+
+  \  const pointerDown = [];\r
+
+  \  onPointerDownFn = (e) => {\r
+
+  \    // Only orbit with left mouse button or single touch\r
+
+  \    if (e.button !== undefined && e.button !== 0) return;\r
+
+  \    isDragging = true;\r
+
+  \    lastPointerX = e.clientX;\r
+
+  \    lastPointerY = e.clientY;\r
+
+  \    pointerDown.push(e);\r
+
+  \  };\r
+
+  \r
+
+  \  let prevDiff = 0;\r
+
+  \  onPointerMoveFn = (e) => {\r
+
+  \    if (!isDragging) return;\r
+
+  \r
+
+  \    if (pointerDown.length === 1) {\r
+
+  \      let dx = e.clientX - lastPointerX;\r
+
+  \      let dy = e.clientY - lastPointerY;\r
+
+  \      lastPointerX = e.clientX;\r
+
+  \      lastPointerY = e.clientY;\r
+
+  \r
+
+  \      targetAzimuth -= dx * this.getAttribute(\"rotateSpeed\") * -1; // reverse x-axis\r
+
+  \      targetPolar -= dy * this.getAttribute(\"rotateSpeed\");\r
+
+  \r
+
+  \      // Clamp polar angle\r
+
+  \      targetPolar = Math.max(this.getAttribute(\"minPolarAngle\"), Math.min(this.getAttribute(\"maxPolarAngle\"), targetPolar));\r
+
+  \r
+
+  \    } else if (pointerDown.length === 2) { // Pinch\r
+
+  \      const index = pointerDown.findIndex(\r
+
+  \        (cachedEv) => cachedEv.pointerId === e.pointerId,\r
+
+  \      );\r
+
+  \      pointerDown[index] = e;\r
+
+  \r
+
+  \      const curDiff = Math.hypot(\r
+
+  \        pointerDown[0].clientX - pointerDown[1].clientX,\r
+
+  \        pointerDown[0].clientY - pointerDown[1].clientY,\r
+
+  \      );\r
+
+  \r
+
+  \      if (prevDiff > 0) {\r
+
+  \        if (curDiff > prevDiff) {\r
+
+  \          targetDistance += -curDiff * this.getAttribute(\"zoomSpeed\") * 0.01;\r
+
+  \          targetDistance = Math.max(this.getAttribute(\"minDistance\"), Math.min(this.getAttribute(\"maxDistance\"), targetDistance));\r
+
+  \        }\r
+
+  \        if (curDiff < prevDiff) {\r
+
+  \          targetDistance += curDiff * this.getAttribute(\"zoomSpeed\") * 0.01;\r
+
+  \          targetDistance = Math.max(this.getAttribute(\"minDistance\"), Math.min(this.getAttribute(\"maxDistance\"), targetDistance));\r
+
+  \        }\r
+
+  \      }\r
+
+  \r
+
+  \      // Cache the distance for the next move event\r
+
+  \      prevDiff = curDiff;\r
+
+  \    }\r
+
+  \  };\r
+
+  \r
+
+  \  onPointerUpFn = (e) => {\r
+
+  \    isDragging = false;\r
+
+  \r
+
+  \    if (pointerDown.length === 0) return;\r
+
+  \    const index = pointerDown.findIndex(\r
+
+  \      (cachedEv) => cachedEv.pointerId === e.pointerId,\r
+
+  \    );\r
+
+  \    pointerDown.splice(index, 1);\r
+
+  \r
+
+  \    if (pointerDown.length < 2) {\r
+
+  \      prevDiff = -1;\r
+
+  \    }\r
+
+  \  };\r
+
+  \r
+
+  \  onWheelFn = (e) => {\r
+
+  \    e.preventDefault();\r
+
+  \    targetDistance += e.deltaY * this.getAttribute(\"zoomSpeed\") * 0.01;\r
+
+  \    targetDistance = Math.max(this.getAttribute(\"minDistance\"), Math.min(this.getAttribute(\"maxDistance\"), targetDistance));\r
+
+  \  };\r
+
+  \r
+
+  \  canvas.addEventListener(\"pointerdown\", onPointerDownFn) // @check-ok\r
+
+  \  canvas.addEventListener(\"pointermove\", onPointerMoveFn); // @check-ok\r
+
+  \  canvas.addEventListener(\"pointerup\", onPointerUpFn) // @check-ok\r
+
+  \  canvas.addEventListener(\"pointerleave\", onPointerUpFn); // @check-ok\r
+
+  \  canvas.addEventListener(\"wheel\", onWheelFn, { passive: false }); // @check-ok\r
+
+  };\r
+
+  \r
+
+  this.update = function (deltaTime) {\r
+
+  \  if (!game || !game.camera) return;\r
+
+  \  updateCameraPosition(game.camera, this.getAttribute(\"smoothing\"));\r
+
+  };\r
+
+  \r
+
+  this.dispose = function () {\r
+
+  \  if (canvas) {\r
+
+  \    if (onPointerDownFn) canvas.removeEventListener(\"pointerdown\", onPointerDownFn) // @check-ok complex input\r
+
+  \    if (onPointerMoveFn) canvas.removeEventListener(\"pointermove\", onPointerMoveFn);\r
+
+  \    if (onPointerUpFn) {\r
+
+  \      canvas.removeEventListener(\"pointerup\", onPointerUpFn) // @check-ok complex input\r
+
+  \      canvas.removeEventListener(\"pointerleave\", onPointerUpFn);\r
+
+  \    }\r
+
+  \    if (onWheelFn) canvas.removeEventListener(\"wheel\", onWheelFn);\r
+
+  \  }\r
+
+  \  onPointerDownFn = null;\r
+
+  \  onPointerMoveFn = null;\r
+
+  \  onPointerUpFn = null;\r
+
+  \  onWheelFn = null;\r
+
+  \  canvas = null;\r
+
+  };\r
+
+  \r
+
+  this.onEvent = function (msg, data) {\r
+
+  \  if (msg === \"resetCamera\") {\r
+
+  \    azimuth = -Math.PI;\r
+
+  \    polar = Math.PI / 3;\r
+
+  \    distance = 14;\r
+
+  \    targetAzimuth = azimuth;\r
+
+  \    targetPolar = polar;\r
+
+  \    targetDistance = distance;\r
+
+  \  }\r
+
+  };"

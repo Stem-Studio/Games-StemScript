@@ -1,0 +1,142 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+config:
+  priority: 0
+  name: "FP3-Birds"
+  id: "fp3.birds"
+  author: "flight-sim"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "InstancedMesh bird flock circling near the player"
+  tags:
+    - gameplay
+  attributes: {}
+  documentation: "Spawns ~30 birds as an InstancedMesh with flapping wing animation. Birds circle in groups and drift toward the player position. Altitude ranges from GROUND_LEVEL+20 to GROUND_LEVEL+60."
+code: |
+  const SEA_LEVEL = 0;
+  const GROUND_LEVEL = 10;
+  const BIRD_COUNT = 30;
+
+  let game;
+  let store;
+  const disposables = [];
+  let birdMesh = null;
+  let birdData = [];
+  const dummy = new THREE.Object3D();
+  const tempMatrix = new THREE.Matrix4();
+
+  function trackGeo(geo) { disposables.push(geo); return geo; }
+  function trackMat(mat) { disposables.push(mat); return mat; }
+
+  this.init = function(_game) {
+    game = _game;
+    store = this.erth.store;
+
+    // Build wing geometry: two flat box wings merged via a group trick
+    // We use a single box per bird instance and scale it to look like wings
+    const wingGeo = trackGeo(new THREE.BoxGeometry(1.5, 0.05, 0.5));
+    const wingMat = trackMat(new THREE.MeshStandardNodeMaterial({
+      color: 0x222222,
+      side: THREE.DoubleSide
+    }));
+
+    birdMesh = new THREE.InstancedMesh(wingGeo, wingMat, BIRD_COUNT * 2);
+    birdMesh.userData.isRuntimeOnly = true;
+    birdMesh.frustumCulled = false;
+
+    // Initialize bird data
+    for (let i = 0; i < BIRD_COUNT; i++) {
+      const angle = Math.random() * Math.PI * 2;
+      const radius = 30 + Math.random() * 170;
+      const altitude = GROUND_LEVEL + 20 + Math.random() * 40;
+      const orbitSpeed = 0.2 + Math.random() * 0.3;
+      const flapSpeed = 3 + Math.random() * 4;
+      const flapPhase = Math.random() * Math.PI * 2;
+      const groupAngleOffset = Math.floor(i / 5) * (Math.PI * 2 / 6);
+
+      birdData.push({
+        angle: angle + groupAngleOffset,
+        radius,
+        altitude,
+        orbitSpeed,
+        flapSpeed,
+        flapPhase,
+        centerX: 0,
+        centerZ: 0
+      });
+    }
+
+    this.gameObject._internal.three.add(birdMesh);
+  };
+
+  this.update = function(deltaTime) {
+    if (!birdMesh || !game) return;
+
+    const dt = Math.min(deltaTime, 0.1);
+    const time = Date.now() * 0.001;
+
+    // Slowly drift bird center toward player
+    const playerPos = store.get('fp3_playerPosition');
+    let playerX = 0, playerZ = 0;
+    if (playerPos) {
+      playerX = playerPos.x;
+      playerZ = playerPos.z;
+    }
+
+    for (let i = 0; i < BIRD_COUNT; i++) {
+      const b = birdData[i];
+
+      // Drift center toward player
+      b.centerX += (playerX - b.centerX) * 0.001;
+      b.centerZ += (playerZ - b.centerZ) * 0.001;
+
+      b.angle += b.orbitSpeed * dt;
+
+      const x = b.centerX + Math.cos(b.angle) * b.radius;
+      const z = b.centerZ + Math.sin(b.angle) * b.radius;
+      const y = b.altitude + Math.sin(time * 0.5 + i) * 2;
+
+      const flapAngle = Math.sin(time * b.flapSpeed + b.flapPhase) * 0.5;
+
+      // Left wing
+      const li = i * 2;
+      dummy.position.set(x - 0.6, y, z);
+      dummy.rotation.set(0, b.angle + Math.PI / 2, flapAngle);
+      dummy.scale.set(1, 1, 1);
+      dummy.updateMatrix();
+      birdMesh.setMatrixAt(li, dummy.matrix);
+
+      // Right wing
+      const ri = i * 2 + 1;
+      dummy.position.set(x + 0.6, y, z);
+      dummy.rotation.set(0, b.angle + Math.PI / 2, -flapAngle);
+      dummy.scale.set(1, 1, 1);
+      dummy.updateMatrix();
+      birdMesh.setMatrixAt(ri, dummy.matrix);
+    }
+
+    birdMesh.instanceMatrix.needsUpdate = true;
+  };
+
+  this.dispose = function() {
+    if (birdMesh && birdMesh.parent) {
+      birdMesh.parent.remove(birdMesh);
+    }
+    for (const d of disposables) {
+      if (d.dispose) d.dispose();
+    }
+    disposables.length = 0;
+    birdMesh = null;
+    birdData = [];
+  };
+
+  this.onEditorAdded = function() {
+    // No editor preview for runtime-only procedural geometry
+  };
+
+  this.onEditorDispose = function() {
+    // Nothing to clean up in editor
+  };

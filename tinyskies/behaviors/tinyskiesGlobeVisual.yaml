@@ -1,0 +1,252 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Globe Visual"
+  id: "tinyskies.globeVisual"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Procedural deformed globe + atmosphere shell. Sphere vertices are radially displaced by simplex-noise terrain and colored by biome (ocean / shallow / beach / grass / rock / snow). Atmosphere uniform glow color stays driven by the day/night cycle."
+  documentation: "Generates a SphereGeometry, walks every vertex (segments+1)² and displaces radially via terrain.surfaceDisplacementAt(seed, terrainType, n). Per-vertex colors written from terrain elevation/depth for biome shading. Atmosphere shell unchanged. Surface still tagged userData.tinyskiesGlobeSurface=true so the paintball system can find it. The day/night ocean tint store key (`tinyskies/oceanShallow`) is no longer consumed — vertex colors dominate; atmosphere glow stays live."
+  tags:
+    - visual
+    - environment
+    - terrain
+  priority: 0
+  throttleConfig:
+    throttlePriority: "HIGH"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: false
+  attributes:
+    radius:
+      name: "Globe Radius"
+      type: "number"
+      default: 5
+      min: 0.5
+      max: 200
+    segments:
+      name: "Sphere Segments"
+      type: "number"
+      default: 128
+      min: 32
+      max: 512
+    terrainSeed:
+      name: "Terrain Seed"
+      type: "number"
+      default: 42
+      min: 1
+      max: 1000000
+    terrainType:
+      name: "Terrain Type"
+      type: "string"
+      default: "default"
+    atmosphereGlow:
+      name: "Atmosphere Glow"
+      type: "color"
+      default: "#eeddbb"
+    atmosphereScale:
+      name: "Atmosphere Shell Scale"
+      type: "number"
+      default: 1.045
+      min: 1.0
+      max: 1.5
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  @import "terrain" as T;
+
+  const LOG_TAG = "[tinyskies.globeVisual]";
+
+  // Biome color palette — from elevation in [0, 1] for land, depth in [0, 1] for ocean.
+  // Land ramp: beach → grass → forest → rock → snow.
+  // Ocean ramp: shallow → mid → deep.
+  const COLOR_DEEP_OCEAN = [0.05, 0.16, 0.34];
+  const COLOR_MID_OCEAN  = [0.10, 0.34, 0.56];
+  const COLOR_SHALLOW_OCEAN = [0.16, 0.55, 0.63];
+  const COLOR_BEACH = [0.92, 0.81, 0.47];
+  const COLOR_GRASS = [0.30, 0.49, 0.23];
+  const COLOR_FOREST = [0.20, 0.37, 0.16];
+  const COLOR_ROCK = [0.41, 0.38, 0.34];
+  const COLOR_SNOW = [0.93, 0.92, 0.88];
+
+  function lerp3(a, b, t) {
+    return [
+      a[0] + (b[0] - a[0]) * t,
+      a[1] + (b[1] - a[1]) * t,
+      a[2] + (b[2] - a[2]) * t,
+    ];
+  }
+
+  function biomeColor(sample) {
+    if (!sample.isLand) {
+      // Ocean ramp by depth: 0 (just at threshold) → 1 (deep).
+      const d = sample.depth;
+      if (d < 0.4) return lerp3(COLOR_SHALLOW_OCEAN, COLOR_MID_OCEAN, d / 0.4);
+      return lerp3(COLOR_MID_OCEAN, COLOR_DEEP_OCEAN, (d - 0.4) / 0.6);
+    }
+    const e = sample.elevation;
+    // Wider, more saturated beach band so coastlines read clearly from
+    // overworld view (matches source visual fidelity reference).
+    if (e < 0.04) return COLOR_BEACH.slice();
+    if (e < 0.12) return lerp3(COLOR_BEACH, COLOR_GRASS, (e - 0.04) / 0.08);
+    if (e < 0.34) return lerp3(COLOR_GRASS, COLOR_FOREST, (e - 0.12) / 0.22);
+    if (e < 0.62) return lerp3(COLOR_FOREST, COLOR_ROCK, (e - 0.34) / 0.28);
+    return lerp3(COLOR_ROCK, COLOR_SNOW, Math.min(1, (e - 0.62) / 0.30));
+  }
+
+  // FIDELITY NOTE: source Globe.ts (Globe.ts:52-74) uses raw GLSL ShaderMaterial
+  // for the atmosphere shell. WebGPU-only engine ⇒ TSL fresnel below reproduces
+  // the same `inner * outer * pow(rim, 1.8) * 0.22` intensity. Visual identical.
+
+  let game;
+
+  this.init = function (_game) {
+    game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._buildVisuals(this.gameObject._internal.three);
+    this._log("init");
+  };
+
+  this.onEditorAdded = function (editor) {
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._buildVisuals(this.gameObject._internal.three);
+  };
+
+  this.onEditorAttributesUpdated = function () {
+    this._teardownVisuals();
+    this._buildVisuals(this.gameObject._internal.three);
+  };
+
+  this.onEditorDispose = function () {
+    this._teardownVisuals();
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    this._teardownVisuals();
+  };
+
+  this._buildVisuals = function (parent) {
+    const radius = this.getAttribute("radius");
+    const segments = this.getAttribute("segments");
+    const terrainSeed = this.getAttribute("terrainSeed");
+    const terrainType = this.getAttribute("terrainType");
+    const atmosphereGlow = new THREE.Color(this.getAttribute("atmosphereGlow"));
+    const atmosphereScale = this.getAttribute("atmosphereScale");
+
+    const root = new THREE.Group();
+    root.name = "tinyskiesGlobeRoot";
+    root.userData.isRuntimeOnly = true;
+
+    const TSL = THREE.TSL;
+
+    // Surface — sphere geometry with per-vertex radial displacement (terrain
+    // height) + per-vertex color (biome). Pre-computed once at init; never
+    // reshapes at runtime.
+    const surfaceGeo = new THREE.SphereGeometry(radius, segments, segments);
+    const posAttr = surfaceGeo.attributes.position;
+    const vertCount = posAttr.count;
+    const colorArr = new Float32Array(vertCount * 3);
+    for (let i = 0; i < vertCount; i++) {
+      const x = posAttr.getX(i);
+      const y = posAttr.getY(i);
+      const z = posAttr.getZ(i);
+      const len = Math.sqrt(x * x + y * y + z * z) || 1;
+      const nx = x / len, ny = y / len, nz = z / len;
+      const sample = T.sampleTerrain(terrainSeed, terrainType, nx, ny, nz);
+      const disp = sample.isLand
+        ? T.surfaceDisplacementAt(terrainSeed, terrainType, nx, ny, nz)
+        : -0.01 * sample.depth; // matches OCEAN_DEPTH constant inside terrain.js
+      const newR = radius + disp;
+      posAttr.setXYZ(i, nx * newR, ny * newR, nz * newR);
+      const color = biomeColor(sample);
+      colorArr[i * 3]     = color[0];
+      colorArr[i * 3 + 1] = color[1];
+      colorArr[i * 3 + 2] = color[2];
+    }
+    posAttr.needsUpdate = true;
+    surfaceGeo.computeVertexNormals();
+    surfaceGeo.setAttribute("color", new THREE.BufferAttribute(colorArr, 3));
+
+    const surfaceMat = new THREE.MeshStandardNodeMaterial({
+      roughness: 0.7,
+      metalness: 0.0,
+      flatShading: true,
+    });
+    surfaceMat.colorNode = TSL.attribute("color");
+
+    const surface = new THREE.Mesh(surfaceGeo, surfaceMat);
+    surface.userData.isRuntimeOnly = true;
+    surface.userData.tinyskiesGlobeSurface = true;
+    surface.castShadow = false;
+    surface.receiveShadow = true;
+    root.add(surface);
+
+    // Atmosphere shell — TSL fresnel matching the source's intensity formula.
+    // Glow color is a uniform so the day/night cycle can retint per frame.
+    const atmosGlowUniform = TSL.uniform(new THREE.Color().copy(atmosphereGlow));
+    const viewDir = TSL.normalize(TSL.sub(TSL.cameraPosition, TSL.positionWorld));
+    const nW = TSL.normalize(TSL.positionWorld); // sphere centered at parent origin
+    const rim = TSL.sub(TSL.float(1.0), TSL.dot(viewDir, nW));
+    const inner = TSL.smoothstep(TSL.float(0.05), TSL.float(0.5), rim);
+    const outer = TSL.sub(TSL.float(1.0), TSL.smoothstep(TSL.float(0.7), TSL.float(1.0), rim));
+    const intensity = inner.mul(outer).mul(TSL.pow(rim, TSL.float(1.8))).mul(TSL.float(0.22));
+    const atmosMat = new THREE.MeshBasicNodeMaterial({
+      side: THREE.BackSide,
+      blending: THREE.AdditiveBlending,
+      transparent: true,
+      depthWrite: false,
+    });
+    atmosMat.colorNode = atmosGlowUniform.mul(intensity);
+    atmosMat.opacityNode = intensity;
+    const atmosGeo = new THREE.SphereGeometry(radius * atmosphereScale, segments, segments);
+    const atmosphere = new THREE.Mesh(atmosGeo, atmosMat);
+    atmosphere.userData.isRuntimeOnly = true;
+    root.add(atmosphere);
+
+    parent.add(root);
+
+    this._root = root;
+    this._surfaceMesh = surface;
+    this._atmosGlowUniform = atmosGlowUniform;
+    this._tmpColor = new THREE.Color();
+  };
+
+  this.update = function () {
+    if (!this._atmosGlowUniform) return;
+    // Surface color is per-vertex (biome) — no longer driven from store.
+    // Atmosphere glow stays live so day → evening → night still re-tints the rim.
+    const atmosGlowStored = this.erth.store.get("tinyskies/atmosphereGlow");
+    if (atmosGlowStored && this._atmosGlowUniform.value) {
+      this._atmosGlowUniform.value.copy(atmosGlowStored);
+    }
+  };
+
+  this._teardownVisuals = function () {
+    if (!this._root) return;
+    this._root.traverse((child) => {
+      if (child.geometry && typeof child.geometry.dispose === "function") child.geometry.dispose();
+      if (child.material) {
+        if (Array.isArray(child.material)) {
+          for (const m of child.material) if (m && typeof m.dispose === "function") m.dispose();
+        } else if (typeof child.material.dispose === "function") {
+          child.material.dispose();
+        }
+      }
+    });
+    if (this._root.parent) this._root.parent.remove(this._root);
+    this._root = null;
+    this._surfaceMesh = null;
+  };

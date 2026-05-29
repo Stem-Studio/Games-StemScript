@@ -1,0 +1,287 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Carpet Landmark Selfie Quest"
+  id: "tinyskies.selfieQuest"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Carpet-only quest: hover with the player's surface normal aligned to a landmark's normal (dot > ENTER_DOT) to fill a progress ring. First completion of each site grants XP. Source-faithful port of CarpetLandmarkSelfieQuest.ts (127 LOC)."
+  documentation: "Reads landmark normals from four published store keys: hotsprings (biomeDecor), shrines (landmarks), mushrooms (vegetation), butterflies (biomeDecor). Active only while vehicleType==='carpet'. Decay rate 0.3, fill rate 1/1.5 (0.667/s), enter dot 0.995 — verbatim from source. On completion, marks the site done in-memory (cross-session persistence will arrive with the Game Services pass), publishes `tinyskies/awardXp` (default 40 = LANDMARK_SELFIE_XP), and writes `tinyskies/selfieTaken` with {kind, kindIndex} for any progression listener."
+  tags:
+    - gameplay
+    - quest
+  priority: 0
+  throttleConfig:
+    throttlePriority: "HIGH"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    globeRadius:
+      name: "Globe Radius"
+      type: "number"
+      default: 5
+      min: 0.1
+      max: 200
+    hotspringNormalsStoreKey:
+      name: "Hotspring Normals Store Key"
+      type: "string"
+      default: "tinyskies/hotspringNormals"
+    shrineNormalsStoreKey:
+      name: "Shrine Normals Store Key"
+      type: "string"
+      default: "tinyskies/shrineNormals"
+    mushroomNormalsStoreKey:
+      name: "Mushroom Normals Store Key"
+      type: "string"
+      default: "tinyskies/mushroomNormals"
+    butterflyNormalsStoreKey:
+      name: "Butterfly Normals Store Key"
+      type: "string"
+      default: "tinyskies/butterflyNormals"
+    selfieXpAmount:
+      name: "Selfie XP Amount"
+      type: "number"
+      default: 40
+      min: 0
+      max: 1000
+    selfieXpStoreKey:
+      name: "Selfie XP Award Key"
+      type: "string"
+      default: "tinyskies/awardXp"
+    selfieTakenStoreKey:
+      name: "Selfie Taken Event Key"
+      type: "string"
+      default: "tinyskies/selfieTaken"
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  @import "spherical-math" as S;
+
+  const LOG_TAG = "[tinyskies.selfieQuest]";
+
+  // Source CarpetLandmarkSelfieQuest.ts:4-7 — verbatim.
+  const FILL_RATE = 1 / 1.5;
+  const DECAY_RATE = 0.3;
+  const ENTER_DOT = 0.995;
+
+  const KIND_HOTSPRING = "hotspring";
+  const KIND_SHRINE = "shrine";
+  const KIND_MUSHROOM = "mushroom";
+  const KIND_BUTTERFLY = "butterfly";
+
+  this.init = function (_game) {
+    this._game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+
+    this._tmpQ = new THREE.Quaternion();
+    this._tmpUp = new THREE.Vector3();
+    this._tmpSiteNormal = new THREE.Vector3();
+
+    this._sites = null;
+    this._sitesPublishedHash = "";
+    this._progress = 0;
+    this._activeSiteIndex = -1;
+
+    this._buildHud();
+    this._log("init");
+  };
+
+  // Build a flat sites array from the 4 store-published normals lists.
+  // Idempotent — rebuilds only when the underlying counts change.
+  this._refreshSites = function () {
+    const store = this.erth.store;
+    const hot = store.get(this.getAttribute("hotspringNormalsStoreKey")) || [];
+    const shr = store.get(this.getAttribute("shrineNormalsStoreKey")) || [];
+    const mus = store.get(this.getAttribute("mushroomNormalsStoreKey")) || [];
+    const but = store.get(this.getAttribute("butterflyNormalsStoreKey")) || [];
+    const hash = hot.length + ":" + shr.length + ":" + mus.length + ":" + but.length;
+    if (hash === this._sitesPublishedHash && this._sites) return;
+    this._sitesPublishedHash = hash;
+
+    const sites = [];
+    for (let i = 0; i < hot.length; i++) {
+      const n = hot[i].normal; sites.push({ kind: KIND_HOTSPRING, kindIndex: i, normal: [n[0], n[1], n[2]], completed: false });
+    }
+    for (let i = 0; i < shr.length; i++) {
+      const n = shr[i].normal; sites.push({ kind: KIND_SHRINE, kindIndex: i, normal: [n[0], n[1], n[2]], completed: false });
+    }
+    for (let i = 0; i < mus.length; i++) {
+      const n = mus[i].normal; sites.push({ kind: KIND_MUSHROOM, kindIndex: i, normal: [n[0], n[1], n[2]], completed: false });
+    }
+    for (let i = 0; i < but.length; i++) {
+      const n = but[i].normal; sites.push({ kind: KIND_BUTTERFLY, kindIndex: i, normal: [n[0], n[1], n[2]], completed: false });
+    }
+    this._sites = sites;
+    this._log("sites refreshed", sites.length);
+  };
+
+  // -----------------------------------------------------------------
+  // HUD: progress ring.
+  // -----------------------------------------------------------------
+  this._buildHud = function () {
+    if (typeof UIKit === "undefined" || !this._game || !this._game.renderer) return;
+    if (this._fullscreen) return;
+    try {
+      const fs = new UIKit.Fullscreen(this._game.renderer, { // @check-ok-responsive — selfie progress text
+        backgroundOpacity: 0,
+        flexDirection: "column",
+        justifyContent: "flex-end",
+        alignItems: "center",
+        pointerEvents: "none",
+        visibility: "visible",
+      });
+      this._fullscreen = fs;
+
+      this._labelText = new UIKit.Text({
+        text: "",
+        fontSize: 32,
+        color: 0xfff4a8,
+        visibility: "hidden",
+        positionType: "absolute",
+        positionBottom: 96,
+      });
+      fs.add(this._labelText);
+
+      this._progressText = new UIKit.Text({
+        text: "",
+        fontSize: 22,
+        color: 0xffffff,
+        visibility: "hidden",
+        positionType: "absolute",
+        positionBottom: 60,
+      });
+      fs.add(this._progressText);
+    } catch (e) {
+      this._log("uikit hud build failed", e);
+    }
+  };
+
+  this._tickHud = function () {
+    if (!this._fullscreen) { this._buildHud(); return; }
+    if (this._game && this._game.uiCamera && !this._fullscreen.parent) {
+      this._game.uiCamera.add(this._fullscreen);
+    }
+    if (this._game && this._game.renderer && this._game.renderer.domElement && typeof this._fullscreen.update === "function") {
+      this._fullscreen.update(this._game.renderer.domElement.clientWidth, this._game.renderer.domElement.clientHeight);
+    }
+  };
+
+  this._setHud = function (kind, progress) {
+    if (!this._labelText || !this._progressText) return;
+    if (progress <= 0 || !kind) {
+      this._labelText.setProperties({ visibility: "hidden" });
+      this._progressText.setProperties({ visibility: "hidden" });
+      return;
+    }
+    const niceKind = kind.charAt(0).toUpperCase() + kind.slice(1);
+    this._labelText.setProperties({ text: "Hold for " + niceKind + " selfie", visibility: "visible" });
+    const pct = Math.round(progress * 100);
+    this._progressText.setProperties({ text: pct + "%", visibility: "visible" });
+  };
+
+  // -----------------------------------------------------------------
+  // Update — source CarpetLandmarkSelfieQuest.update body verbatim.
+  // -----------------------------------------------------------------
+  this.update = function (deltaTime) {
+    const dt = Math.min(deltaTime, 0.1);
+    this._tickHud();
+
+    const store = this.erth.store;
+    const vehicle = store.get("tinyskies/vehicleType") || "plane";
+    const isCarpet = (vehicle === "carpet");
+
+    if (!isCarpet) {
+      if (this._progress > 0) {
+        this._progress = 0;
+        this._activeSiteIndex = -1;
+        this._setHud(null, 0);
+      }
+      return;
+    }
+
+    this._refreshSites();
+    if (!this._sites || this._sites.length === 0) return;
+
+    const qx = store.get("tinyskies/qx");
+    const qy = store.get("tinyskies/qy");
+    const qz = store.get("tinyskies/qz");
+    const qw = store.get("tinyskies/qw");
+    if (qx === undefined || qy === undefined || qz === undefined || qw === undefined) return;
+    this._tmpQ.set(qx, qy, qz, qw);
+    // Player surface normal = local +Y rotated by qPosition.
+    this._tmpUp.set(0, 1, 0).applyQuaternion(this._tmpQ).normalize();
+
+    let bestIdx = -1;
+    let bestDot = -1;
+    for (let i = 0; i < this._sites.length; i++) {
+      const s = this._sites[i];
+      if (s.completed) continue;
+      const d = this._tmpUp.x * s.normal[0] + this._tmpUp.y * s.normal[1] + this._tmpUp.z * s.normal[2];
+      if (d > ENTER_DOT && d > bestDot) {
+        bestDot = d;
+        bestIdx = i;
+      }
+    }
+
+    if (bestIdx < 0) {
+      this._progress = Math.max(0, this._progress - DECAY_RATE * dt);
+      if (this._progress === 0) this._activeSiteIndex = -1;
+      this._setHud(this._activeSiteIndex >= 0 ? this._sites[this._activeSiteIndex].kind : null, this._progress);
+      return;
+    }
+
+    if (this._activeSiteIndex !== -1 && this._activeSiteIndex !== bestIdx) {
+      this._progress = 0;
+    }
+    this._activeSiteIndex = bestIdx;
+
+    const site = this._sites[bestIdx];
+    const next = Math.min(1, this._progress + FILL_RATE * dt);
+    if (this._progress < 1 && next >= 1) {
+      site.completed = true;
+      this._progress = 0;
+      this._activeSiteIndex = -1;
+      this._setHud(null, 0);
+      // Source onPhotoTaken — XP + selfie payload.
+      this.erth.store.set(this.getAttribute("selfieXpStoreKey"), {
+        amount: this.getAttribute("selfieXpAmount"),
+        source: "selfie",
+        kind: site.kind,
+        kindIndex: site.kindIndex,
+      });
+      this.erth.store.set(this.getAttribute("selfieTakenStoreKey"), {
+        kind: site.kind, kindIndex: site.kindIndex, t: Date.now(),
+      });
+      this._log("selfie taken", site.kind, site.kindIndex);
+      return;
+    }
+
+    this._progress = next;
+    this._setHud(site.kind, this._progress);
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    if (this._fullscreen && typeof this._fullscreen.dispose === "function") {
+      try { this._fullscreen.dispose(); } catch (_e) { /* ignore */ }
+    }
+    this._fullscreen = null;
+    this._labelText = null;
+    this._progressText = null;
+    this._sites = null;
+  };
+
+  // No editor preview — selfie quest renders nothing in the editor; it
+  // only provides a small UIKit progress display while a carpet hovers
+  // exactly aligned with a landmark normal. // @check-ok no editor preview

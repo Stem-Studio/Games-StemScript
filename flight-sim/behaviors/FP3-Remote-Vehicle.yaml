@@ -1,0 +1,279 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  priority: 0
+  name: "FP3 Remote Vehicle"
+  id: "fp3.remoteVehicle"
+  author: "flight-sim"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Renders remote player vehicles with position interpolation and name labels"
+  tags:
+    - gameplay
+  attributes: {}
+  documentation: Watches fp3_remotePlayers store key and manages simplified vehicle
+    meshes for each remote player. Interpolates position and rotation smoothly,
+    displays player name labels above vehicles, and cleans up meshes when players leave.
+
+code: |
+  let game;
+  let store;
+
+  // --- Constants ---
+  let LERP_SPEED = 15;
+  let LABEL_HEIGHT = 8;
+  let SEA_LEVEL = 0;
+  let GROUND_LEVEL = 10;
+
+  // --- Pre-allocated temporaries ---
+  const _tmpVec = new THREE.Vector3();
+  const _tmpEuler = new THREE.Euler();
+
+  // --- State ---
+  let vehicleMeshes = {};
+  let nameLabels = {};
+  let targetPositions = {};
+  let targetRotations = {};
+  let parentObj = null;
+  let materials = [];
+  let geometries = [];
+
+  this.init = function(_game) {
+    game = _game;
+    store = this.erth.store;
+  };
+
+  this.onStart = function() {
+    parentObj = this.gameObject._internal.three;
+  };
+
+  function createMaterial(color) {
+    let mat = new THREE.MeshStandardNodeMaterial({ color: color });
+    materials.push(mat);
+    return mat;
+  }
+
+  function createGeometry(geo) {
+    geometries.push(geo);
+    return geo;
+  }
+
+  function buildCessna() {
+    let group = new THREE.Group();
+    // Body
+    let bodyGeo = createGeometry(new THREE.BoxGeometry(1.5, 1, 5));
+    let bodyMat = createMaterial(0x4488cc);
+    let body = new THREE.Mesh(bodyGeo, bodyMat);
+    group.add(body);
+    // Wings
+    let wingGeo = createGeometry(new THREE.BoxGeometry(10, 0.2, 2));
+    let wingMat = createMaterial(0x5599dd);
+    let wings = new THREE.Mesh(wingGeo, wingMat);
+    wings.position.set(0, 0.3, 0);
+    group.add(wings);
+    // Tail
+    let tailGeo = createGeometry(new THREE.BoxGeometry(3, 0.2, 1));
+    let tailMat = createMaterial(0x5599dd);
+    let tail = new THREE.Mesh(tailGeo, tailMat);
+    tail.position.set(0, 0.8, -2.2);
+    group.add(tail);
+    return group;
+  }
+
+  function buildF16() {
+    let group = new THREE.Group();
+    // Body
+    let bodyGeo = createGeometry(new THREE.BoxGeometry(1.2, 0.8, 6));
+    let bodyMat = createMaterial(0x777777);
+    let body = new THREE.Mesh(bodyGeo, bodyMat);
+    group.add(body);
+    // Delta wings
+    let wingGeo = createGeometry(new THREE.BoxGeometry(8, 0.15, 3));
+    let wingMat = createMaterial(0x888888);
+    let wings = new THREE.Mesh(wingGeo, wingMat);
+    wings.position.set(0, 0, 0.5);
+    group.add(wings);
+    return group;
+  }
+
+  function buildApache() {
+    let group = new THREE.Group();
+    // Body
+    let bodyGeo = createGeometry(new THREE.BoxGeometry(1.5, 1.5, 5));
+    let bodyMat = createMaterial(0x556633);
+    let body = new THREE.Mesh(bodyGeo, bodyMat);
+    group.add(body);
+    // Rotor cross
+    let rotorGeo1 = createGeometry(new THREE.BoxGeometry(10, 0.1, 0.3));
+    let rotorGeo2 = createGeometry(new THREE.BoxGeometry(0.3, 0.1, 10));
+    let rotorMat = createMaterial(0x333333);
+    let rotor1 = new THREE.Mesh(rotorGeo1, rotorMat);
+    let rotor2 = new THREE.Mesh(rotorGeo2, rotorMat);
+    rotor1.position.set(0, 1.2, 0);
+    rotor2.position.set(0, 1.2, 0);
+    group.add(rotor1);
+    group.add(rotor2);
+    return group;
+  }
+
+  function buildTank() {
+    let group = new THREE.Group();
+    // Body
+    let bodyGeo = createGeometry(new THREE.BoxGeometry(3, 1.2, 5));
+    let bodyMat = createMaterial(0x445522);
+    let body = new THREE.Mesh(bodyGeo, bodyMat);
+    group.add(body);
+    // Turret
+    let turretGeo = createGeometry(new THREE.BoxGeometry(1.5, 0.8, 1.5));
+    let turretMat = createMaterial(0x556633);
+    let turret = new THREE.Mesh(turretGeo, turretMat);
+    turret.position.set(0, 1, 0);
+    group.add(turret);
+    return group;
+  }
+
+  function buildCyberpink() {
+    let group = new THREE.Group();
+    // Body
+    let bodyGeo = createGeometry(new THREE.BoxGeometry(1.5, 0.8, 5));
+    let bodyMat = createMaterial(0xff44aa);
+    let body = new THREE.Mesh(bodyGeo, bodyMat);
+    group.add(body);
+    // Wings
+    let wingGeo = createGeometry(new THREE.BoxGeometry(8, 0.2, 2));
+    let wingMat = createMaterial(0xff66cc);
+    let wings = new THREE.Mesh(wingGeo, wingMat);
+    wings.position.set(0, 0.2, 0);
+    group.add(wings);
+    return group;
+  }
+
+  function buildVehicle(vehicleName) {
+    let name = (vehicleName || 'cessna').toLowerCase();
+    if (name === 'f16' || name === 'f-16') return buildF16();
+    if (name === 'apache') return buildApache();
+    if (name === 'tank') return buildTank();
+    if (name === 'cyberpink') return buildCyberpink();
+    return buildCessna();
+  }
+
+  function createNameLabel(username) {
+    let canvas = document.createElement('canvas');
+    canvas.width = 256;
+    canvas.height = 64;
+    let ctx = canvas.getContext('2d');
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0, 0, 256, 64);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 28px Arial';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(username || 'Pilot', 128, 32);
+
+    let texture = new THREE.CanvasTexture(canvas);
+    let spriteMat = new THREE.SpriteNodeMaterial({ map: texture, depthTest: false });
+    materials.push(spriteMat);
+    let sprite = new THREE.Sprite(spriteMat);
+    sprite.scale.set(8, 2, 1);
+    return sprite;
+  }
+
+  this.update = function(deltaTime) {
+    let dt = Math.min(deltaTime, 0.1);
+    let remoteData = store.get('fp3_remotePlayers');
+    if (!remoteData) return;
+
+    let playerIds = Object.keys(remoteData);
+
+    // Spawn or update each remote player
+    for (let i = 0; i < playerIds.length; i++) {
+      let pid = playerIds[i];
+      let data = remoteData[pid];
+
+      if (!vehicleMeshes[pid]) {
+        // Create new vehicle mesh
+        let mesh = buildVehicle(data.vehicleName);
+        mesh.userData.isRuntimeOnly = true;
+        mesh.position.set(data.x, data.y, data.z);
+        mesh.rotation.set(data.rx, data.ry, data.rz);
+        parentObj.add(mesh);
+        vehicleMeshes[pid] = mesh;
+
+        // Create name label
+        let label = createNameLabel(data.username);
+        label.userData.isRuntimeOnly = true;
+        label.position.set(0, LABEL_HEIGHT, 0);
+        mesh.add(label);
+        nameLabels[pid] = label;
+
+        _tmpVec.set(data.x, data.y, data.z);
+        targetPositions[pid] = _tmpVec.clone();
+        _tmpEuler.set(data.rx, data.ry, data.rz);
+        targetRotations[pid] = _tmpEuler.clone();
+      } else {
+        // Update targets for interpolation
+        targetPositions[pid].set(data.x, data.y, data.z);
+        targetRotations[pid].set(data.rx, data.ry, data.rz);
+      }
+    }
+
+    // Interpolate positions and rotations
+    let factor = 1 - Math.exp(-LERP_SPEED * dt);
+    let activeIds = Object.keys(vehicleMeshes);
+    for (let j = 0; j < activeIds.length; j++) {
+      let id = activeIds[j];
+      let mesh = vehicleMeshes[id];
+
+      if (!remoteData[id]) {
+        // Player left — remove mesh
+        parentObj.remove(mesh);
+        delete vehicleMeshes[id];
+        delete nameLabels[id];
+        delete targetPositions[id];
+        delete targetRotations[id];
+        continue;
+      }
+
+      let tp = targetPositions[id];
+      let tr = targetRotations[id];
+      mesh.position.lerp(tp, factor);
+      mesh.rotation.x += (tr.x - mesh.rotation.x) * factor;
+      mesh.rotation.y += (tr.y - mesh.rotation.y) * factor;
+      mesh.rotation.z += (tr.z - mesh.rotation.z) * factor;
+    }
+  };
+
+  this.dispose = function() {
+    // Remove all vehicle meshes
+    let ids = Object.keys(vehicleMeshes);
+    for (let i = 0; i < ids.length; i++) {
+      if (parentObj) parentObj.remove(vehicleMeshes[ids[i]]);
+    }
+    vehicleMeshes = {};
+    nameLabels = {};
+    targetPositions = {};
+    targetRotations = {};
+
+    // Dispose all geometries and materials
+    for (let g = 0; g < geometries.length; g++) {
+      geometries[g].dispose();
+    }
+    for (let m = 0; m < materials.length; m++) {
+      if (materials[m].map) materials[m].map.dispose();
+      materials[m].dispose();
+    }
+    geometries = [];
+    materials = [];
+  };
+
+  this.onEditorAdded = function() {
+    // No editor preview for runtime-only procedural geometry
+  };
+
+  this.onEditorDispose = function() {
+    // Nothing to clean up in editor
+  };

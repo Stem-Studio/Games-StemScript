@@ -1,0 +1,310 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  priority: 0
+  name: "FP3 Decorations"
+  id: "fp3.decorations"
+  author: "flight-sim"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Decorative world objects: mailbox, robot, UFO, hot air balloon, and banner"
+  tags:
+    - gameplay
+  attributes: {}
+  documentation: Creates miscellaneous decorative objects scattered around the world.
+    Includes a mailbox near the runway, an idle-animated robot, an orbiting UFO, a
+    drifting hot air balloon, and a FLY PIETER banner. All runtime-only with full disposal.
+
+code: |
+  let game;
+
+  // --- Constants ---
+  let GROUND_LEVEL = 10;
+  let SEA_LEVEL = 0;
+  let UFO_ORBIT_RADIUS = 100;
+  let UFO_ORBIT_SPEED = 0.1;
+  let UFO_ALTITUDE = 80;
+  let BALLOON_ALTITUDE = 60;
+  let BALLOON_DRIFT_SPEED = 0.02;
+
+  // --- State ---
+  let decorGroup = null;
+  let parentObj = null;
+  let geometries = [];
+  let materials = [];
+  let ufoGroup = null;
+  let ufoAngle = 0;
+  let balloonGroup = null;
+  let balloonAngle = 0;
+  let robotGroup = null;
+  let robotTime = 0;
+
+  this.init = function(_game) {
+    game = _game;
+  };
+
+  function makeMat(color, opts) {
+    let params = { color: color };
+    if (opts) {
+      if (opts.transparent) params.transparent = true;
+      if (opts.opacity !== undefined) params.opacity = opts.opacity;
+    }
+    let mat = new THREE.MeshStandardNodeMaterial(params);
+    materials.push(mat);
+    return mat;
+  }
+
+  function makeGeo(geo) {
+    geometries.push(geo);
+    return geo;
+  }
+
+  function addMesh(parent, geo, mat, x, y, z) {
+    let mesh = new THREE.Mesh(geo, mat);
+    mesh.position.set(x, y, z);
+    parent.add(mesh);
+    return mesh;
+  }
+
+  // =====================
+  // MAILBOX
+  // =====================
+  function buildMailbox(parent) {
+    let group = new THREE.Group();
+    group.position.set(5, GROUND_LEVEL, 80);
+
+    // Post
+    let postGeo = makeGeo(new THREE.CylinderGeometry(0.08, 0.08, 1, 6));
+    let postMat = makeMat(0x444444);
+    addMesh(group, postGeo, postMat, 0, 0.5, 0);
+
+    // Box
+    let boxGeo = makeGeo(new THREE.BoxGeometry(0.5, 0.4, 0.5));
+    let boxMat = makeMat(0x2255bb);
+    addMesh(group, boxGeo, boxMat, 0, 1.2, 0);
+
+    // Flag
+    let flagGeo = makeGeo(new THREE.BoxGeometry(0.05, 0.2, 0.05));
+    let flagMat = makeMat(0xcc0000);
+    addMesh(group, flagGeo, flagMat, 0.28, 1.3, 0);
+
+    group.userData.isRuntimeOnly = true;
+    parent.add(group);
+  }
+
+  // =====================
+  // ROBOT
+  // =====================
+  function buildRobot(parent) {
+    robotGroup = new THREE.Group();
+    robotGroup.position.set(10, GROUND_LEVEL, -10);
+
+    let silverMat = makeMat(0xcccccc);
+    let darkMat = makeMat(0x555555);
+    let redMat = makeMat(0xff0000);
+
+    // Body
+    let bodyGeo = makeGeo(new THREE.BoxGeometry(1, 1.5, 0.8));
+    addMesh(robotGroup, bodyGeo, silverMat, 0, 1.75, 0);
+
+    // Head
+    let headGeo = makeGeo(new THREE.BoxGeometry(0.8, 0.8, 0.8));
+    addMesh(robotGroup, headGeo, silverMat, 0, 2.9, 0);
+
+    // Eyes
+    let eyeGeo = makeGeo(new THREE.SphereGeometry(0.08, 8, 6));
+    addMesh(robotGroup, eyeGeo, redMat, -0.2, 3.0, 0.4);
+    addMesh(robotGroup, eyeGeo, redMat, 0.2, 3.0, 0.4);
+
+    // Arms
+    let armGeo = makeGeo(new THREE.CylinderGeometry(0.1, 0.1, 1.2, 6));
+    addMesh(robotGroup, armGeo, darkMat, -0.7, 1.8, 0);
+    addMesh(robotGroup, armGeo, darkMat, 0.7, 1.8, 0);
+
+    // Legs
+    let legGeo = makeGeo(new THREE.CylinderGeometry(0.12, 0.12, 1, 6));
+    addMesh(robotGroup, legGeo, darkMat, -0.3, 0.5, 0);
+    addMesh(robotGroup, legGeo, darkMat, 0.3, 0.5, 0);
+
+    robotGroup.userData.isRuntimeOnly = true;
+    parent.add(robotGroup);
+  }
+
+  // =====================
+  // UFO
+  // =====================
+  function buildUFO(parent) {
+    ufoGroup = new THREE.Group();
+    ufoGroup.position.set(UFO_ORBIT_RADIUS, GROUND_LEVEL + UFO_ALTITUDE, 0);
+
+    // Disc
+    let discGeo = makeGeo(new THREE.CylinderGeometry(4, 4, 0.5, 16));
+    let discMat = makeMat(0xcccccc);
+    addMesh(ufoGroup, discGeo, discMat, 0, 0, 0);
+
+    // Dome
+    let domeGeo = makeGeo(new THREE.SphereGeometry(2, 16, 8, 0, Math.PI * 2, 0, Math.PI / 2));
+    let domeMat = makeMat(0x22cc44, { transparent: true, opacity: 0.5 });
+    addMesh(ufoGroup, domeGeo, domeMat, 0, 0.25, 0);
+
+    // Bottom light
+    let lightGeo = makeGeo(new THREE.SphereGeometry(0.5, 8, 6));
+    let lightMat = makeMat(0xffff00, { transparent: true, opacity: 0.8 });
+    addMesh(ufoGroup, lightGeo, lightMat, 0, -0.4, 0);
+
+    ufoGroup.userData.isRuntimeOnly = true;
+    parent.add(ufoGroup);
+  }
+
+  // =====================
+  // HOT AIR BALLOON
+  // =====================
+  function buildBalloon(parent) {
+    balloonGroup = new THREE.Group();
+    balloonGroup.position.set(-50, GROUND_LEVEL + BALLOON_ALTITUDE, 100);
+
+    // Envelope
+    let envGeo = makeGeo(new THREE.SphereGeometry(5, 16, 12));
+    let envMat = makeMat(0xee3333);
+    addMesh(balloonGroup, envGeo, envMat, 0, 5, 0);
+
+    // Yellow stripe band (ring around middle)
+    let bandGeo = makeGeo(new THREE.TorusGeometry(4.8, 0.4, 8, 16));
+    let bandMat = makeMat(0xffcc00);
+    let band = addMesh(balloonGroup, bandGeo, bandMat, 0, 5, 0);
+    band.rotation.x = Math.PI / 2;
+
+    // Basket
+    let basketGeo = makeGeo(new THREE.BoxGeometry(2, 1.5, 2));
+    let basketMat = makeMat(0x885522);
+    addMesh(balloonGroup, basketGeo, basketMat, 0, -2, 0);
+
+    // Ropes (4 thin cylinders)
+    let ropeMat = makeMat(0x444444);
+    let ropePositions = [
+      { x: -0.8, z: -0.8 },
+      { x: 0.8, z: -0.8 },
+      { x: -0.8, z: 0.8 },
+      { x: 0.8, z: 0.8 }
+    ];
+    for (let i = 0; i < ropePositions.length; i++) {
+      let rp = ropePositions[i];
+      let ropeGeo = makeGeo(new THREE.CylinderGeometry(0.03, 0.03, 6, 4));
+      addMesh(balloonGroup, ropeGeo, ropeMat, rp.x, 1.5, rp.z);
+    }
+
+    balloonGroup.userData.isRuntimeOnly = true;
+    parent.add(balloonGroup);
+  }
+
+  // =====================
+  // BANNER
+  // =====================
+  function buildBanner(parent) {
+    let group = new THREE.Group();
+    group.position.set(0, GROUND_LEVEL + 30, -100);
+
+    // Banner plane
+    let bannerGeo = makeGeo(new THREE.BoxGeometry(20, 5, 0.1));
+    let bannerMat = makeMat(0x2244aa);
+    addMesh(group, bannerGeo, bannerMat, 0, 0, 0);
+
+    // Text overlay using canvas texture
+    let canvas = document.createElement('canvas');
+    canvas.width = 512;
+    canvas.height = 128;
+    let ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#2244aa';
+    ctx.fillRect(0, 0, 512, 128);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 64px Arial';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('FLY PIETER', 256, 64);
+
+    let texture = new THREE.CanvasTexture(canvas);
+    let textGeo = makeGeo(new THREE.PlaneGeometry(20, 5));
+    let textMat = new THREE.MeshBasicNodeMaterial({ map: texture, transparent: true });
+    materials.push(textMat);
+    let textMesh = addMesh(group, textGeo, textMat, 0, 0, 0.06);
+
+    // Back face
+    let textMeshBack = addMesh(group, textGeo, textMat, 0, 0, -0.06);
+    textMeshBack.rotation.y = Math.PI;
+
+    group.userData.isRuntimeOnly = true;
+    parent.add(group);
+  }
+
+  // =====================
+  // LIFECYCLE
+  // =====================
+  this.onStart = function() {
+    parentObj = this.gameObject._internal.three;
+    decorGroup = new THREE.Group();
+    decorGroup.userData.isRuntimeOnly = true;
+
+    buildMailbox(decorGroup);
+    buildRobot(decorGroup);
+    buildUFO(decorGroup);
+    buildBalloon(decorGroup);
+    buildBanner(decorGroup);
+
+    parentObj.add(decorGroup);
+  };
+
+  this.update = function(deltaTime) {
+    const dt = Math.min(deltaTime, 0.1);
+    // Robot idle animation
+    if (robotGroup) {
+      robotTime += dt;
+      robotGroup.rotation.y = Math.sin(robotTime * 0.8) * 0.3;
+    }
+
+    // UFO orbit
+    if (ufoGroup) {
+      ufoAngle += UFO_ORBIT_SPEED * dt;
+      ufoGroup.position.x = Math.cos(ufoAngle) * UFO_ORBIT_RADIUS;
+      ufoGroup.position.z = Math.sin(ufoAngle) * UFO_ORBIT_RADIUS;
+      ufoGroup.rotation.y = -ufoAngle;
+    }
+
+    // Balloon drift
+    if (balloonGroup) {
+      balloonAngle += BALLOON_DRIFT_SPEED * dt;
+      balloonGroup.position.x = -50 + Math.sin(balloonAngle) * 30;
+      balloonGroup.position.y = GROUND_LEVEL + BALLOON_ALTITUDE + Math.sin(balloonAngle * 1.5) * 3;
+    }
+  };
+
+  this.dispose = function() {
+    if (decorGroup && parentObj) {
+      parentObj.remove(decorGroup);
+    }
+    decorGroup = null;
+    ufoGroup = null;
+    balloonGroup = null;
+    robotGroup = null;
+
+    for (let i = 0; i < geometries.length; i++) {
+      geometries[i].dispose();
+    }
+    for (let j = 0; j < materials.length; j++) {
+      if (materials[j].map) materials[j].map.dispose();
+      materials[j].dispose();
+    }
+    geometries = [];
+    materials = [];
+  };
+
+  this.onEditorAdded = function() {
+    // No editor preview for runtime-only procedural geometry
+  };
+
+  this.onEditorDispose = function() {
+    // Nothing to clean up in editor
+  };

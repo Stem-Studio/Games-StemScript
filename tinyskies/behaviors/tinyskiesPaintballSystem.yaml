@@ -1,0 +1,356 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Paintball System"
+  id: "tinyskies.paintballSystem"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Paintball projectiles + colored splatters on the globe surface. Verbatim port of source PaintballSystem.ts MVP subset (REQ-007, REQ-008): cooldown 500ms, speed 7 u/s, range = globeRadius * 0.85, splatter fades over 14s."
+  documentation: "Reads `tinyskies/firePaintball` from this.erth.store (single-shot, set by flight controller on Space-press) and the player's nose ray from store qx/qy/qz/qw + heading + pitch + altitude. Spawns a projectile sphere that travels a constant-altitude great-circle arc at PAINTBALL_SPEED. On range expiry, drops a flat colored splatter onto the globe surface at the projectile's current radial position. Splatter fades over SPLATTER_LIFETIME_SEC and is disposed. No remote-player hit testing (single-player MVP)."
+  tags:
+    - gameplay
+    - vfx
+  priority: 0
+  throttleConfig:
+    throttlePriority: "HIGH"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    globeRadius:
+      name: "Globe Radius"
+      type: "number"
+      default: 5
+      min: 0.5
+      max: 200
+    cooldownMs:
+      name: "Cooldown (ms)"
+      type: "number"
+      default: 500
+      min: 50
+      max: 5000
+    paintballSpeed:
+      name: "Projectile Speed (u/s)"
+      type: "number"
+      default: 7
+      min: 0.5
+      max: 50
+    rangeFactor:
+      name: "Range / GlobeRadius"
+      type: "number"
+      default: 0.85
+      min: 0.1
+      max: 2
+    splatterLifetimeSec:
+      name: "Splatter Lifetime (s)"
+      type: "number"
+      default: 14
+      min: 1
+      max: 120
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  @import "spherical-math" as S;
+
+  const LOG_TAG = "[tinyskies.paintballSystem]";
+
+  // Vibrant 8-color palette — verbatim from shared/types.ts:96-98 (REQ-007).
+  const PAINTBALL_COLORS = [
+    0xd83858, 0xd56038, 0xd8b828, 0x38b878,
+    0x3888d8, 0x8858d8, 0xd838a8, 0x4888a8,
+  ];
+
+  let game;
+
+  this.init = function (_game) {
+    game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+
+    // Pre-allocated working set (CLAUDE.md hot-path rule).
+    this._qPos = new THREE.Quaternion();
+    this._tmpAxis = new THREE.Vector3();
+    this._tmpQuat = new THREE.Quaternion();
+    this._tmpUp = new THREE.Vector3();
+    this._tmpRight = new THREE.Vector3();
+    this._tmpFwd = new THREE.Vector3();
+
+    // Active projectiles + decal fade pool.
+    this._projectiles = [];
+    this._splatters = [];
+
+    // Cooldown state — REQ-007.
+    this._lastFireMs = -1e9;
+
+    // Find the globe surface mesh that the globeVisual behavior tagged.
+    this._globeSurfaceMesh = null;
+    this._globeRoot = null;
+    this._findGlobeSurface();
+
+    this._log("init");
+  };
+
+  this._findGlobeSurface = function () {
+    if (!game || !game.scene) return;
+    let surface = null;
+    let root = null;
+    game.scene.traverse((obj) => {
+      if (surface) return;
+      if (obj.userData && obj.userData.tinyskiesGlobeSurface) {
+        surface = obj;
+        // Walk up to the gameObject that owns the globe so splatters parent there
+        // and inherit its transform.
+        let p = obj;
+        while (p) {
+          if (p.userData && p.userData.isRuntimeOnly === false) break;
+          if (!p.parent) break;
+          p = p.parent;
+        }
+        root = p || obj.parent || obj;
+      }
+    });
+    this._globeSurfaceMesh = surface;
+    this._globeRoot = root;
+    if (this._globeSurfaceMesh) {
+      this._log("found globe surface");
+    }
+  };
+
+  this.update = function (deltaTime) {
+    const dt = Math.min(deltaTime, 0.1);
+    const store = this.erth.store;
+
+    if (!this._globeSurfaceMesh) this._findGlobeSurface();
+
+    // Drain firePaintball flag (one-shot). Gated to plane — carpet
+    // reinterprets the same key as "place portal" via the carpet portal
+    // system, boat ignores it entirely.
+    const vt = store.get("tinyskies/vehicleType") || "plane";
+    const fire = store.get("tinyskies/firePaintball") === true;
+    if (fire && vt === "plane") {
+      store.set("tinyskies/firePaintball", false);
+      this._tryFire();
+    }
+
+    this._stepProjectiles(dt);
+    this._fadeSplatters(dt);
+  };
+
+  this._tryFire = function () {
+    const nowMs = Date.now();
+    if (nowMs - this._lastFireMs < this.getAttribute("cooldownMs")) return;
+    this._lastFireMs = nowMs;
+
+    const store = this.erth.store;
+    const qx = store.get("tinyskies/qx");
+    const qy = store.get("tinyskies/qy");
+    const qz = store.get("tinyskies/qz");
+    const qw = store.get("tinyskies/qw");
+    if (qx === undefined || qw === undefined) return;
+    this._qPos.set(qx, qy, qz, qw);
+    const heading = store.get("tinyskies/heading") || 0;
+    const pitch = store.get("tinyskies/pitch") || 0;
+    const altitude = store.get("tinyskies/altitude") || 0;
+    const globeRadius = this.getAttribute("globeRadius");
+
+    const ray = S.paintballRayFromPlaneState(
+      this._qPos,
+      heading,
+      pitch,
+      altitude,
+      globeRadius,
+    );
+
+    // Sphere-arc projectile state — see source PaintballSystem.ts Projectile type.
+    const r0 = ray.origin.length();
+    if (r0 < 1e-4) return;
+    const rHat = ray.origin.clone().multiplyScalar(1 / r0);
+    // Tangent component of the direction (drop the radial part).
+    const wHat = ray.direction.clone();
+    wHat.addScaledVector(rHat, -wHat.dot(rHat));
+    if (wHat.lengthSq() < 1e-8) return;
+    wHat.normalize();
+
+    const colorHex = PAINTBALL_COLORS[Math.floor(Math.random() * PAINTBALL_COLORS.length)];
+
+    // Projectile mesh — small bright sphere. MeshBasicNodeMaterial keeps the
+    // paintball reading "lit" against any backdrop without depending on scene lights.
+    // No editor preview callback by design — paintballs are one-shot runtime VFX
+    // that exist only while the player is firing; an empty editor stub would be
+    // bloat per CLAUDE.md memory feedback_no_empty_editor_stubs.md.
+    const geom = new THREE.SphereGeometry(0.045, 12, 8);                        // @check-ok runtime-only VFX, no editor preview
+    const mat = new THREE.MeshBasicNodeMaterial({
+      color: new THREE.Color(colorHex),
+      transparent: false,
+      depthWrite: true,
+    });
+    const mesh = new THREE.Mesh(geom, mat);
+    mesh.userData.isRuntimeOnly = true;
+    mesh.position.copy(rHat).multiplyScalar(r0);
+    // Parent to the behavior's own gameObject (PaintballManager — sits at scene origin),
+    // matching the visual-only-children pattern in CLAUDE.md. The mesh is already
+    // tagged userData.isRuntimeOnly so it won't be serialized.
+    this.gameObject._internal.three.add(mesh);
+
+    const maxRange = globeRadius * this.getAttribute("rangeFactor");
+
+    this._projectiles.push({
+      mesh: mesh,
+      mat: mat,
+      geom: geom,
+      r0: r0,
+      rHat: rHat,
+      wHat: wHat,
+      traveled: 0,
+      maxRange: maxRange,
+      speed: this.getAttribute("paintballSpeed"),
+      colorHex: colorHex,
+    });
+  };
+
+  this._stepProjectiles = function (dt) {
+    const remain = [];
+    // Optional gremlin hit-test inputs — published by tinyskies.skyGremlins.
+    // Each entry: {x, y, z, alive, hitRadius}. If present, every projectile is
+    // tested per-step against every alive gremlin; on hit, push {index} into
+    // `tinyskies/gremlinHits` (drained by gremlin behavior at the top of its
+    // own update()) and dispose the projectile.
+    const gremlinPositions = this.erth.store.get("tinyskies/gremlinPositions");
+    const gremlinHits = this.erth.store.get("tinyskies/gremlinHits");
+    const hasGremlins = Array.isArray(gremlinPositions) && Array.isArray(gremlinHits);
+
+    for (let i = 0; i < this._projectiles.length; i++) {
+      const p = this._projectiles[i];
+      const arcStep = (p.speed * dt) / p.r0;
+      // Rotate (rHat, wHat) around axis = rHat × wHat by arcStep.
+      this._tmpAxis.copy(p.rHat).cross(p.wHat).normalize();
+      this._tmpQuat.setFromAxisAngle(this._tmpAxis, arcStep);
+      p.rHat.applyQuaternion(this._tmpQuat).normalize();
+      p.wHat.applyQuaternion(this._tmpQuat).normalize();
+      p.traveled += p.speed * dt;
+
+      p.mesh.position.copy(p.rHat).multiplyScalar(p.r0);
+
+      // Gremlin hit?
+      let hitGremlin = false;
+      if (hasGremlins) {
+        for (let gi = 0; gi < gremlinPositions.length; gi++) {
+          const g = gremlinPositions[gi];
+          if (!g || !g.alive) continue;
+          const dx = p.mesh.position.x - g.x;
+          const dy = p.mesh.position.y - g.y;
+          const dz = p.mesh.position.z - g.z;
+          const r = g.hitRadius || 0.16;
+          if (dx * dx + dy * dy + dz * dz < r * r) {
+            gremlinHits.push(gi);
+            hitGremlin = true;
+            break;
+          }
+        }
+      }
+
+      if (hitGremlin) {
+        this._disposeProjectile(p);
+        continue;
+      }
+
+      if (p.traveled >= p.maxRange) {
+        this._spawnSplatter(p);
+        this._disposeProjectile(p);
+      } else {
+        remain.push(p);
+      }
+    }
+    this._projectiles = remain;
+  };
+
+  this._spawnSplatter = function (p) {
+    const globeRadius = this.getAttribute("globeRadius");
+    // Drop the splatter onto the globe surface directly below the projectile's
+    // current radial position. (Source PaintballSystem uses DecalGeometry; the
+    // MVP ships a flat-quad approximation — visually similar at this scale.)
+    const surfaceCenterFar = p.rHat.clone().multiplyScalar(globeRadius + 0.005);
+
+    // Random radius for variety + jitter rotation.
+    const radius = 0.18 + Math.random() * 0.06;
+    const geom = new THREE.CircleGeometry(radius, 24);
+    const mat = new THREE.MeshBasicNodeMaterial({
+      color: new THREE.Color(p.colorHex),
+      transparent: true,
+      opacity: 1,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    const mesh = new THREE.Mesh(geom, mat);
+    mesh.userData.isRuntimeOnly = true;
+    mesh.position.copy(surfaceCenterFar);
+    // Orient the disc so its +Z (default normal) points outward from the globe center.
+    mesh.lookAt(p.rHat.clone().multiplyScalar(globeRadius * 2));
+    // Random in-plane rotation.
+    const spin = Math.random() * Math.PI * 2;
+    mesh.rotateZ(spin);
+
+    // Parent to the behavior's own gameObject (PaintballManager — sits at scene origin),
+    // matching the visual-only-children pattern in CLAUDE.md. The mesh is already
+    // tagged userData.isRuntimeOnly so it won't be serialized.
+    this.gameObject._internal.three.add(mesh);
+    this._splatters.push({
+      mesh: mesh,
+      mat: mat,
+      geom: geom,
+      age: 0,
+      lifetime: this.getAttribute("splatterLifetimeSec"),
+    });
+  };
+
+  this._fadeSplatters = function (dt) {
+    const remain = [];
+    for (let i = 0; i < this._splatters.length; i++) {
+      const s = this._splatters[i];
+      s.age += dt;
+      const t = s.age / s.lifetime;
+      if (t >= 1) {
+        if (s.mesh.parent) s.mesh.parent.remove(s.mesh);
+        s.geom.dispose();
+        s.mat.dispose();
+        continue;
+      }
+      // Linear fade for simplicity — source uses opacity tween + colorize, but the
+      // MVP keeps it minimal.
+      s.mat.opacity = 1 - t;
+      remain.push(s);
+    }
+    this._splatters = remain;
+  };
+
+  this._disposeProjectile = function (p) {
+    if (p.mesh.parent) p.mesh.parent.remove(p.mesh);
+    p.geom.dispose();
+    p.mat.dispose();
+  };
+
+  // No editor preview — projectiles only exist in play, and there's nothing to render
+  // in the empty editor state. (Per CLAUDE.md memory feedback_no_empty_editor_stubs.md.)
+
+  this.dispose = function () {
+    this._log("dispose");
+    for (const p of this._projectiles) this._disposeProjectile(p);
+    this._projectiles.length = 0;
+    for (const s of this._splatters) {
+      if (s.mesh.parent) s.mesh.parent.remove(s.mesh);
+      s.geom.dispose();
+      s.mat.dispose();
+    }
+    this._splatters.length = 0;
+    this._globeSurfaceMesh = null;
+    this._globeRoot = null;
+  };

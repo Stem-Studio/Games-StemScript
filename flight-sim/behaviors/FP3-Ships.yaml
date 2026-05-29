@@ -1,0 +1,109 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+config:
+  priority: 0
+  name: "FP3-Ships"
+  id: "fp3.ships"
+  author: "flight-sim"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Three ships bobbing on the ocean surface"
+  tags:
+    - gameplay
+  attributes: {}
+  documentation: "Creates 3 ships with hull and bridge geometry positioned on the ocean. Ships bob vertically and drift slowly along the Z axis."
+code: |
+  const SEA_LEVEL = 0;
+  const GROUND_LEVEL = 10;
+
+  let game;
+  const disposables = [];
+  const ships = [];
+
+  function trackGeo(geo) { disposables.push(geo); return geo; }
+  function trackMat(mat) { disposables.push(mat); return mat; }
+
+  const SHIP_POSITIONS = [
+    { x: -500, z: -200, speed: 0.5 },
+    { x: -550, z: 100, speed: 0.3 },
+    { x: -480, z: 400, speed: 0.4 }
+  ];
+
+  this.init = function(_game) {
+    game = _game;
+
+    const hullGeo = trackGeo(new THREE.BoxGeometry(5, 2, 15));
+    const hullMat = trackMat(new THREE.MeshStandardNodeMaterial({ color: 0x555555 }));
+    const bridgeGeo = trackGeo(new THREE.BoxGeometry(3, 3, 4));
+    const bridgeMat = trackMat(new THREE.MeshStandardNodeMaterial({ color: 0x888888 }));
+
+    for (const cfg of SHIP_POSITIONS) {
+      const group = new THREE.Group();
+      group.userData.isRuntimeOnly = true;
+
+      const hull = new THREE.Mesh(hullGeo, hullMat);
+      hull.userData.isRuntimeOnly = true;
+      group.add(hull);
+
+      const bridge = new THREE.Mesh(bridgeGeo, bridgeMat);
+      bridge.position.set(0, 2.5, -4);
+      bridge.userData.isRuntimeOnly = true;
+      group.add(bridge);
+
+      group.position.set(cfg.x, SEA_LEVEL + 0.5, cfg.z);
+
+      this.gameObject._internal.three.add(group);
+
+      ships.push({
+        mesh: group,
+        baseZ: cfg.z,
+        speed: cfg.speed,
+        phase: Math.random() * Math.PI * 2
+      });
+    }
+  };
+
+  this.update = function(deltaTime) {
+    if (!game) return;
+    const dt = Math.min(deltaTime, 0.1);
+
+    const time = Date.now() * 0.001;
+
+    for (const s of ships) {
+      // Bob up and down
+      s.mesh.position.y = SEA_LEVEL + 0.5 + Math.sin(time + s.phase) * 0.1;
+
+      // Gentle roll
+      s.mesh.rotation.z = Math.sin(time * 0.7 + s.phase) * 0.02;
+
+      // Slow forward movement along Z
+      s.mesh.position.z += s.speed * dt;
+
+      // Wrap around if too far
+      if (s.mesh.position.z > 1000) {
+        s.mesh.position.z = -1000;
+      }
+    }
+  };
+
+  this.dispose = function() {
+    for (const s of ships) {
+      if (s.mesh.parent) s.mesh.parent.remove(s.mesh);
+    }
+    for (const d of disposables) {
+      if (d.dispose) d.dispose();
+    }
+    disposables.length = 0;
+    ships.length = 0;
+  };
+
+  this.onEditorAdded = function() {
+    // No editor preview for runtime-only procedural geometry
+  };
+
+  this.onEditorDispose = function() {
+    // Nothing to clean up in editor
+  };

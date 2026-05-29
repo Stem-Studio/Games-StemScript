@@ -1,0 +1,104 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+config:
+  priority: 0
+  name: "FP3-Blimps"
+  id: "fp3.blimps"
+  author: "flight-sim"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Three blimps orbiting at altitude"
+  tags:
+    - gameplay
+  attributes: {}
+  documentation: "Creates 3 blimps with elongated bodies and gondolas, orbiting at different radii and altitudes."
+code: |
+  const SEA_LEVEL = 0;
+  const GROUND_LEVEL = 10;
+
+  let game;
+  const disposables = [];
+  const blimps = [];
+
+  function trackGeo(geo) { disposables.push(geo); return geo; }
+  function trackMat(mat) { disposables.push(mat); return mat; }
+
+  const BLIMP_CONFIGS = [
+    { x: -50, y: 150, z: -200, orbitRadius: 200, orbitSpeed: 0.01 },
+    { x: 100, y: 200, z: 300, orbitRadius: 400, orbitSpeed: 0.008 },
+    { x: -200, y: 180, z: 100, orbitRadius: 600, orbitSpeed: 0.006 }
+  ];
+
+  this.init = function(_game) {
+    game = _game;
+
+    const bodyGeo = trackGeo(new THREE.SphereGeometry(10, 16, 16));
+    const bodyMat = trackMat(new THREE.MeshStandardNodeMaterial({ color: 0xCCCCCC }));
+    const gondolaGeo = trackGeo(new THREE.BoxGeometry(3, 2, 5));
+    const gondolaMat = trackMat(new THREE.MeshStandardNodeMaterial({ color: 0x666666 }));
+
+    for (let i = 0; i < BLIMP_CONFIGS.length; i++) {
+      const cfg = BLIMP_CONFIGS[i];
+      const group = new THREE.Group();
+      group.userData.isRuntimeOnly = true;
+
+      // Elongated blimp body
+      const body = new THREE.Mesh(bodyGeo, bodyMat);
+      body.scale.set(3, 1, 1);
+      body.userData.isRuntimeOnly = true;
+      group.add(body);
+
+      // Gondola underneath
+      const gondola = new THREE.Mesh(gondolaGeo, gondolaMat);
+      gondola.position.set(0, -8, 0);
+      gondola.userData.isRuntimeOnly = true;
+      group.add(gondola);
+
+      group.position.set(cfg.x, cfg.y, cfg.z);
+
+      this.gameObject._internal.three.add(group);
+
+      blimps.push({
+        mesh: group,
+        angle: Math.atan2(cfg.z, cfg.x),
+        orbitRadius: cfg.orbitRadius,
+        orbitSpeed: cfg.orbitSpeed,
+        altitude: cfg.y
+      });
+    }
+  };
+
+  this.update = function(deltaTime) {
+    if (!game) return;
+
+    const dt = Math.min(deltaTime, 0.1);
+    for (const b of blimps) {
+      b.angle += b.orbitSpeed * dt;
+      b.mesh.position.x = Math.cos(b.angle) * b.orbitRadius;
+      b.mesh.position.z = Math.sin(b.angle) * b.orbitRadius;
+      b.mesh.position.y = b.altitude;
+      b.mesh.rotation.y = b.angle + Math.PI / 2;
+    }
+  };
+
+  this.dispose = function() {
+    for (const b of blimps) {
+      if (b.mesh.parent) b.mesh.parent.remove(b.mesh);
+    }
+    for (const d of disposables) {
+      if (d.dispose) d.dispose();
+    }
+    disposables.length = 0;
+    blimps.length = 0;
+  };
+
+  this.onEditorAdded = function() {
+    // No editor preview for runtime-only procedural geometry
+  };
+
+  this.onEditorDispose = function() {
+    // Nothing to clean up in editor
+  };

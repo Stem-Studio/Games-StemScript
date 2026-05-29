@@ -1,0 +1,81 @@
+# ============================================================
+# Star Fox Railpath — StemStudio Conversion
+# Source: https://github.com/mustache-dev/Starfox-railpath-2.0
+# Genre: Rail Shooter
+# ============================================================
+
+project title "Star Fox Railpath"
+
+# --- Import Assets ---
+import model name="Arwing" filepath="models/arwing-transformed.glb" comment="Star Fox Arwing spacecraft model"
+import model name="Environment" filepath="models/testenv-transformed.glb" comment="Environment terrain plane"
+update "Arwing" objectSettings={gameVisibility:false}
+import image name="Viewfinder" filepath="textures/viewfinder.png" comment="Crosshair/viewfinder texture (reserved for future use)"
+
+# --- Import Behaviors ---
+import behavior name="SF Rail Path" filepath="behaviors/sfRailPath.yaml" comment="Rail path progression — positions and orients group along CatmullRomCurve3"
+import behavior name="SF Player Controller" filepath="behaviors/sfPlayerController.yaml" comment="Player movement, camera, barrel roll, crosshairs, and engine glow"
+import behavior name="SF Laser System" filepath="behaviors/sfLaserSystem.yaml" comment="Burst-fire laser projectile system"
+
+# --- Scene Settings ---
+
+# Dark space background
+scene background type=Color color=#001522
+
+# No fog (open space)
+scene fog type=none
+
+# Ambient light (source uses intensity 1 + warehouse HDRI)
+scene lighting ambient={intensity:1}
+
+# Bloom (source: Bloom intensity=0.2, threshold=0)
+scene postprocessing bloom={enabled:true,intensity:0.2,threshold:0,radius:0.4}
+
+# --- Scene Hierarchy ---
+
+# RailGroup: invisible group that follows the 420-point rail curve
+# Initial position at curve start point
+add group name="RailGroup" position=0,13.83,2
+
+# Ship: child of RailGroup, moves in local XY space
+# Hosts the player controller, laser system, viewfinders, and glow
+add group name="Ship"
+update Ship tag=Player
+move Ship parent=RailGroup
+
+# Parent the Arwing model under Ship
+# Model rotation handled by sfPlayerController behavior (-90° Y)
+move Arwing parent=Ship
+
+# --- Environment ---
+# Source: position=[-71.879, 1.227, 0] scale=-85.364
+update Environment position=-71.879,1.227,0 scale=-85.364,-85.364,-85.364
+
+# --- Camera ---
+# Custom camera controlled entirely by sfPlayerController
+# Generous clipping planes for the ~300-unit rail path
+# Custom camera controlled by sfPlayerController behavior
+camera "DefaultCamera" cameraType=NONE fov=50 near=0.1 far=2000
+
+# --- Attach Behaviors ---
+
+# Rail path: controls RailGroup position/orientation along the curve over 60 seconds
+behavior attach RailGroup behaviorId=sf.railPath config={duration:60}
+
+# Player controller: handles WASD movement, camera, barrel roll, viewfinder, glow
+behavior attach Ship behaviorId=sf.playerController config={moveSpeed:18,doubleTapMs:200,arwingModel:"Arwing",viewfinderTexture:"Viewfinder"}
+
+# Laser system: E/F to shoot, 3-shot burst, green emissive projectiles
+behavior attach Ship behaviorId=sf.laserSystem config={laserSpeed:250,burstCount:3,burstDelay:0.1,laserLifetime:5}
+
+# ============================================================
+# NOTES:
+# - WASD/Arrows: move ship within constrained window
+# - E/F: fire lasers (3-shot burst)
+# - Double-tap Left/Right: barrel roll
+# - The rail path auto-advances over 60 seconds
+# - Camera follows behind the ship along the path
+# - Viewfinder crosshairs appear ahead of the ship
+# - Engine glow pulsates at the exhaust port
+# - No touch controls: this game requires keyboard input
+# ============================================================

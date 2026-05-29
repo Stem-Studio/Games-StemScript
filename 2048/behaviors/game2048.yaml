@@ -1,0 +1,1763 @@
+# StemStudio Export File
+# Do not edit manually unless you know what you're doing
+
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+  exportedAt: 2026-04-30T17:51:29.245Z
+config:
+  name: 2048 Game
+  id: 69eecda1ab87d90ff0e22f9f
+  author: script-wizard
+  isScript: true
+  main: script.js
+  priority: 0
+  version: 2.0.0
+  description: Classic 2048 sliding tile puzzle — faithful port of gabrielecirulli/2048 (UIKit rendering)
+  tags:
+    - gameplay
+  attributes:
+    gridSize:
+      name: Grid Size
+      type: number
+      default: 4
+      min: 3
+      max: 8
+    winTile:
+      name: Win Tile Value
+      type: number
+      default: 2048
+    spawnChance4:
+      name: Chance to Spawn 4
+      type: number
+      default: 0.1
+      min: 0
+      max: 1
+  inputs:
+    g2048_Up:
+      action: true
+      bindings:
+        - keyboard: ArrowUp
+        - keyboard: KeyW
+        - keyboard: KeyK
+    g2048_Down:
+      action: true
+      bindings:
+        - keyboard: ArrowDown
+        - keyboard: KeyS
+        - keyboard: KeyJ
+    g2048_Left:
+      action: true
+      bindings:
+        - keyboard: ArrowLeft
+        - keyboard: KeyA
+        - keyboard: KeyH
+    g2048_Right:
+      action: true
+      bindings:
+        - keyboard: ArrowRight
+        - keyboard: KeyD
+        - keyboard: KeyL
+    g2048_Restart:
+      action: true
+      bindings:
+        - keyboard: KeyR
+  throttleConfig:
+    throttlePriority: CRITICAL
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+    updateHz: 30
+  documentation: Classic 2048 sliding tile puzzle — faithful port of gabrielecirulli/2048 (UIKit rendering) Configure attributes in the editor to tune gameplay behavior.
+code: "// 2048 Game — ported from gabrielecirulli/2048\r
+
+  // UIKit-rendered fullscreen 2D puzzle\r
+
+  \r
+
+  // --- Tile color map (source-faithful, hex integers for UIKit) ---\r
+
+  const self = this;\r
+
+  let game;\r
+
+  \r
+
+  const SAVETHRESHOLD = 5;\r
+
+  let saveTimer = 0;\r
+
+  let savedHighscore = 0;\r
+
+  let gameLoginEvent = undefined;\r
+
+  \r
+
+  const TILE_COLORS = {\r
+
+  \  2: { bg: 0xeee4da, fg: 0x776e65 },\r
+
+  \  4: { bg: 0xede0c8, fg: 0x776e65 },\r
+
+  \  8: { bg: 0xf2b179, fg: 0xf9f6f2 },\r
+
+  \  16: { bg: 0xf59563, fg: 0xf9f6f2 },\r
+
+  \  32: { bg: 0xf67c5f, fg: 0xf9f6f2 },\r
+
+  \  64: { bg: 0xf65e3b, fg: 0xf9f6f2 },\r
+
+  \  128: { bg: 0xedcf72, fg: 0xf9f6f2 },\r
+
+  \  256: { bg: 0xedcc61, fg: 0xf9f6f2 },\r
+
+  \  512: { bg: 0xedc850, fg: 0xf9f6f2 },\r
+
+  \  1024: { bg: 0xedc53f, fg: 0xf9f6f2 },\r
+
+  \  2048: { bg: 0xedc22e, fg: 0xf9f6f2 }\r
+
+  };\r
+
+  const SUPER_COLOR = { bg: 0x3c3a32, fg: 0xf9f6f2 };\r
+
+  \r
+
+  // --- UIKit layout constants ---\r
+
+  const GRID_TOTAL = 480;\r
+
+  const G_PAD = 12;\r
+
+  const G_GAP = 10;\r
+
+  const GRID_BG_C = 0xbbada0;\r
+
+  const EMPTY_BG_C = 0xeee4da;\r
+
+  const EMPTY_OP = 0.35;\r
+
+  const DARK_C = 0x776e65;\r
+
+  const SCORE_LBL_C = 0xeee4da;\r
+
+  const BTN_BG_C = 0x8f7a66;\r
+
+  const BTN_FG_C = 0xf9f6f2;\r
+
+  \r
+
+  // --- Helpers ---\r
+
+  function uiCellSize(gs) {\r
+
+  \  return Math.floor((GRID_TOTAL - G_PAD * 2 - G_GAP * (gs - 1)) / gs);\r
+
+  }\r
+
+  \r
+
+  function tileFontSize(value, cs) {\r
+
+  \  if (value >= 1000) return Math.floor(cs * 0.28);\r
+
+  \  if (value >= 100) return Math.floor(cs * 0.35);\r
+
+  \  return Math.floor(cs * 0.45);\r
+
+  }\r
+
+  \r
+
+  function intToHex(n) {\r
+
+  \  return '#' + n.toString(16).padStart(6, '0');\r
+
+  }\r
+
+  \r
+
+  // --- Grid class ---\r
+
+  function Grid(size) {\r
+
+  \  this.size = size;\r
+
+  \  this.cells = [];\r
+
+  \  for (let x = 0; x < size; x++) {\r
+
+  \    this.cells[x] = [];\r
+
+  \    for (let y = 0; y < size; y++) {\r
+
+  \      this.cells[x][y] = null;\r
+
+  \    }\r
+
+  \  }\r
+
+  }\r
+
+  Grid.prototype.availableCells = function () {\r
+
+  \  const out = [];\r
+
+  \  for (let x = 0; x < this.size; x++)\r
+
+  \    for (let y = 0; y < this.size; y++)\r
+
+  \      if (!this.cells[x][y]) out.push({ x: x, y: y });\r
+
+  \  return out;\r
+
+  };\r
+
+  Grid.prototype.cellsAvailable = function () {\r
+
+  \  return this.availableCells().length > 0;\r
+
+  };\r
+
+  Grid.prototype.cellContent = function (c) {\r
+
+  \  if (c.x >= 0 && c.x < this.size && c.y >= 0 && c.y < this.size)\r
+
+  \    return this.cells[c.x][c.y];\r
+
+  \  return null;\r
+
+  };\r
+
+  Grid.prototype.cellAvailable = function (c) { return !this.cellContent(c); };\r
+
+  Grid.prototype.insertTile = function (t) { this.cells[t.x][t.y] = t; };\r
+
+  Grid.prototype.removeTile = function (t) { this.cells[t.x][t.y] = null; };\r
+
+  Grid.prototype.withinBounds = function (p) {\r
+
+  \  return p.x >= 0 && p.x < this.size && p.y >= 0 && p.y < this.size;\r
+
+  };\r
+
+  Grid.prototype.randomAvailableCell = function () {\r
+
+  \  const c = this.availableCells();\r
+
+  \  return c.length ? c[Math.floor(Math.random() * c.length)] : null;\r
+
+  };\r
+
+  \r
+
+  // --- Tile class ---\r
+
+  function GameTile(pos, value) {\r
+
+  \  this.x = pos.x;\r
+
+  \  this.y = pos.y;\r
+
+  \  this.value = value || 2;\r
+
+  \  this.previousPosition = null;\r
+
+  \  this.mergedFrom = null;\r
+
+  }\r
+
+  GameTile.prototype.savePosition = function () {\r
+
+  \  this.previousPosition = { x: this.x, y: this.y };\r
+
+  };\r
+
+  GameTile.prototype.updatePosition = function (p) {\r
+
+  \  this.x = p.x;\r
+
+  \  this.y = p.y;\r
+
+  };\r
+
+  \r
+
+  // --- Movement vectors (source-faithful) ---\r
+
+  const VECTORS = [\r
+
+  \  { x: 0, y: -1 },  // 0 = Up\r
+
+  \  { x: 1, y: 0 },   // 1 = Right\r
+
+  \  { x: 0, y: 1 },   // 2 = Down\r
+
+  \  { x: -1, y: 0 }   // 3 = Left\r
+
+  ];\r
+
+  \r
+
+  // ========== BEHAVIOR LIFECYCLE ==========\r
+
+  \r
+
+  this.init = function (_game) {\r
+
+  \  game = _game;\r
+
+  \  const gs = this.getAttribute(\"gridSize\") || 4;\r
+
+  \  this._gs = gs;\r
+
+  \  this._winTile = this.getAttribute(\"winTile\") || 2048;\r
+
+  \  this._spawnChance4 = this.getAttribute(\"spawnChance4\") || 0.1;\r
+
+  \  this._score = 0;\r
+
+  \  this._bestScore = 0;\r
+
+  \  this._over = false;\r
+
+  \  this._won = false;\r
+
+  \  this._keepGoing = false;\r
+
+  \  this._dirty = true;\r
+
+  \  this._inputQueue = [];\r
+
+  \  this._touchStart = { x: 0, y: 0 };\r
+
+  \  this._cs = uiCellSize(gs);\r
+
+  \r
+
+  \  self._keydown = (e) => {\r
+
+  \    if (e.code === 'KeyR') self._restart();\r
+
+  \  };\r
+
+  \r
+
+  \  gameLoginEvent = EventBus.instance.subscribe(\"login.finished\", this._onLoginSuccessEvent.bind(this));\r
+
+  \  document.addEventListener('keydown', self._keydown);\r
+
+  \r
+
+  \  // === UIKit setup ===\r
+
+  \  UIKitPointerEvents.initialize(game);\r
+
+  \r
+
+  \  const root = new UIKit.Fullscreen(game.renderer, {\r
+
+  \    flexDirection: 'column',\r
+
+  \    justifyContent: 'center',\r
+
+  \    alignItems: 'center',\r
+
+  \    gap: 12,\r
+
+  \    padding: 20,\r
+
+  \    pointerEvents: 'none', visibility: \"visible\"\r
+
+  \  });\r
+
+  \  this._root = root;\r
+
+  \  this._rootParented = false;\r
+
+  \  this._parentRootToCamera(game);\r
+
+  \r
+
+  \  // --- Header: title + score boxes ---\r
+
+  \  const header = new UIKit.Container({\r
+
+  \    width: GRID_TOTAL,\r
+
+  \    flexDirection: 'row',\r
+
+  \    justifyContent: 'space-between',\r
+
+  \    alignItems: 'center', visibility: \"visible\"\r
+
+  \  });\r
+
+  \  root.add(header);\r
+
+  \r
+
+  \  header.add(new UIKit.Text({\r
+
+  \    text: '2048',\r
+
+  \    fontSize: 60,\r
+
+  \    fontWeight: 'bold',\r
+
+  \    color: DARK_C, visibility: \"visible\"\r
+
+  \  }));\r
+
+  \r
+
+  \  const scoresRow = new UIKit.Container({\r
+
+  \    flexDirection: 'row',\r
+
+  \    gap: 8, visibility: \"visible\"\r
+
+  \  });\r
+
+  \  header.add(scoresRow);\r
+
+  \r
+
+  \  this._scoreValueText = this._addScoreBox(scoresRow, 'SCORE', '0');\r
+
+  \  this._bestValueText = this._addScoreBox(scoresRow, 'BEST', '0');\r
+
+  \r
+
+  \  // --- Subtitle row ---\r
+
+  \  const subRow = new UIKit.Container({\r
+
+  \    width: GRID_TOTAL,\r
+
+  \    flexDirection: 'row',\r
+
+  \    justifyContent: 'space-between',\r
+
+  \    alignItems: 'center',\r
+
+  \    paddingBottom: 4, visibility: \"visible\"\r
+
+  \  });\r
+
+  \  root.add(subRow);\r
+
+  \r
+
+  \  subRow.add(new UIKit.Text({\r
+
+  \    text: 'Join the numbers and get to ' + this._winTile + '!',\r
+
+  \    fontSize: 16,\r
+
+  \    color: DARK_C, visibility: \"visible\"\r
+
+  \  }));\r
+
+  \r
+
+  \  const newGameBtn = new UIKit.Container({\r
+
+  \    backgroundColor: BTN_BG_C,\r
+
+  \    borderRadius: 4,\r
+
+  \    paddingTop: 8,\r
+
+  \    paddingBottom: 8,\r
+
+  \    paddingLeft: 16,\r
+
+  \    paddingRight: 16,\r
+
+  \    pointerEvents: 'auto',\r
+
+  \    cursor: 'pointer',\r
+
+  \    hover: { opacity: 0.85 },\r
+
+  \    onClick: function () { self._restart(); }, visibility: \"visible\"\r
+
+  \  });\r
+
+  \  newGameBtn.add(new UIKit.Text({\r
+
+  \    text: 'New Game',\r
+
+  \    fontSize: 14,\r
+
+  \    fontWeight: 'bold',\r
+
+  \    color: BTN_FG_C, visibility: \"visible\"\r
+
+  \  }));\r
+
+  \  subRow.add(newGameBtn);\r
+
+  \r
+
+  \  // --- Grid area (positioning context for grid + overlays) ---\r
+
+  \  const gridArea = new UIKit.Container({\r
+
+  \    width: GRID_TOTAL,\r
+
+  \    height: GRID_TOTAL, visibility: \"visible\"\r
+
+  \  });\r
+
+  \  root.add(gridArea);\r
+
+  \r
+
+  \  // Grid container (absolute fill within gridArea)\r
+
+  \  const gridContainer = new UIKit.Container({\r
+
+  \    positionType: 'absolute',\r
+
+  \    positionTop: 0,\r
+
+  \    positionLeft: 0,\r
+
+  \    positionRight: 0,\r
+
+  \    positionBottom: 0,\r
+
+  \    backgroundColor: GRID_BG_C,\r
+
+  \    borderRadius: 8,\r
+
+  \    flexDirection: 'column',\r
+
+  \    padding: G_PAD,\r
+
+  \    gap: G_GAP,\r
+
+  \    justifyContent: 'center',\r
+
+  \    alignItems: 'center', visibility: \"visible\"\r
+
+  \  });\r
+
+  \  gridArea.add(gridContainer);\r
+
+  \r
+
+  \  // Build cell grid\r
+
+  \  const cs = this._cs;\r
+
+  \  this._cellContainers = [];\r
+
+  \  this._cellTexts = [];\r
+
+  \  for (let row = 0; row < gs; row++) {\r
+
+  \    this._cellContainers[row] = [];\r
+
+  \    this._cellTexts[row] = [];\r
+
+  \    const rowC = new UIKit.Container({\r
+
+  \      flexDirection: 'row',\r
+
+  \      gap: G_GAP, visibility: \"visible\"\r
+
+  \    });\r
+
+  \    gridContainer.add(rowC);\r
+
+  \    for (let col = 0; col < gs; col++) {\r
+
+  \      const cell = new UIKit.Container({\r
+
+  \        width: cs,\r
+
+  \        height: cs,\r
+
+  \        backgroundColor: EMPTY_BG_C,\r
+
+  \        opacity: EMPTY_OP,\r
+
+  \        borderRadius: 5,\r
+
+  \        justifyContent: 'center',\r
+
+  \        alignItems: 'center', visibility: \"visible\"\r
+
+  \      });\r
+
+  \      const txt = new UIKit.Text({\r
+
+  \        text: '',\r
+
+  \        fontSize: Math.floor(cs * 0.45),\r
+
+  \        fontWeight: 'bold',\r
+
+  \        color: DARK_C,\r
+
+  \        textAlign: 'center', visibility: \"visible\"\r
+
+  \      });\r
+
+  \      cell.add(txt);\r
+
+  \      rowC.add(cell);\r
+
+  \      this._cellContainers[row][col] = cell;\r
+
+  \      this._cellTexts[row][col] = txt;\r
+
+  \    }\r
+
+  \  }\r
+
+  \r
+
+  \  // --- Game Over overlay (absolute over grid) ---\r
+
+  \  this._gameOverOverlay = this._buildOverlay(\r
+
+  \    gridArea, 'Game Over!', DARK_C, 0xeee4da, 0.73, false\r
+
+  \  );\r
+
+  \r
+
+  \  // --- Win overlay (absolute over grid) ---\r
+
+  \  this._winOverlay = this._buildOverlay(\r
+
+  \    gridArea, 'You Win!', BTN_FG_C, 0xedc22e, 0.6, true\r
+
+  \  );\r
+
+  \r
+
+  \  // --- Instructions ---\r
+
+  \  root.add(new UIKit.Text({\r
+
+  \    text: 'Arrow keys to move \\u2022 R to restart \\u2022 Swipe on mobile',\r
+
+  \    fontSize: 14,\r
+
+  \    color: DARK_C,\r
+
+  \    textAlign: 'center', visibility: \"visible\"\r
+
+  \  }));\r
+
+  \r
+
+  \  // === Input — polled per-frame via InputManager ===\r
+
+  \  this._inputPrev = { up: false, down: false, left: false, right: false, restart: false };\r
+
+  \  this._touchAxisLatched = false;\r
+
+  \r
+
+  \  // Create Grid\r
+
+  \  this._grid = new Grid(gs);\r
+
+  };\r
+
+  \r
+
+  this._onLoginSuccessEvent = function (event, data) {\r
+
+  \  sendHighscore(\"api:gameProgress:get\", {},\r
+
+  \    function (response) {\r
+
+  \      if (!response || !response.success) {\r
+
+  \        console.error(\"[2048] No best score to retrieve from the backend...\", response);\r
+
+  \      } else {\r
+
+  \        const _highScore = response.data.metadata.highscore;\r
+
+  \        self._bestScore = _highScore ?? 0;\r
+
+  \        savedHighscore = _highScore ?? 0;\r
+
+  \        if (self._bestValueText) self._bestValueText.setProperties({ text: '' + self._bestScore });\r
+
+  \      }\r
+
+  \r
+
+  \      // Start Game\r
+
+  \      self._addStartTiles();\r
+
+  \      self._updateUI();\r
+
+  \    }\r
+
+  \  );\r
+
+  };\r
+
+  \r
+
+  // --- Camera parenting (deferred retry) ---\r
+
+  this._parentRootToCamera = function (game) {\r
+
+  \  if (this._rootParented || !this._root) return;\r
+
+  \  const uiCamera = game.uiCamera;\r
+
+  \  if (!uiCamera) return;\r
+
+  \  uiCamera.add(this._root);\r
+
+  \  UIKitPointerEvents.registerRoot(this._root);\r
+
+  \  this._rootParented = true;\r
+
+  };\r
+
+  \r
+
+  // --- Score box builder ---\r
+
+  this._addScoreBox = function (parent, label, initialValue) {\r
+
+  \  const box = new UIKit.Container({\r
+
+  \    backgroundColor: GRID_BG_C,\r
+
+  \    borderRadius: 4,\r
+
+  \    paddingTop: 8,\r
+
+  \    paddingBottom: 8,\r
+
+  \    paddingLeft: 16,\r
+
+  \    paddingRight: 16,\r
+
+  \    flexDirection: 'column',\r
+
+  \    alignItems: 'center',\r
+
+  \    justifyContent: 'center',\r
+
+  \    gap: 2, visibility: \"visible\"\r
+
+  \  });\r
+
+  \  box.add(new UIKit.Text({\r
+
+  \    text: label,\r
+
+  \    fontSize: 12,\r
+
+  \    color: SCORE_LBL_C, visibility: \"visible\"\r
+
+  \  }));\r
+
+  \  const valueText = new UIKit.Text({\r
+
+  \    text: initialValue,\r
+
+  \    fontSize: 22,\r
+
+  \    fontWeight: 'bold',\r
+
+  \    color: 0xffffff, visibility: \"visible\"\r
+
+  \  });\r
+
+  \  box.add(valueText);\r
+
+  \  parent.add(box);\r
+
+  \  return valueText;\r
+
+  };\r
+
+  \r
+
+  // --- Overlay builder ---\r
+
+  this._buildOverlay = function (parent, message, msgColor, bgColor, bgOpacity, showKeepGoing) {\r
+
+  \  const overlay = new UIKit.Container({\r
+
+  \    positionType: 'absolute',\r
+
+  \    positionTop: 0,\r
+
+  \    positionLeft: 0,\r
+
+  \    positionRight: 0,\r
+
+  \    positionBottom: 0,\r
+
+  \    backgroundColor: bgColor,\r
+
+  \    borderRadius: 8,\r
+
+  \    flexDirection: 'column',\r
+
+  \    justifyContent: 'center',\r
+
+  \    alignItems: 'center',\r
+
+  \    gap: 12,\r
+
+  \    pointerEvents: 'auto', visibility: \"visible\"\r
+
+  \  });\r
+
+  \  overlay.setProperties({ visibility: 'hidden' });\r
+
+  \r
+
+  \  overlay.add(new UIKit.Text({\r
+
+  \    text: message,\r
+
+  \    fontSize: 48,\r
+
+  \    fontWeight: 'bold',\r
+
+  \    renderOrder: 3,\r
+
+  \    color: msgColor, visibility: \"visible\",\r
+
+  \  }));\r
+
+  \r
+
+  \  if (showKeepGoing) {\r
+
+  \    const keepBtn = new UIKit.Container({\r
+
+  \      backgroundColor: BTN_BG_C,\r
+
+  \      opacity: bgOpacity,\r
+
+  \      borderRadius: 4,\r
+
+  \      paddingTop: 10,\r
+
+  \      paddingBottom: 10,\r
+
+  \      paddingLeft: 32,\r
+
+  \      paddingRight: 32,\r
+
+  \      pointerEvents: 'auto',\r
+
+  \      hover: { opacity: 0.85 },\r
+
+  \      renderOrder: 2,\r
+
+  \      onClick: function () {\r
+
+  \        self._keepGoing = true;\r
+
+  \        self._dirty = true;\r
+
+  \      }, visibility: \"visible\"\r
+
+  \    });\r
+
+  \    keepBtn.add(new UIKit.Text({\r
+
+  \      text: 'Keep going',\r
+
+  \      fontSize: 18,\r
+
+  \      fontWeight: 'bold',\r
+
+  \      cursor: 'pointer',\r
+
+  \      renderOrder: 3,\r
+
+  \      color: BTN_FG_C, visibility: \"visible\"\r
+
+  \    }));\r
+
+  \    overlay.add(keepBtn);\r
+
+  \  }\r
+
+  \r
+
+  \  const retryBtn = new UIKit.Container({\r
+
+  \    backgroundColor: BTN_BG_C,\r
+
+  \    opacity: bgOpacity,\r
+
+  \    borderRadius: 4,\r
+
+  \    paddingTop: 10,\r
+
+  \    paddingBottom: 10,\r
+
+  \    paddingLeft: 32,\r
+
+  \    paddingRight: 32,\r
+
+  \    pointerEvents: 'auto',\r
+
+  \    renderOrder: 2,\r
+
+  \    hover: { opacity: 0.85 },\r
+
+  \    onClick: function () { self._restart(); }, visibility: \"visible\"\r
+
+  \  });\r
+
+  \  retryBtn.add(new UIKit.Text({\r
+
+  \    text: 'Try again',\r
+
+  \    fontSize: 18,\r
+
+  \    fontWeight: 'bold',\r
+
+  \    cursor: 'pointer',\r
+
+  \    renderOrder: 3,\r
+
+  \    color: BTN_FG_C, visibility: \"visible\"\r
+
+  \  }));\r
+
+  \  overlay.add(retryBtn);\r
+
+  \r
+
+  \  parent.add(overlay);\r
+
+  \  return overlay;\r
+
+  };\r
+
+  \r
+
+  // --- Game state queries ---\r
+
+  this._isTerminated = function () {\r
+
+  \  return this._over || (this._won && !this._keepGoing);\r
+
+  };\r
+
+  \r
+
+  // --- Game actions ---\r
+
+  this._restart = function () {\r
+
+  \  this._grid = new Grid(this._gs);\r
+
+  \  this._score = 0;\r
+
+  \  this._over = false;\r
+
+  \  this._won = false;\r
+
+  \  this._keepGoing = false;\r
+
+  \  this._addStartTiles();\r
+
+  \  this._dirty = true;\r
+
+  };\r
+
+  \r
+
+  this._addStartTiles = function () {\r
+
+  \  for (let i = 0; i < 2; i++) this._addRandomTile();\r
+
+  };\r
+
+  \r
+
+  this._addRandomTile = function () {\r
+
+  \  if (this._grid.cellsAvailable()) {\r
+
+  \    const val = Math.random() < (1 - this._spawnChance4) ? 2 : 4;\r
+
+  \    this._grid.insertTile(new GameTile(this._grid.randomAvailableCell(), val));\r
+
+  \  }\r
+
+  };\r
+
+  \r
+
+  this._move = function (direction) {\r
+
+  \  if (this._isTerminated()) return;\r
+
+  \  const vector = VECTORS[direction];\r
+
+  \  const traversals = { x: [], y: [] };\r
+
+  \  for (let i = 0; i < this._gs; i++) {\r
+
+  \    traversals.x.push(i);\r
+
+  \    traversals.y.push(i);\r
+
+  \  }\r
+
+  \  if (vector.x === 1) traversals.x.reverse();\r
+
+  \  if (vector.y === 1) traversals.y.reverse();\r
+
+  \r
+
+  \  for (let x = 0; x < this._gs; x++)\r
+
+  \    for (let y = 0; y < this._gs; y++) {\r
+
+  \      const t = this._grid.cells[x][y];\r
+
+  \      if (t) { t.mergedFrom = null; t.savePosition(); }\r
+
+  \    }\r
+
+  \r
+
+  \  let moved = false;\r
+
+  \r
+
+  \  traversals.x.forEach((x) => {\r
+
+  \    traversals.y.forEach((y) => {\r
+
+  \      const cell = { x: x, y: y };\r
+
+  \      const tile = this._grid.cellContent(cell);\r
+
+  \      if (!tile) return;\r
+
+  \r
+
+  \      let prev = cell;\r
+
+  \      let cur = { x: prev.x + vector.x, y: prev.y + vector.y };\r
+
+  \      while (this._grid.withinBounds(cur) && this._grid.cellAvailable(cur)) {\r
+
+  \        prev = cur;\r
+
+  \        cur = { x: prev.x + vector.x, y: prev.y + vector.y };\r
+
+  \      }\r
+
+  \      const farthest = prev;\r
+
+  \      const next = this._grid.cellContent(cur);\r
+
+  \r
+
+  \      if (next && next.value === tile.value && !next.mergedFrom) {\r
+
+  \        const merged = new GameTile(cur, tile.value * 2);\r
+
+  \        merged.mergedFrom = [tile, next];\r
+
+  \        this._grid.insertTile(merged);\r
+
+  \        this._grid.removeTile(tile);\r
+
+  \        tile.updatePosition(cur);\r
+
+  \        this._score += merged.value;\r
+
+  \        if (this._bestScore < this._score) this._bestScore = this._score;\r
+
+  \        if (merged.value === this._winTile) this._won = true;\r
+
+  \      } else {\r
+
+  \        this._grid.cells[tile.x][tile.y] = null;\r
+
+  \        this._grid.cells[farthest.x][farthest.y] = tile;\r
+
+  \        tile.updatePosition(farthest);\r
+
+  \      }\r
+
+  \r
+
+  \      if (cell.x !== tile.x || cell.y !== tile.y) moved = true;\r
+
+  \    });\r
+
+  \  });\r
+
+  \r
+
+  \  if (moved) {\r
+
+  \    this._addRandomTile();\r
+
+  \    if (!this._movesAvailable()) this._over = true;\r
+
+  \    this._dirty = true;\r
+
+  \  }\r
+
+  };\r
+
+  \r
+
+  this._movesAvailable = function () {\r
+
+  \  if (this._grid.cellsAvailable()) return true;\r
+
+  \  for (let x = 0; x < this._gs; x++)\r
+
+  \    for (let y = 0; y < this._gs; y++) {\r
+
+  \      const tile = this._grid.cellContent({ x: x, y: y });\r
+
+  \      if (!tile) continue;\r
+
+  \      for (let d = 0; d < 4; d++) {\r
+
+  \        const v = VECTORS[d];\r
+
+  \        const other = this._grid.cellContent({ x: x + v.x, y: y + v.y });\r
+
+  \        if (other && other.value === tile.value) return true;\r
+
+  \      }\r
+
+  \    }\r
+
+  \  return false;\r
+
+  };\r
+
+  \r
+
+  // --- UI Update (replaces canvas _renderBoard) ---\r
+
+  this._updateUI = function () {\r
+
+  \  const gs = this._gs;\r
+
+  \  const cs = this._cs;\r
+
+  \r
+
+  \  // Update scores\r
+
+  \  this._scoreValueText.setProperties({ text: '' + this._score });\r
+
+  \  this._bestValueText.setProperties({ text: '' + this._bestScore });\r
+
+  \r
+
+  \  // Update grid cells\r
+
+  \  for (let row = 0; row < gs; row++) {\r
+
+  \    for (let col = 0; col < gs; col++) {\r
+
+  \      const tile = this._grid.cells[col][row];\r
+
+  \      const cellC = this._cellContainers[row][col];\r
+
+  \      const cellT = this._cellTexts[row][col];\r
+
+  \      if (tile) {\r
+
+  \        const colors = TILE_COLORS[tile.value] || SUPER_COLOR;\r
+
+  \        cellC.setProperties({\r
+
+  \          backgroundColor: colors.bg,\r
+
+  \          opacity: 1\r
+
+  \        });\r
+
+  \        cellT.setProperties({\r
+
+  \          text: '' + tile.value,\r
+
+  \          color: colors.fg,\r
+
+  \          fontSize: tileFontSize(tile.value, cs)\r
+
+  \        });\r
+
+  \      } else {\r
+
+  \        cellC.setProperties({\r
+
+  \          backgroundColor: EMPTY_BG_C,\r
+
+  \          opacity: EMPTY_OP\r
+
+  \        });\r
+
+  \        cellT.setProperties({ text: '' });\r
+
+  \      }\r
+
+  \    }\r
+
+  \  }\r
+
+  \r
+
+  \  // Overlay visibility (UIKit uses setProperties, not .visible)\r
+
+  \  if (this._over) {\r
+
+  \    this._updateBackend();\r
+
+  \    this._gameOverOverlay.setProperties({ visibility: 'visible' });\r
+
+  \    this._winOverlay.setProperties({ visibility: 'hidden' });\r
+
+  \  } else if (this._won && !this._keepGoing) {\r
+
+  \    this._updateBackend();\r
+
+  \    this._gameOverOverlay.setProperties({ visibility: 'hidden' });\r
+
+  \    this._winOverlay.setProperties({ visibility: 'visible' });\r
+
+  \  } else {\r
+
+  \    this._gameOverOverlay.setProperties({ visibility: 'hidden' });\r
+
+  \    this._winOverlay.setProperties({ visibility: 'hidden' });\r
+
+  \  }\r
+
+  \r
+
+  \  this._dirty = false;\r
+
+  };\r
+
+  \r
+
+  // --- Update loop ---\r
+
+  this._pollInput = function () {\r
+
+  \  if (!game || !game.inputManager) return;\r
+
+  \  const im = game.inputManager;\r
+
+  \  const cur = {\r
+
+  \    up: !!im.getAction('g2048_Up'),\r
+
+  \    down: !!im.getAction('g2048_Down'),\r
+
+  \    left: !!im.getAction('g2048_Left'),\r
+
+  \    right: !!im.getAction('g2048_Right'),\r
+
+  \    restart: !!im.getAction('g2048_Restart'),\r
+
+  \  };\r
+
+  \  const prev = this._inputPrev;\r
+
+  \  if (cur.restart && !prev.restart) this._restart();\r
+
+  \  if (!this._isTerminated()) {\r
+
+  \    if (cur.up && !prev.up) this._inputQueue.push(0);\r
+
+  \    if (cur.right && !prev.right) this._inputQueue.push(1);\r
+
+  \    if (cur.down && !prev.down) this._inputQueue.push(2);\r
+
+  \    if (cur.left && !prev.left) this._inputQueue.push(3);\r
+
+  \  }\r
+
+  \  this._inputPrev = cur;\r
+
+  \r
+
+  \  // Touch swipe via lateral/forward motion edges\r
+
+  \  if (im.getMotion) {\r
+
+  \    const lateral = im.getMotion('lateral') || 0;\r
+
+  \    const forward = im.getMotion('forward') || 0;\r
+
+  \    const aL = Math.abs(lateral);\r
+
+  \    const aF = Math.abs(forward);\r
+
+  \    const engage = 0.4;\r
+
+  \    const release = 0.2;\r
+
+  \    if (this._touchAxisLatched) {\r
+
+  \      if (aL < release && aF < release) this._touchAxisLatched = false;\r
+
+  \    } else if (!this._isTerminated()) {\r
+
+  \      let dir = -1;\r
+
+  \      if (aL > aF && aL > engage) dir = lateral > 0 ? 1 : 3;\r
+
+  \      else if (aF > engage) dir = forward > 0 ? 0 : 2;\r
+
+  \      if (dir !== -1) {\r
+
+  \        this._inputQueue.push(dir);\r
+
+  \        this._touchAxisLatched = true;\r
+
+  \      }\r
+
+  \    }\r
+
+  \  }\r
+
+  };\r
+
+  \r
+
+  this.update = function (deltaTime) {\r
+
+  \  if (!this._rootParented) this._parentRootToCamera(game);\r
+
+  \  this._pollInput();\r
+
+  \  if (this._inputQueue.length > 0) {\r
+
+  \    this._move(this._inputQueue.shift());\r
+
+  \  }\r
+
+  \  if (this._dirty) this._updateUI();\r
+
+  \  if (this._rootParented) {\r
+
+  \    UIKitPointerEvents.update(deltaTime);\r
+
+  \  }\r
+
+  \r
+
+  \  // Update Backend every 5 seconds\r
+
+  \  saveTimer += deltaTime;\r
+
+  \  if (saveTimer < SAVETHRESHOLD) return;\r
+
+  \  saveTimer = 0;\r
+
+  \  this._updateBackend();\r
+
+  };\r
+
+  \r
+
+  this._updateBackend = function () {\r
+
+  \  if (savedHighscore >= self._bestScore) {\r
+
+  \    saveTimer = 0;\r
+
+  \    return;\r
+
+  \  }\r
+
+  \r
+
+  \  const highscoreData = {\r
+
+  \    metadata: { highscore: self._bestScore },\r
+
+  \  };\r
+
+  \r
+
+  \  sendHighscore(\"api:gameProgress:update\", highscoreData,\r
+
+  \    function (response) {\r
+
+  \      if (!response.success) {\r
+
+  \        console.error(\"[2048] Failed to update the best score. Reason:\", response.message);\r
+
+  \        return;\r
+
+  \      } else {\r
+
+  \        console.warn(\"[2048] Best score updated:\", self._bestScore);\r
+
+  \        savedHighscore = self._bestScore;\r
+
+  \        return;\r
+
+  \      }\r
+
+  \    }\r
+
+  \  );\r
+
+  \r
+
+  \  saveTimer = 0;\r
+
+  };\r
+
+  \r
+
+  // --- Cleanup ---\r
+
+  this.dispose = function () {\r
+
+  \  if (this._root) {\r
+
+  \    UIKitPointerEvents.unregisterRoot(this._root);\r
+
+  \    if (this._root.parent) this._root.parent.remove(this._root);\r
+
+  \    this._root.dispose();\r
+
+  \  }\r
+
+  \  UIKitPointerEvents.deinitialize();\r
+
+  \r
+
+  \  EventBus.instance.unsubscribe(gameLoginEvent);\r
+
+  \  document.removeEventListener('keydown', self._keydown);\r
+
+  };\r
+
+  \r
+
+  // --- Editor preview (rendering-only, canvas-based static snapshot) ---\r
+
+  // Canvas constants for editor preview only\r
+
+  const EDITOR_CW = 1024;\r
+
+  const EDITOR_CH = 1280;\r
+
+  const EDITOR_GRID_X = 52;\r
+
+  const EDITOR_GRID_Y = 220;\r
+
+  const EDITOR_GRID_PX = 920;\r
+
+  const EDITOR_GRID_PAD = 15;\r
+
+  const EDITOR_GRID_GAP = 15;\r
+
+  \r
+
+  const editorCellSize = (gs) =>\r
+
+  \  Math.floor((EDITOR_GRID_PX - EDITOR_GRID_PAD * 2 - EDITOR_GRID_GAP * (gs - 1)) / gs);\r
+
+  \r
+
+  const editorCellPos = (col, row, gs) => {\r
+
+  \  const cs = editorCellSize(gs);\r
+
+  \  return {\r
+
+  \    x: EDITOR_GRID_X + EDITOR_GRID_PAD + col * (cs + EDITOR_GRID_GAP),\r
+
+  \    y: EDITOR_GRID_Y + EDITOR_GRID_PAD + row * (cs + EDITOR_GRID_GAP),\r
+
+  \  };\r
+
+  };\r
+
+  \r
+
+  const editorRoundRect = (ctx, x, y, w, h, r) => {\r
+
+  \  ctx.beginPath();\r
+
+  \  ctx.moveTo(x + r, y);\r
+
+  \  ctx.lineTo(x + w - r, y);\r
+
+  \  ctx.quadraticCurveTo(x + w, y, x + w, y + r);\r
+
+  \  ctx.lineTo(x + w, y + h - r);\r
+
+  \  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);\r
+
+  \  ctx.lineTo(x + r, y + h);\r
+
+  \  ctx.quadraticCurveTo(x, y + h, x, y + h - r);\r
+
+  \  ctx.lineTo(x, y + r);\r
+
+  \  ctx.quadraticCurveTo(x, y, x + r, y);\r
+
+  \  ctx.closePath();\r
+
+  };\r
+
+  \r
+
+  const disposeEditorPreview = () => {\r
+
+  \  if (this._editorMeshes) {\r
+
+  \    this._editorMeshes.forEach((m) => {\r
+
+  \      m.geometry.dispose();\r
+
+  \      if (m.parent) m.parent.remove(m);\r
+
+  \    });\r
+
+  \  }\r
+
+  \  if (this._editorMats) this._editorMats.forEach((m) => m.dispose());\r
+
+  \  if (this._editorTextures) this._editorTextures.forEach((t) => t.dispose());\r
+
+  \  this._editorMeshes = null;\r
+
+  \  this._editorMats = null;\r
+
+  \  this._editorTextures = null;\r
+
+  };\r
+
+  \r
+
+  const buildEditorPreview = () => {\r
+
+  \  disposeEditorPreview();\r
+
+  \r
+
+  \  const canvas = document.createElement('canvas'); // @check-ok — editor-only 2D canvas texture\r
+
+  \  canvas.width = EDITOR_CW;\r
+
+  \  canvas.height = EDITOR_CH;\r
+
+  \  const ctx = canvas.getContext('2d');\r
+
+  \  const gs = this.getAttribute(\"gridSize\") || 4;\r
+
+  \  const cs = editorCellSize(gs);\r
+
+  \r
+
+  \  // Background + title\r
+
+  \  ctx.fillStyle = '#faf8ef';\r
+
+  \  ctx.fillRect(0, 0, EDITOR_CW, EDITOR_CH);\r
+
+  \  ctx.fillStyle = '#776e65';\r
+
+  \  ctx.font = 'bold 80px Arial, sans-serif';\r
+
+  \  ctx.textAlign = 'left';\r
+
+  \  ctx.textBaseline = 'middle';\r
+
+  \  ctx.fillText('2048', 52, 70);\r
+
+  \r
+
+  \  // Grid background\r
+
+  \  ctx.fillStyle = '#bbada0';\r
+
+  \  editorRoundRect(ctx, EDITOR_GRID_X, EDITOR_GRID_Y, EDITOR_GRID_PX, EDITOR_GRID_PX, 8);\r
+
+  \  ctx.fill();\r
+
+  \r
+
+  \  // Empty cells\r
+
+  \  for (let x = 0; x < gs; x++) {\r
+
+  \    for (let y = 0; y < gs; y++) {\r
+
+  \      const p = editorCellPos(x, y, gs);\r
+
+  \      ctx.fillStyle = 'rgba(238, 228, 218, 0.35)';\r
+
+  \      editorRoundRect(ctx, p.x, p.y, cs, cs, 5);\r
+
+  \      ctx.fill();\r
+
+  \    }\r
+
+  \  }\r
+
+  \r
+
+  \  // Sample tiles — scale down to fit smaller grids\r
+
+  \  const samples = [\r
+
+  \    { x: 0, y: 0, v: 2 }, { x: 1, y: 1, v: 4 },\r
+
+  \    { x: 2, y: 0, v: 8 }, { x: 3, y: 3, v: 2048 },\r
+
+  \  ];\r
+
+  \  samples.forEach((s) => {\r
+
+  \    if (s.x < gs && s.y < gs) {\r
+
+  \      const p = editorCellPos(s.x, s.y, gs);\r
+
+  \      const c = TILE_COLORS[s.v] || SUPER_COLOR;\r
+
+  \      ctx.fillStyle = intToHex(c.bg);\r
+
+  \      editorRoundRect(ctx, p.x, p.y, cs, cs, 5);\r
+
+  \      ctx.fill();\r
+
+  \      ctx.fillStyle = intToHex(c.fg);\r
+
+  \      let fs = cs * 0.45;\r
+
+  \      if (s.v >= 100) fs = cs * 0.35;\r
+
+  \      if (s.v >= 1000) fs = cs * 0.28;\r
+
+  \      ctx.font = 'bold ' + Math.floor(fs) + 'px Arial, sans-serif';\r
+
+  \      ctx.textAlign = 'center';\r
+
+  \      ctx.textBaseline = 'middle';\r
+
+  \      ctx.fillText(String(s.v), p.x + cs / 2, p.y + cs / 2);\r
+
+  \    }\r
+
+  \  });\r
+
+  \r
+
+  \  const tex = new THREE.CanvasTexture(canvas);\r
+
+  \  tex.colorSpace = THREE.SRGBColorSpace;\r
+
+  \  const mat = new THREE.MeshBasicNodeMaterial();\r
+
+  \  mat.map = tex;\r
+
+  \  // Aspect-ratio-preserving plane. GameBoard is a group (no scale\r
+
+  \  // inheritance), so these are world-space sizes.\r
+
+  \  const geo = new THREE.PlaneGeometry(4, 5);\r
+
+  \  const mesh = new THREE.Mesh(geo, mat);\r
+
+  \  mesh.rotation.x = -Math.PI / 2;\r
+
+  \  mesh.position.set(0, 0.01, 0);\r
+
+  \  mesh.userData.isRuntimeOnly = true;\r
+
+  \  this.gameObject._internal.three.add(mesh);\r
+
+  \  this._editorMeshes = [mesh];\r
+
+  \  this._editorMats = [mat];\r
+
+  \  this._editorTextures = [tex];\r
+
+  };\r
+
+  \r
+
+  this.onEditorAdded = function (editor) {\r
+
+  \  buildEditorPreview();\r
+
+  };\r
+
+  \r
+
+  this.onEditorAttributesUpdated = function () {\r
+
+  \  buildEditorPreview();\r
+
+  };\r
+
+  \r
+
+  this.onEditorDispose = function () {\r
+
+  \  disposeEditorPreview();\r
+
+  };\r
+
+  \r
+
+  function getSendWs() {\r
+
+  \  if (game?.player?.userData?.sendWsMessage) return game.player.userData.sendWsMessage;\r
+
+  \  if (typeof globalThis !== \"undefined\" && globalThis.sendWsMessage) return globalThis.sendWsMessage;\r
+
+  \  return null;\r
+
+  }\r
+
+  \r
+
+  function sendHighscore(action, payload, cb) {\r
+
+  \  const send = getSendWs();\r
+
+  \  if (!send) {\r
+
+  \    if (cb) cb({ success: false });\r
+
+  \    return;\r
+
+  \  }\r
+
+  \  send(action, payload || {}, cb || function () { });\r
+
+  }"

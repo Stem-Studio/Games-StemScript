@@ -1,0 +1,62 @@
+# === BBall — 3v3 Multiplayer Arcade Basketball ===
+# Source: https://github.com/elisee/bball
+# Genre: Sports / Competitive Multiplayer Arcade
+# Players: 3v3 (6 total), 5-minute matches
+
+project title "BBall"
+
+# --- Import Textures ---
+import image name="BBFloor" filepath="textures/floor.png"
+import image name="BBWall" filepath="textures/wall.png"
+import image name="BBRedBasket" filepath="textures/red-basket.png"
+import image name="BBBlueBasket" filepath="textures/blue-basket.png"
+import image name="BBBallMarker" filepath="textures/ball-marker.png" comment="Ball marker texture (reserved — not yet wired to a behavior)"
+
+# --- Import Audio ---
+import audio name="BBBounce" filepath="audio/bounce.wav" comment="Ball bounce sound effect"
+import audio name="BBCatch" filepath="audio/catch.wav" comment="Ball catch sound effect"
+import audio name="BBThrow" filepath="audio/throw.wav" comment="Ball throw sound effect"
+import audio name="BBScore" filepath="audio/score.wav" comment="Team score sound effect"
+
+# --- Import Behaviors ---
+import behavior id=bball.court filepath="behaviors/bbCourt.yaml" description="Court geometry — floor, walls, baskets, point lights"
+import behavior id=bball.characterModel filepath="behaviors/bbCharacterModel.yaml" description="Procedural box avatar — head, body, arms, legs, nametag"
+import behavior id=bball.playerController filepath="behaviors/bbPlayerController.yaml" description="Local player input, movement, jumping, catch/throw"
+import behavior id=bball.ballController filepath="behaviors/bbBallController.yaml" description="Ball physics (host-only), catch/throw, scoring"
+import behavior id=bball.gameManager filepath="behaviors/bbGameManager.yaml" description="Match lifecycle, multiplayer, HUD"
+import behavior id=bball.camera filepath="behaviors/bbCamera.yaml" description="Fixed isometric camera"
+import behavior id=bball.audio filepath="behaviors/bbAudio.yaml" description="Sound effects"
+
+# --- Scene Settings ---
+scene background type=Color color=#1a1a2e
+scene lighting ambient={color:#cccccc,intensity:0.5}
+light "Directional Light" intensity=0.3 castShadow=true shadowMapSize=1024
+update "Directional Light" position=0,6,2
+
+# --- Game Settings ---
+game settings enabled=true isMultiplayer=true showHUD=false
+
+# --- Court Environment ---
+add group name="Court" position=0,0,0
+behavior attach "Court" behaviorId=bball.court config={floorTexture:"BBFloor",wallTexture:"BBWall",redBasketTexture:"BBRedBasket",blueBasketTexture:"BBBlueBasket"}
+
+# --- Local Player ---
+add group name="Player" position=-5,0,0
+update "Player" tag=Player
+behavior attach "Player" behaviorId=bball.characterModel config={teamIndex:0}
+behavior attach "Player" behaviorId=bball.playerController
+
+# --- Ball ---
+add group name="Ball" position=0,2,0
+behavior attach "Ball" behaviorId=bball.ballController config={ballMarkerTexture:"BBBallMarker"}
+
+# --- Camera ---
+camera "DefaultCamera" cameraType=NONE
+behavior attach "Default Scene" behaviorId=bball.camera
+
+# --- Game Manager & Audio (scene-level) ---
+behavior attach "Default Scene" behaviorId=bball.gameManager
+behavior attach "Default Scene" behaviorId=bball.audio config={bounceSound:"BBBounce",catchSound:"BBCatch",throwSound:"BBThrow",scoreSound:"BBScore"}
+
+# --- Touch Controls ---
+behavior attach "Default Scene" behaviorId=touchControls config={mobileEnabled:true,tabletEnabled:true,desktopEnabled:false,mobileHorizontalLayout:{joystick:{x:15,y:65,size:40,buttonId:"move"},buttons:[{x:80,y:70,size:14,buttonType:"jump",label:"JUMP"},{x:90,y:55,size:14,buttonType:"interact",label:"THROW"}]}}

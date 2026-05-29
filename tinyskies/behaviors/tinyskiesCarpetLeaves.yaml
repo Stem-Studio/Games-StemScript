@@ -1,0 +1,302 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Carpet Leaves"
+  id: "tinyskies.carpetLeaves"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Rustling leaf particles when the carpet flies over land. Pool of 300 leaves with flutter motion + gravity. Active only over land sites with speed > 0.5. Source-faithful port of CarpetLeaves.ts (320 LOC)."
+  documentation: "Active only while vehicleType==='carpet'. Each frame samples the terrain at the player's surface normal via terrain.js sampleTerrain — emits leaves only when the surface is land AND speed > 0.5. Each leaf has its own flutter phase + per-particle color (one of 6 autumn colors). Gravity pulls leaves down along the local up axis; flutter is a sin wave on age. Source uses raw GLSL ShaderMaterial with custom leaf-shaped fragment; replaced with PointsNodeMaterial + RGBA vertexColors for WebGPU compat. Group parented to scene root."
+  tags:
+    - vehicle
+    - vfx
+  priority: 0
+  throttleConfig:
+    throttlePriority: "MEDIUM"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    globeRadius:
+      name: "Globe Radius"
+      type: "number"
+      default: 5
+      min: 0.1
+      max: 200
+    terrainSeed:
+      name: "Terrain Seed"
+      type: "number"
+      default: 42
+      min: 0
+      max: 2147483647
+    terrainType:
+      name: "Terrain Type"
+      type: "string"
+      default: "default"
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  @import "spherical-math" as S;
+  @import "terrain" as T;
+
+  const LOG_TAG = "[tinyskies.carpetLeaves]";
+
+  // Source CarpetLeaves.ts:14-23 — verbatim.
+  const POOL_SIZE = 300;
+  const PARTICLE_LIFETIME_MIN = 1.0;
+  const PARTICLE_LIFETIME_MAX = 2.5;
+  const EMIT_PER_FRAME = 0.25;
+  const LEAF_UP_SPEED = 0.14;
+  const LEAF_OUT_SPEED = 0.14;
+  const GRAVITY = 0.04;
+  const FLUTTER_FREQ = 8.0;
+  const FLUTTER_AMP = 0.015;
+
+  // 6 autumn colors (source LEAF_COLORS palette, approximate).
+  const LEAF_COLORS = [
+    [0.85, 0.45, 0.18],
+    [0.92, 0.65, 0.20],
+    [0.78, 0.30, 0.12],
+    [0.68, 0.60, 0.22],
+    [0.55, 0.75, 0.30],
+    [0.90, 0.80, 0.35],
+  ];
+
+  this.init = function (_game) {
+    this._game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+
+    this._pool = [];
+    for (let i = 0; i < POOL_SIZE; i++) {
+      this._pool.push({
+        alive: false, age: 0, lifetime: 1, phase: 0,
+        px: 0, py: 0, pz: 0, vx: 0, vy: 0, vz: 0,
+        upX: 0, upY: 1, upZ: 0,
+        rightX: 1, rightY: 0, rightZ: 0,
+        cR: 1, cG: 1, cB: 1,
+        size: 0.05,
+      });
+    }
+
+    const positions = new Float32Array(POOL_SIZE * 3);
+    const colors = new Float32Array(POOL_SIZE * 4);
+    const sizes = new Float32Array(POOL_SIZE);
+
+    this._posAttr = new THREE.BufferAttribute(positions, 3);
+    this._colAttr = new THREE.BufferAttribute(colors, 4);
+    this._sizeAttr = new THREE.BufferAttribute(sizes, 1);
+
+    const geo = new THREE.BufferGeometry(); // @check-ok no editor preview — leaves are play-only
+    geo.setAttribute("position", this._posAttr);
+    geo.setAttribute("color", this._colAttr);
+    geo.setAttribute("size", this._sizeAttr);
+    this._geo = geo;
+
+    this._mat = new THREE.PointsNodeMaterial({
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.NormalBlending,
+      vertexColors: true,
+      sizeAttenuation: true,
+      size: 0.05,
+    });
+
+    this._points = new THREE.Points(geo, this._mat);
+    this._points.frustumCulled = false;
+    this._points.userData.isRuntimeOnly = true;
+
+    this._group = new THREE.Group();
+    this._group.userData.isRuntimeOnly = true;
+    this._group.visible = false;
+    this._group.add(this._points);
+    const sceneParent = this.gameObject._internal.three.parent || this.gameObject._internal.three;
+    sceneParent.add(this._group);
+
+    this._landAlpha = 0;
+    this._emitAccum = 0;
+    this._tmpQ = new THREE.Quaternion();
+    this._tmpUp = new THREE.Vector3();
+    this._tmpForward = new THREE.Vector3();
+    this._tmpRight = new THREE.Vector3();
+    this._tmpOrigin = new THREE.Vector3();
+
+    this._log("init");
+  };
+
+  this._emit = function (origin, up, right, forward, speed) {
+    let slot = -1;
+    for (let i = 0; i < POOL_SIZE; i++) {
+      if (!this._pool[i].alive) { slot = i; break; }
+    }
+    if (slot < 0) return;
+    const p = this._pool[slot];
+    p.alive = true;
+    p.age = 0;
+    p.lifetime = PARTICLE_LIFETIME_MIN + Math.random() * (PARTICLE_LIFETIME_MAX - PARTICLE_LIFETIME_MIN);
+    p.phase = Math.random() * Math.PI * 2;
+
+    // Spawn slightly behind the carpet (-forward) and randomized side offset.
+    const sideJitter = (Math.random() - 0.5) * 0.06;
+    const backJitter = -0.02 - Math.random() * 0.04;
+    p.px = origin.x + right.x * sideJitter + forward.x * backJitter;
+    p.py = origin.y + right.y * sideJitter + forward.y * backJitter;
+    p.pz = origin.z + right.z * sideJitter + forward.z * backJitter;
+
+    const upJ = 0.5 + Math.random() * 0.8;
+    const outJ = (Math.random() - 0.5) * 1.5;
+    p.vx = up.x * LEAF_UP_SPEED * upJ + right.x * LEAF_OUT_SPEED * outJ;
+    p.vy = up.y * LEAF_UP_SPEED * upJ + right.y * LEAF_OUT_SPEED * outJ;
+    p.vz = up.z * LEAF_UP_SPEED * upJ + right.z * LEAF_OUT_SPEED * outJ;
+
+    p.upX = up.x; p.upY = up.y; p.upZ = up.z;
+    p.rightX = right.x; p.rightY = right.y; p.rightZ = right.z;
+
+    const palette = LEAF_COLORS[Math.floor(Math.random() * LEAF_COLORS.length)];
+    p.cR = palette[0]; p.cG = palette[1]; p.cB = palette[2];
+    p.size = 0.04 + Math.random() * 0.04;
+  };
+
+  this._tickPool = function (dt, landAlpha) {
+    const positions = this._posAttr.array;
+    const colors = this._colAttr.array;
+    const sizes = this._sizeAttr.array;
+    for (let i = 0; i < POOL_SIZE; i++) {
+      const p = this._pool[i];
+      if (!p.alive) {
+        colors[i * 4 + 3] = 0;
+        sizes[i] = 0;
+        continue;
+      }
+      p.age += dt;
+      if (p.age >= p.lifetime) {
+        p.alive = false;
+        colors[i * 4 + 3] = 0;
+        sizes[i] = 0;
+        continue;
+      }
+      // Gravity along local down + flutter side-to-side.
+      p.vx -= p.upX * GRAVITY * dt;
+      p.vy -= p.upY * GRAVITY * dt;
+      p.vz -= p.upZ * GRAVITY * dt;
+      const flutter = Math.sin(p.age * FLUTTER_FREQ + p.phase) * FLUTTER_AMP * dt;
+      p.px += p.vx * dt + p.rightX * flutter;
+      p.py += p.vy * dt + p.rightY * flutter;
+      p.pz += p.vz * dt + p.rightZ * flutter;
+
+      positions[i * 3]     = p.px;
+      positions[i * 3 + 1] = p.py;
+      positions[i * 3 + 2] = p.pz;
+
+      const t = p.age / p.lifetime;
+      const fadeIn = Math.min(1, p.age / 0.2);
+      const fadeOut = 1 - t;
+      const a = fadeIn * fadeOut * landAlpha;
+      colors[i * 4]     = p.cR;
+      colors[i * 4 + 1] = p.cG;
+      colors[i * 4 + 2] = p.cB;
+      colors[i * 4 + 3] = a;
+      sizes[i] = p.size;
+    }
+    this._posAttr.needsUpdate = true;
+    this._colAttr.needsUpdate = true;
+    this._sizeAttr.needsUpdate = true;
+  };
+
+  this._reset = function () {
+    for (const p of this._pool) p.alive = false;
+    this._colAttr.array.fill(0);
+    this._sizeAttr.array.fill(0);
+    this._colAttr.needsUpdate = true;
+    this._sizeAttr.needsUpdate = true;
+    this._landAlpha = 0;
+    this._emitAccum = 0;
+  };
+
+  this.update = function (deltaTime) {
+    if (!this._group) return;
+    const dt = Math.min(deltaTime, 0.1);
+    const store = this.erth.store;
+    const vt = store.get("tinyskies/vehicleType") || "plane";
+    const isCarpet = (vt === "carpet");
+
+    if (!isCarpet) {
+      if (this._group.visible) {
+        this._group.visible = false;
+        this._reset();
+      }
+      return;
+    }
+    if (!this._group.visible) this._group.visible = true;
+
+    const qx = store.get("tinyskies/qx");
+    const qy = store.get("tinyskies/qy");
+    const qz = store.get("tinyskies/qz");
+    const qw = store.get("tinyskies/qw");
+    const altitude = store.get("tinyskies/altitude");
+    const heading = store.get("tinyskies/heading") || 0;
+    const speedRatio = store.get("tinyskies/speedRatio") || 0;
+    if (qx === undefined || qy === undefined || qz === undefined || qw === undefined || altitude === undefined) {
+      this._tickPool(dt, this._landAlpha);
+      return;
+    }
+    this._tmpQ.set(qx, qy, qz, qw);
+
+    const frame = S.tangentFrame(this._tmpQ);
+    this._tmpUp.copy(frame.up);
+
+    const seed = this.getAttribute("terrainSeed") | 0;
+    const terrainType = this.getAttribute("terrainType");
+    const sample = T.sampleTerrain(seed, terrainType, this._tmpUp.x, this._tmpUp.y, this._tmpUp.z);
+    const overLand = !!sample.isLand;
+
+    // Source CarpetLeaves.ts:298-305 — exponential approach toward target.
+    const speedFade = Math.min(1, Math.max(0, (speedRatio - 0.5) / 0.3));
+    const target = (overLand && speedRatio > 0.5) ? speedFade : 0;
+    this._landAlpha += (target - this._landAlpha) * 0.08;
+
+    this._tickPool(dt, this._landAlpha);
+
+    if (this._landAlpha < 0.01) return;
+
+    this._tmpForward.set(0, 0, 0)
+      .addScaledVector(frame.north, Math.cos(heading))
+      .addScaledVector(frame.east, Math.sin(heading))
+      .normalize();
+    this._tmpRight.crossVectors(this._tmpForward, this._tmpUp).normalize();
+
+    const radius = this.getAttribute("globeRadius");
+    const spawnAlt = altitude * 0.7;
+    const origin = S.cartesianFromSpherical(this._tmpQ, spawnAlt, radius);
+    this._tmpOrigin.copy(origin);
+
+    // Source emits ~speed scaled per frame. We approximate by accumulating a
+    // sub-emit count similar to drift smoke.
+    this._emitAccum += EMIT_PER_FRAME * speedRatio * 60 * dt;
+    const count = Math.floor(this._emitAccum);
+    this._emitAccum -= count;
+    for (let i = 0; i < count; i++) {
+      this._emit(this._tmpOrigin, this._tmpUp, this._tmpRight, this._tmpForward, speedRatio);
+    }
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    if (this._geo && typeof this._geo.dispose === "function") this._geo.dispose();
+    if (this._mat && typeof this._mat.dispose === "function") this._mat.dispose();
+    if (this._group && this._group.parent) this._group.parent.remove(this._group);
+    this._group = null;
+    this._geo = null;
+    this._mat = null;
+    this._points = null;
+    this._pool = null;
+  };

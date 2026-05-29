@@ -1,0 +1,35 @@
+# Drop7 — Classic-style number puzzle
+
+project title "Drop7"
+
+# Scene: rich arcade gradient behind the UIKit playfield
+scene background type=Gradient gradient="radial-gradient(circle at 50% 12%, #204f7a 0%, #122847 34%, #0b1220 72%, #05070d 100%)"
+
+# Lighting: simple ambient fill for UI-only presentation
+light "AmbientLight" intensity=2
+delete "HemisphereLight"
+delete "Directional Light"
+
+# Attach point for the gameplay behavior
+add group name="GameBoard" position=0,0,0
+
+# Fixed camera; UIKit parents to uiCamera at runtime
+camera "DefaultCamera" cameraType=NONE fov=40 near=0.01 far=100
+update "DefaultCamera" position=0,10,0 rotation=-90,0,0
+
+# Audio (Kenney CC0 — UI Audio + Impact Sounds packs)
+import audio name="DropSfx" filepath="audio/drop_click.ogg" comment="Click when a chip drop begins"
+import audio name="LandSfx" filepath="audio/land_thud.ogg" comment="Light thud when chip rests in slot"
+import audio name="ClearSfx" filepath="audio/clear_bell.ogg" comment="Bell on match/clear"
+import audio name="ChainSfx" filepath="audio/chain_bright.ogg" comment="Brighter glass ring for chains"
+import audio name="OverSfx" filepath="audio/over_low.ogg" comment="Low metal thud on game over"
+
+# Shared script-import asset — UIKit dual-mode helper used by the game behavior.
+import script name="uikit-dual-mode" filepath="imports/uikit-dual-mode.yaml" comment="Dual-mode UIKit lifecycle helper"
+
+# Behavior import
+import behavior name="Drop7 Game" filepath="behaviors/drop7Game.yaml" comment="Classic-style Drop7 rules and UIKit HUD"
+behavior attach "GameBoard" behaviorId=drop7.game
+
+# Enable play mode; built-in HUD stays hidden because UIKit renders the full UI
+game settings enabled=true showHUD=false

@@ -1,0 +1,213 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  priority: 0
+  name: "FP3 Castle"
+  id: "fp3.castle"
+  author: "flight-sim"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Procedural medieval castle with towers, walls, keep, gate, and battlements"
+  tags:
+    - gameplay
+  attributes: {}
+  documentation: Generates a castle structure at (200, GROUND_LEVEL, -300) with four
+    corner towers with cone caps, connecting walls with battlements, a central keep,
+    and a gate opening. All geometry is runtime-only and fully disposed on cleanup.
+
+code: |
+  let game;
+
+  // --- Constants ---
+  let GROUND_LEVEL = 10;
+  let SEA_LEVEL = 0;
+  let CASTLE_X = 200;
+  let CASTLE_Z = -300;
+
+  let TOWER_RADIUS = 3;
+  let TOWER_HEIGHT = 20;
+  let TOWER_SEGMENTS = 8;
+  let CAP_RADIUS = 4;
+  let CAP_HEIGHT = 8;
+  let WALL_HEIGHT = 15;
+  let WALL_THICKNESS = 2;
+  let KEEP_SIZE = 15;
+  let KEEP_HEIGHT = 25;
+  let CASTLE_HALF = 20;
+  let BATTLEMENT_SIZE = 1;
+  let BATTLEMENT_SPACING = 3;
+  let GATE_WIDTH = 6;
+  let GATE_HEIGHT = 10;
+
+  // --- State ---
+  let castleGroup = null;
+  let geometries = [];
+  let materials = [];
+  let parentObj = null;
+
+  this.init = function(_game) {
+    game = _game;
+  };
+
+  function makeMat(color) {
+    let mat = new THREE.MeshStandardNodeMaterial({ color: color });
+    materials.push(mat);
+    return mat;
+  }
+
+  function makeGeo(geo) {
+    geometries.push(geo);
+    return geo;
+  }
+
+  function addMesh(parent, geo, mat, x, y, z) {
+    let mesh = new THREE.Mesh(geo, mat);
+    mesh.position.set(x, y, z);
+    parent.add(mesh);
+    return mesh;
+  }
+
+  function buildTower(parent, x, z) {
+    let stoneMat = makeMat(0x888888);
+    let capMat = makeMat(0x8B0000);
+
+    // Tower cylinder
+    let towerGeo = makeGeo(new THREE.CylinderGeometry(TOWER_RADIUS, TOWER_RADIUS, TOWER_HEIGHT, TOWER_SEGMENTS));
+    addMesh(parent, towerGeo, stoneMat, x, TOWER_HEIGHT / 2, z);
+
+    // Cone cap
+    let capGeo = makeGeo(new THREE.ConeGeometry(CAP_RADIUS, CAP_HEIGHT, TOWER_SEGMENTS));
+    addMesh(parent, capGeo, capMat, x, TOWER_HEIGHT + CAP_HEIGHT / 2, z);
+  }
+
+  function buildWall(parent, x1, z1, x2, z2, hasGate) {
+    let wallMat = makeMat(0x999999);
+    let dx = x2 - x1;
+    let dz = z2 - z1;
+    let length = Math.sqrt(dx * dx + dz * dz);
+    let angle = Math.atan2(dx, dz);
+    let cx = (x1 + x2) / 2;
+    let cz = (z1 + z2) / 2;
+
+    if (hasGate) {
+      // Two wall segments with a gap in the middle
+      let segLen = (length - GATE_WIDTH) / 2;
+
+      // Left segment
+      let leftGeo = makeGeo(new THREE.BoxGeometry(WALL_THICKNESS, WALL_HEIGHT, segLen));
+      let leftMesh = addMesh(parent, leftGeo, wallMat, 0, WALL_HEIGHT / 2, 0);
+      let offset1 = (segLen / 2 + GATE_WIDTH / 2);
+      leftMesh.position.set(
+        cx - Math.sin(angle) * 0 + Math.cos(angle) * 0 - Math.sin(angle + Math.PI / 2) * 0,
+        WALL_HEIGHT / 2,
+        cz
+      );
+      // Simpler approach: offset along wall direction
+      let dirX = dx / length;
+      let dirZ = dz / length;
+      leftMesh.position.set(
+        cx - dirX * (segLen / 2 + GATE_WIDTH / 2),
+        WALL_HEIGHT / 2,
+        cz - dirZ * (segLen / 2 + GATE_WIDTH / 2)
+      );
+      leftMesh.rotation.y = angle;
+
+      // Right segment
+      let rightGeo = makeGeo(new THREE.BoxGeometry(WALL_THICKNESS, WALL_HEIGHT, segLen));
+      let rightMesh = addMesh(parent, rightGeo, wallMat, 0, WALL_HEIGHT / 2, 0);
+      rightMesh.position.set(
+        cx + dirX * (segLen / 2 + GATE_WIDTH / 2),
+        WALL_HEIGHT / 2,
+        cz + dirZ * (segLen / 2 + GATE_WIDTH / 2)
+      );
+      rightMesh.rotation.y = angle;
+
+      // Gate arch (top beam)
+      let archGeo = makeGeo(new THREE.BoxGeometry(WALL_THICKNESS, WALL_HEIGHT - GATE_HEIGHT, GATE_WIDTH));
+      let archMesh = addMesh(parent, archGeo, wallMat, cx, GATE_HEIGHT + (WALL_HEIGHT - GATE_HEIGHT) / 2, cz);
+      archMesh.rotation.y = angle;
+    } else {
+      // Solid wall
+      let wallGeo = makeGeo(new THREE.BoxGeometry(WALL_THICKNESS, WALL_HEIGHT, length));
+      let wallMesh = addMesh(parent, wallGeo, wallMat, cx, WALL_HEIGHT / 2, cz);
+      wallMesh.rotation.y = angle;
+
+      // Battlements on top
+      let battleMat = makeMat(0x777777);
+      let numBattlements = Math.floor(length / BATTLEMENT_SPACING);
+      for (let i = 0; i < numBattlements; i++) {
+        let t = (i + 0.5) / numBattlements - 0.5;
+        let bx = cx + dx * t;
+        let bz = cz + dz * t;
+        if (i % 2 === 0) {
+          let bGeo = makeGeo(new THREE.BoxGeometry(WALL_THICKNESS + 0.5, BATTLEMENT_SIZE, BATTLEMENT_SIZE));
+          addMesh(parent, bGeo, battleMat, bx, WALL_HEIGHT + BATTLEMENT_SIZE / 2, bz);
+        }
+      }
+    }
+  }
+
+  this.onStart = function() {
+    parentObj = this.gameObject._internal.three;
+    castleGroup = new THREE.Group();
+    castleGroup.userData.isRuntimeOnly = true;
+    castleGroup.position.set(CASTLE_X, GROUND_LEVEL, CASTLE_Z);
+
+    // Corner positions (relative to castle center)
+    let corners = [
+      { x: -CASTLE_HALF, z: -CASTLE_HALF },
+      { x:  CASTLE_HALF, z: -CASTLE_HALF },
+      { x:  CASTLE_HALF, z:  CASTLE_HALF },
+      { x: -CASTLE_HALF, z:  CASTLE_HALF }
+    ];
+
+    // Build 4 towers
+    for (let i = 0; i < corners.length; i++) {
+      buildTower(castleGroup, corners[i].x, corners[i].z);
+    }
+
+    // Build 4 walls (front wall has gate)
+    buildWall(castleGroup, corners[0].x, corners[0].z, corners[1].x, corners[1].z, false);
+    buildWall(castleGroup, corners[1].x, corners[1].z, corners[2].x, corners[2].z, false);
+    buildWall(castleGroup, corners[2].x, corners[2].z, corners[3].x, corners[3].z, true); // gate wall
+    buildWall(castleGroup, corners[3].x, corners[3].z, corners[0].x, corners[0].z, false);
+
+    // Central keep
+    let keepMat = makeMat(0x666666);
+    let keepGeo = makeGeo(new THREE.BoxGeometry(KEEP_SIZE, KEEP_HEIGHT, KEEP_SIZE));
+    addMesh(castleGroup, keepGeo, keepMat, 0, KEEP_HEIGHT / 2, 0);
+
+    parentObj.add(castleGroup);
+  };
+
+  this.update = function(dt) {
+    // Static structure — no update needed
+  };
+
+  this.dispose = function() {
+    if (castleGroup && parentObj) {
+      parentObj.remove(castleGroup);
+    }
+    castleGroup = null;
+
+    for (let i = 0; i < geometries.length; i++) {
+      geometries[i].dispose();
+    }
+    for (let j = 0; j < materials.length; j++) {
+      materials[j].dispose();
+    }
+    geometries = [];
+    materials = [];
+  };
+
+  this.onEditorAdded = function() {
+    // No editor preview for runtime-only procedural geometry
+  };
+
+  this.onEditorDispose = function() {
+    // Nothing to clean up in editor
+  };

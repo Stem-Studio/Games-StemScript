@@ -1,0 +1,144 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+config:
+  priority: 0
+  name: "FP3-Rain"
+  id: "fp3.rain"
+  author: "flight-sim"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Particle rain system using InstancedMesh for performance"
+  tags:
+    - gameplay
+  attributes: {}
+  documentation: "Creates 3000 raindrop instances that fall around the player. Active only when fp3_weatherRain store key is true."
+code: |
+  const SEA_LEVEL = 0;
+  const GROUND_LEVEL = 10;
+
+  let game;
+  const disposables = [];
+  const DROP_COUNT = 3000;
+  const SPREAD = 100;
+  const FALL_HEIGHT = 50;
+  const MIN_SPEED = 20;
+  const MAX_SPEED = 30;
+
+  let rainMesh = null;
+  let rainContainer = null;
+  const drops = []; // { x, y, z, speed } relative offsets
+
+  function trackGeo(geo) { disposables.push(geo); return geo; }
+  function trackMat(mat) { disposables.push(mat); return mat; }
+
+  function rand(min, max) { return min + Math.random() * (max - min); }
+
+  this.init = function(_game) {
+    game = _game;
+
+    const geo = trackGeo(new THREE.CylinderGeometry(0.02, 0.02, 1, 4));
+    const mat = trackMat(new THREE.MeshBasicNodeMaterial({
+      color: 0xaaddff,
+      transparent: true,
+      opacity: 0.4,
+      depthWrite: false,
+    }));
+
+    rainMesh = new THREE.InstancedMesh(geo, mat, DROP_COUNT);
+    rainMesh.userData.isRuntimeOnly = true;
+    disposables.push(rainMesh);
+
+    // Initialize drop data
+    for (let i = 0; i < DROP_COUNT; i++) {
+      drops.push({
+        x: rand(-SPREAD / 2, SPREAD / 2),
+        y: rand(0, FALL_HEIGHT),
+        z: rand(-SPREAD / 2, SPREAD / 2),
+        speed: rand(MIN_SPEED, MAX_SPEED),
+      });
+    }
+
+    rainContainer = new THREE.Group();
+    rainContainer.userData.isRuntimeOnly = true;
+    rainContainer.visible = false;
+    rainContainer.add(rainMesh);
+
+    this.gameObject._internal.three.add(rainContainer);
+
+    // Set initial transforms
+    this._updateMatrices(THREE);
+  };
+
+  this._dummy = null;
+
+  this._updateMatrices = function(THREE) {
+    if (!this._dummy) {
+      this._dummy = new THREE.Object3D();
+    }
+    const dummy = this._dummy;
+    for (let i = 0; i < DROP_COUNT; i++) {
+      const d = drops[i];
+      dummy.position.set(d.x, d.y, d.z);
+      dummy.scale.set(1, 1, 1);
+      dummy.updateMatrix();
+      rainMesh.setMatrixAt(i, dummy.matrix);
+    }
+    rainMesh.instanceMatrix.needsUpdate = true;
+  };
+
+  this.update = function(delta) {
+    const dt = Math.min(delta, 0.1);
+    const store = this.erth.store;
+    const isRaining = store.get('fp3_weatherRain');
+    rainContainer.visible = !!isRaining;
+
+    if (!isRaining) return;
+
+    // Follow player position
+    const playerPos = store.get('fp3_playerPosition');
+    if (playerPos) {
+      rainContainer.position.set(playerPos.x || 0, playerPos.y || 0, playerPos.z || 0);
+    }
+
+    // Animate drops falling
+    for (let i = 0; i < DROP_COUNT; i++) {
+      const d = drops[i];
+      d.y -= d.speed * delta;
+
+      // Recycle if below player
+      if (d.y < -10) {
+        d.y = FALL_HEIGHT + rand(0, 10);
+        d.x = rand(-SPREAD / 2, SPREAD / 2);
+        d.z = rand(-SPREAD / 2, SPREAD / 2);
+        d.speed = rand(MIN_SPEED, MAX_SPEED);
+      }
+    }
+
+    this._updateMatrices(THREE);
+  };
+
+  this.dispose = function() {
+    if (rainContainer && rainContainer.parent) {
+      rainContainer.parent.remove(rainContainer);
+    }
+    for (let i = disposables.length - 1; i >= 0; i--) {
+      disposables[i].dispose();
+    }
+    disposables.length = 0;
+    drops.length = 0;
+    rainMesh = null;
+    rainContainer = null;
+    this._dummy = null;
+    game = null;
+  };
+
+  this.onEditorAdded = function() {
+    // No editor preview for runtime-only procedural geometry
+  };
+
+  this.onEditorDispose = function() {
+    // Nothing to clean up in editor
+  };

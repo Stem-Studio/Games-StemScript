@@ -1,0 +1,35 @@
+{
+  "title": "Drop7",
+  "mode": "creation",
+  "createdAt": "2026-04-23",
+  "destination": "drop7",
+  "generatedFiles": [
+    "drop7/drop7.stemscript",
+    "drop7/design-doc.md",
+    "drop7/README.md",
+    "drop7/creation-notes.md",
+    "drop7/creation-manifest.json",
+    "drop7/behaviors/drop7Game.yaml"
+  ],
+  "directories": [
+    "drop7/behaviors"
+  ],
+  "assets": [],
+  "behaviors": [
+    {
+      "id": "drop7.game",
+      "file": "drop7/behaviors/drop7Game.yaml",
+      "attributes": {
+        "roundLength": 5,
+        "solidDiscChance": 0.18,
+        "clearBaseScore": 7,
+        "clearBoardBonus": 70000
+      }
+    }
+  ],
+  "notes": [
+    "Classic-style single-mode Drop7 implementation",
+    "UI-only presentation using UIKit",
+    "Scoring and disc distribution are configurable approximations"
+  ]
+}

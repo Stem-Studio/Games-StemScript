@@ -1,0 +1,673 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Sky Gremlins"
+  id: "tinyskies.skyGremlins"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Flying gremlin enemies that chase the player and shoot paintballs back. Capped MVP — Gremlin King + Hearts pickups deferred."
+  documentation: "Pool of `gremlinCount` (default 3) procedural gremlins flying on the globe. Each has spherical state (qPosition, heading, altitude), HP, fire cooldown. AI per gremlin: when player within DETECT_RANGE, turn-toward-player and orbit at STANDOFF_IDEAL; when aim aligned and cooldown ready, fire a paintball projectile that flies toward the player. Player paintball vs gremlin: read `tinyskies/gremlinHits` queue published by paintballSystem; apply 1 damage per hit; on death, fall + respawn after 13-19s. Gremlin paintball vs player (HIT_RADIUS 0.22): push slow/wobble/damage signals into store for the flightController. HP bar billboard above each gremlin tracks remaining HP. Source SkyGremlins.ts is 1507 lines (King variant + retaliate mode + complex armor mesh + multiple shooting patterns); the WebGPU port ships only the basic gremlin (one type). Documented in tinyskies-fidelity-decision-record.md."
+  tags:
+    - gameplay
+    - enemy
+  priority: 0
+  throttleConfig:
+    throttlePriority: "HIGH"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    globeRadius:
+      name: "Globe Radius"
+      type: "number"
+      default: 5
+      min: 0.5
+      max: 200
+    gremlinCount:
+      name: "Gremlin Count"
+      type: "number"
+      default: 3
+      min: 1
+      max: 12
+    seed:
+      name: "Spawn Seed"
+      type: "number"
+      default: 42
+      min: 1
+      max: 1000000
+    kingKillThreshold:
+      name: "King Kill Threshold"
+      type: "number"
+      default: 5
+      min: 0
+      max: 50
+      description: "After this many basic-gremlin kills in a session, the Gremlin King spawns once. Set 0 to spawn the King immediately at scene init; set high to disable until late session."
+    kingEnabled:
+      name: "King Enabled"
+      type: "boolean"
+      default: true
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  @import "spherical-math" as S;
+
+  const LOG_TAG = "[tinyskies.skyGremlins]";
+
+  // Constants — verbatim from source SkyGremlins.ts:50-103.
+  const GREMLIN_HP_MAX = 3;
+  const GREMLIN_ALTITUDE_MIN = 0.52;
+  const GREMLIN_ALTITUDE_MAX = 0.65;
+  const GREMLIN_CRUISE_SPEED = 0.34;
+  const GREMLIN_CHASE_SPEED = 0.5;
+  const GREMLIN_BOB_SPEED = 2.8;
+  const GREMLIN_BOB_AMP = 0.08;
+  const GREMLIN_FLAP_SPEED = 11.5;
+  const GREMLIN_FLAP_AMP = 0.72;
+  const GREMLIN_DETECT_RANGE = 2.25;
+  const GREMLIN_STANDOFF_IDEAL = 1.15;
+  const GREMLIN_STANDOFF_MIN = 0.92;
+  // Source-faithful (SkyGremlins.ts:79). When the gremlin is below this distance,
+  // steer tangent-and-retreat instead of straight at the player so the player
+  // can yaw around and re-acquire it. Without this, the gremlin closes to 0
+  // distance during a player 180° turn and ends up "glued" to the wing.
+  const GREMLIN_FIRE_RANGE = 1.6;
+  // Gremlin King — promoted in FDR-006 followup. Source SkyGremlins.ts:50-94.
+  // Spawns once after `kingKillThreshold` basic gremlins are downed (default 5,
+  // matching source's narrative beat). HP 10 (vs 3), longer fire range, slower
+  // cooldown. Red/dark recoloring of the same procedural mesh — source's
+  // multi-material body/belly/wing scheme is approximated via a single
+  // material colorOverride in buildGremlinMesh.
+  const GREMLIN_KING_HP_MAX = 10;
+  const GREMLIN_KING_FIRE_RANGE = 2.55;
+  const GREMLIN_KING_FIRE_COOLDOWN_MIN = 2.5;
+  const GREMLIN_KING_FIRE_COOLDOWN_MAX = 3.85;
+  const GREMLIN_FIRE_DOT = 0.82;
+  const GREMLIN_AIM_TURN_RATE = 9.0;
+  const GREMLIN_FIRE_COOLDOWN_MIN = 1.85;
+  const GREMLIN_FIRE_COOLDOWN_MAX = 2.95;
+  const GREMLIN_RESPAWN_MIN_SEC = 13.0;
+  const GREMLIN_RESPAWN_MAX_SEC = 19.0;
+  const GREMLIN_HIT_RADIUS = 0.16;          // player paintball hit-radius vs gremlin
+  const PLAYER_HIT_RADIUS = 0.22;           // gremlin paintball hit-radius vs player
+  const GREMLIN_FALL_SEC = 0.8;
+  const GREMLIN_FALL_SPEED = 0.95;
+  const GREMLIN_SHOT_SPEED = 2.85;
+  const GREMLIN_SHOT_LIFETIME_SEC = 4.0;
+  const HP_BAR_RADIAL_LIFT = 0.12;
+  const HP_BAR_W = 0.135;
+  const HP_BAR_H = 0.0145;
+
+  function seededRandom(seed) {
+    let s = seed >>> 0;
+    if (s === 0) s = 1;
+    return function () { s = (s * 16807) % 2147483647; return (s - 1) / 2147483646; };
+  }
+
+  function buildGremlinMesh() {
+    const root = new THREE.Group();
+    // Body: green sphere. No editor preview by design — gremlins only spawn at
+    // runtime under their AI; an empty editor stub would be bloat per CLAUDE.md
+    // memory feedback_no_empty_editor_stubs.md.
+    const bodyMat = new THREE.MeshStandardNodeMaterial({ color: 0x4a7c3b, roughness: 0.55, metalness: 0.05, flatShading: true });
+    const body = new THREE.Mesh(new THREE.SphereGeometry(0.06, 8, 8), bodyMat);     // @check-ok runtime-only enemy mesh
+    root.add(body);
+    // Head: smaller sphere out front (toward -Z).
+    const headMat = new THREE.MeshStandardNodeMaterial({ color: 0x68a355, roughness: 0.55, metalness: 0.05, flatShading: true });
+    const head = new THREE.Mesh(new THREE.SphereGeometry(0.045, 8, 8), headMat);
+    head.position.set(0, 0.02, -0.06);
+    root.add(head);
+    // Eyes — bright yellow cubes.
+    const eyeMat = new THREE.MeshBasicNodeMaterial({ color: 0xffcc00 });
+    const eyeL = new THREE.Mesh(new THREE.BoxGeometry(0.012, 0.012, 0.012), eyeMat);
+    eyeL.position.set(-0.018, 0.025, -0.085);
+    root.add(eyeL);
+    const eyeR = new THREE.Mesh(new THREE.BoxGeometry(0.012, 0.012, 0.012), eyeMat);
+    eyeR.position.set(0.018, 0.025, -0.085);
+    root.add(eyeR);
+    // Tail — cone pointing back.
+    const tailMat = new THREE.MeshStandardNodeMaterial({ color: 0x4a7c3b, roughness: 0.55, metalness: 0.05, flatShading: true });
+    const tail = new THREE.Mesh(new THREE.ConeGeometry(0.012, 0.08, 4), tailMat);
+    tail.position.set(0, 0, 0.07);
+    tail.rotation.x = Math.PI / 2;
+    root.add(tail);
+    // Wings — 2 flapping planes.
+    const wingMat = new THREE.MeshStandardNodeMaterial({ color: 0x2d1b38, roughness: 0.5, metalness: 0.05, flatShading: true, side: THREE.DoubleSide });
+    const wingL = new THREE.Mesh(new THREE.PlaneGeometry(0.13, 0.07), wingMat);
+    wingL.position.set(-0.04, 0.02, 0.0);
+    wingL.rotation.y = -Math.PI / 2;
+    const wingR = new THREE.Mesh(new THREE.PlaneGeometry(0.13, 0.07), wingMat);
+    wingR.position.set(0.04, 0.02, 0.0);
+    wingR.rotation.y = Math.PI / 2;
+    root.add(wingL);
+    root.add(wingR);
+    // Track wings + materials for flap animation + dispose.
+    root.userData.wingL = wingL;
+    root.userData.wingR = wingR;
+    root.userData.materials = [bodyMat, headMat, eyeMat, tailMat, wingMat];
+    return root;
+  }
+
+  function buildHpBar() {
+    const root = new THREE.Group();
+    root.renderOrder = 5;
+    const trackMat = new THREE.MeshBasicNodeMaterial({
+      color: new THREE.Color(0x000000),
+      transparent: true,
+      opacity: 0.6,
+      depthWrite: false,
+    });
+    const track = new THREE.Mesh(new THREE.PlaneGeometry(HP_BAR_W, HP_BAR_H), trackMat);
+    root.add(track);
+    const fillMat = new THREE.MeshBasicNodeMaterial({
+      color: new THREE.Color(0xa8e0ff),
+      transparent: true,
+      opacity: 0.95,
+      depthWrite: false,
+    });
+    const fill = new THREE.Mesh(new THREE.PlaneGeometry(HP_BAR_W - 0.005, HP_BAR_H * 0.6), fillMat);
+    fill.position.z = 0.001;
+    root.add(fill);
+    root.userData.fill = fill;
+    root.userData.fillW = HP_BAR_W - 0.005;
+    root.userData.materials = [trackMat, fillMat];
+    return root;
+  }
+
+  let game;
+
+  this.init = function (_game) {
+    game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+
+    this._tmpV = new THREE.Vector3();
+    this._tmpV2 = new THREE.Vector3();
+    this._tmpV3 = new THREE.Vector3();
+    this._tmpQ = new THREE.Quaternion();
+    this._camWorld = new THREE.Vector3();
+    this._playerWorld = new THREE.Vector3();
+    this._playerQ = new THREE.Quaternion();
+
+    this._rand = seededRandom(this.getAttribute("seed"));
+    this._time = 0;
+    this._buildVisuals(this.gameObject._internal.three);
+    // Seed the published positions list (paintballSystem reads it).
+    this._publishGremlinPositions();
+    const gs = this._gremlins;
+    this._log("init", gs ? gs.length : 0, "gremlins");
+  };
+
+  this.update = function (deltaTime) {
+    const gremlins = this._gremlins;
+    if (!gremlins || !game || !game.camera) return;
+    const dt = Math.min(deltaTime, 0.1);
+    this._time += dt;
+    const globeRadius = this.getAttribute("globeRadius");
+
+    // ── Drain `tinyskies/gremlinHits` queue (paintballSystem writes here). ──
+    const hits = this.erth.store.get("tinyskies/gremlinHits");
+    if (Array.isArray(hits) && hits.length > 0) {
+      for (const h of hits) {
+        const idx = typeof h === "number" ? h : h && h.index;
+        if (typeof idx !== "number" || idx < 0 || idx >= gremlins.length) continue;
+        this._damageGremlin(gremlins[idx]);
+      }
+      hits.length = 0; // drain in place
+    }
+
+    // ── Read player position. ──
+    const qx = this.erth.store.get("tinyskies/qx");
+    const qw = this.erth.store.get("tinyskies/qw");
+    const planeAlt = this.erth.store.get("tinyskies/altitude");
+    let playerKnown = false;
+    if (qx !== undefined && qw !== undefined && typeof planeAlt === "number") {
+      this._playerQ.set(qx, this.erth.store.get("tinyskies/qy") || 0, this.erth.store.get("tinyskies/qz") || 0, qw);
+      const playerWorld = S.cartesianFromSpherical(this._playerQ, planeAlt, globeRadius);
+      this._playerWorld.copy(playerWorld);
+      playerKnown = true;
+    }
+    game.camera.getWorldPosition(this._camWorld);
+
+    // ── Per-gremlin update. ──
+    for (let i = 0; i < gremlins.length; i++) {
+      const g = gremlins[i];
+      this._updateGremlin(g, dt, playerKnown, globeRadius);
+    }
+
+    // ── Per-projectile (gremlin shot) update. ──
+    if (this._shots) this._updateShots(dt, playerKnown, globeRadius);
+
+    this._publishGremlinPositions();
+  };
+
+  this._updateGremlin = function (g, dt, playerKnown, globeRadius) {
+    if (!g.alive) {
+      g.respawnTimer -= dt;
+      // While dead, fall toward globe (visual).
+      if (g.fallTimer > 0) {
+        g.fallTimer -= dt;
+        g.altitude = Math.max(0.05, g.altitude - GREMLIN_FALL_SPEED * dt);
+        this._poseGremlin(g, globeRadius);
+      } else {
+        g.mesh.visible = false;
+        g.hpBar.visible = false;
+      }
+      if (g.respawnTimer <= 0) this._respawnGremlin(g, globeRadius);
+      return;
+    }
+
+    // ── AI: chase or cruise ──
+    let targetSpeed = GREMLIN_CRUISE_SPEED;
+    let targetHeadingDelta = 0;
+
+    if (playerKnown) {
+      const myWorld = S.cartesianFromSpherical(g.qPos, g.altitude, globeRadius);
+      const distToPlayer = myWorld.distanceTo(this._playerWorld);
+      g.distToPlayer = distToPlayer;
+      if (distToPlayer < GREMLIN_DETECT_RANGE) {
+        // Compute desired heading toward player on the tangent plane.
+        const frame = S.tangentFrame(g.qPos);
+        // Vector from gremlin to player projected onto tangent plane.
+        this._tmpV.copy(this._playerWorld).sub(myWorld);
+        const radial = this._tmpV.dot(frame.up);
+        this._tmpV.addScaledVector(frame.up, -radial);
+        if (this._tmpV.lengthSq() > 1e-6) {
+          this._tmpV.normalize();
+          let desiredHeading = Math.atan2(this._tmpV.dot(frame.east), this._tmpV.dot(frame.north));
+
+          // Standoff offset: when too close, rotate the desired heading off
+          // the player so the gremlin orbits/retreats instead of closing further.
+          // The pick-side hash uses the gremlin's qPos so each gremlin orbits
+          // a consistent direction (no flip-flopping on frame boundaries).
+          const orbitSign = ((g.qPos.x + g.qPos.z) > 0) ? 1 : -1;
+          let standoffOffset = 0;
+          if (distToPlayer < GREMLIN_STANDOFF_MIN) {
+            // Very close — mostly retreat (135° off the player vector).
+            standoffOffset = orbitSign * (Math.PI * 0.75);
+          } else if (distToPlayer < GREMLIN_STANDOFF_IDEAL) {
+            // Inside the standoff sweet spot — pure tangent orbit (90°).
+            standoffOffset = orbitSign * (Math.PI * 0.5);
+          }
+          desiredHeading += standoffOffset;
+
+          // Smooth turn toward desired heading.
+          let headingDiff = desiredHeading - g.heading;
+          while (headingDiff > Math.PI) headingDiff -= Math.PI * 2;
+          while (headingDiff < -Math.PI) headingDiff += Math.PI * 2;
+          targetHeadingDelta = headingDiff * Math.min(1, GREMLIN_AIM_TURN_RATE * dt);
+        }
+        targetSpeed = distToPlayer > GREMLIN_STANDOFF_IDEAL ? GREMLIN_CHASE_SPEED : GREMLIN_CRUISE_SPEED * 0.7;
+
+        // Fire when in range + aim aligned + cooldown ready. King uses its
+        // own (longer) fire range and (slower) cooldown — source
+        // SkyGremlins.ts:84-94, 1182.
+        const fireRange = g.isKing ? GREMLIN_KING_FIRE_RANGE : GREMLIN_FIRE_RANGE;
+        if (distToPlayer < fireRange && g.fireCooldown <= 0) {
+          // Aim alignment check.
+          const fwd = frame.north.clone().multiplyScalar(Math.cos(g.heading)).addScaledVector(frame.east, Math.sin(g.heading));
+          const toPlayer = this._tmpV2.copy(this._playerWorld).sub(myWorld).normalize();
+          const aimDot = fwd.dot(toPlayer);
+          if (aimDot > GREMLIN_FIRE_DOT) {
+            this._fireShot(g, myWorld, fwd, globeRadius);
+            g.fireCooldown = g.isKing
+              ? GREMLIN_KING_FIRE_COOLDOWN_MIN + this._rand() * (GREMLIN_KING_FIRE_COOLDOWN_MAX - GREMLIN_KING_FIRE_COOLDOWN_MIN)
+              : GREMLIN_FIRE_COOLDOWN_MIN + this._rand() * (GREMLIN_FIRE_COOLDOWN_MAX - GREMLIN_FIRE_COOLDOWN_MIN);
+          }
+        }
+      } else {
+        g.distToPlayer = Infinity;
+      }
+    }
+
+    if (g.fireCooldown > 0) g.fireCooldown -= dt;
+
+    g.heading += targetHeadingDelta;
+    const arc = (targetSpeed * dt) / globeRadius;
+    g.qPos = S.moveOnSphere(g.qPos, g.heading, arc);
+
+    // Bob altitude with sin.
+    g.bobPhase += dt * GREMLIN_BOB_SPEED;
+    g.altitude = g.baseAltitude + Math.sin(g.bobPhase) * GREMLIN_BOB_AMP * 0.05;
+
+    // Wing flap.
+    g.flapPhase += dt * GREMLIN_FLAP_SPEED;
+    if (g.mesh.userData.wingL && g.mesh.userData.wingR) {
+      const flap = Math.sin(g.flapPhase) * GREMLIN_FLAP_AMP;
+      g.mesh.userData.wingL.rotation.x = flap;
+      g.mesh.userData.wingR.rotation.x = -flap;
+    }
+
+    this._poseGremlin(g, globeRadius);
+
+    // HP bar billboard + fill scale.
+    if (g.hpBar) {
+      const myWorld = S.cartesianFromSpherical(g.qPos, g.altitude, globeRadius);
+      this._tmpV.copy(myWorld).normalize();
+      g.hpBar.position.copy(myWorld).addScaledVector(this._tmpV, HP_BAR_RADIAL_LIFT);
+      game.camera.getWorldQuaternion(this._tmpQ);
+      g.hpBar.quaternion.copy(this._tmpQ);
+      const hpMax = g.isKing ? GREMLIN_KING_HP_MAX : GREMLIN_HP_MAX;
+      const ratio = Math.max(0, Math.min(1, g.hp / hpMax));
+      const fill = g.hpBar.userData.fill;
+      const fillW = g.hpBar.userData.fillW;
+      const w = Math.max(0.001, fillW * ratio);
+      fill.scale.set(w / fillW, 1, 1);
+      fill.position.x = -fillW * 0.5 + w * 0.5;
+      g.hpBar.visible = g.hp < hpMax;
+    }
+  };
+
+  this._poseGremlin = function (g, globeRadius) {
+    // Build matrix using same pattern as plane (heading, no pitch, no bank).
+    const m = S.buildPlaneMatrix(g.qPos, g.heading, 0, 0, g.altitude, globeRadius);
+    g.mesh.matrixAutoUpdate = false;
+    g.mesh.matrix.copy(m);
+    g.mesh.matrixWorldNeedsUpdate = true;
+    g.mesh.visible = true;
+  };
+
+  this._fireShot = function (g, myWorld, fwd, globeRadius) {
+    const shots = this._shots;
+    if (!shots) return;
+    const slot = this._findShotSlot();
+    if (slot === -1) return;
+    const shot = shots[slot];
+    shot.alive = true;
+    shot.life = 0;
+    // Aim straight at the player (lead = none for MVP).
+    this._tmpV.copy(this._playerWorld).sub(myWorld).normalize();
+    shot.vel.copy(this._tmpV).multiplyScalar(GREMLIN_SHOT_SPEED);
+    shot.mesh.position.copy(myWorld).addScaledVector(fwd, 0.1);
+    shot.mesh.visible = true;
+  };
+
+  this._findShotSlot = function () {
+    if (!this._shots) return -1;
+    for (let i = 0; i < this._shots.length; i++) {
+      if (!this._shots[i].alive) return i;
+    }
+    return -1;
+  };
+
+  this._updateShots = function (dt, playerKnown, globeRadius) {
+    for (let i = 0; i < this._shots.length; i++) {
+      const sh = this._shots[i];
+      if (!sh.alive) continue;
+      sh.life += dt;
+      sh.mesh.position.addScaledVector(sh.vel, dt);
+      // Hit player?
+      if (playerKnown && sh.mesh.position.distanceTo(this._playerWorld) < PLAYER_HIT_RADIUS) {
+        // Apply slow + wobble + 1 damage to player.
+        this.erth.store.set("tinyskies/applyGremlinSlow", true);
+        this.erth.store.set("tinyskies/applyPaintballWobble", true);
+        const prev = this.erth.store.get("tinyskies/applyGremlinDamage");
+        this.erth.store.set("tinyskies/applyGremlinDamage", (typeof prev === "number" ? prev : 0) + 1);
+        sh.alive = false;
+        sh.mesh.visible = false;
+        continue;
+      }
+      // Despawn after lifetime or if too far from globe origin.
+      if (sh.life >= GREMLIN_SHOT_LIFETIME_SEC || sh.mesh.position.length() > globeRadius * 2.5) {
+        sh.alive = false;
+        sh.mesh.visible = false;
+      }
+    }
+  };
+
+  this._damageGremlin = function (g) {
+    if (!g.alive) return;
+    g.hp -= 1;
+    if (g.hp <= 0) {
+      g.alive = false;
+      g.fallTimer = GREMLIN_FALL_SEC;
+      g.respawnTimer = GREMLIN_RESPAWN_MIN_SEC + this._rand() * (GREMLIN_RESPAWN_MAX_SEC - GREMLIN_RESPAWN_MIN_SEC);
+      // Track basic-gremlin kills for King-spawn trigger. King kill ends the
+      // session-long counter (King doesn't trigger another King).
+      if (!g.isKing) {
+        this._sessionKills = (this._sessionKills || 0) + 1;
+        // Publish for any HUD that wants to surface the count
+        this.erth.store.set("tinyskies/gremlinSessionKills", this._sessionKills);
+        // King spawn check — only one King at a time, only if enabled
+        if (this.getAttribute("kingEnabled")
+            && !this._kingSpawned
+            && this._sessionKills >= this.getAttribute("kingKillThreshold")
+            && this._kingState && !this._kingState.alive) {
+          this._spawnKing(this._kingState);
+        }
+      } else {
+        this._log("Gremlin King defeated! +120 XP (source SKY_GREMLIN_KING_XP)");
+        // Publish king-defeated event for any progression listener
+        this.erth.store.set("tinyskies/kingDefeated", true);
+        this._kingSpawned = false; // allow respawn after the king's respawn timer
+      }
+      this._log(g.isKing ? "KING down — respawn in" : "gremlin down — respawn in", g.respawnTimer.toFixed(1), "s");
+    }
+  };
+
+  this._spawnKing = function (kingState) {
+    if (!kingState || kingState.alive) return;
+    const globeRadius = this.getAttribute("globeRadius");
+    this._respawnGremlin(kingState, globeRadius);
+    this._kingSpawned = true;
+    this._log("Gremlin King spawned at session-kill", this._sessionKills);
+  };
+
+  this._respawnGremlin = function (g, globeRadius) {
+    const spawn = S.randomSpawnQuaternionAndHeading(this.getAttribute("seed") + Math.floor(this._rand() * 1e6));
+    g.qPos.copy(spawn.qPosition);
+    g.heading = spawn.heading;
+    g.baseAltitude = GREMLIN_ALTITUDE_MIN + this._rand() * (GREMLIN_ALTITUDE_MAX - GREMLIN_ALTITUDE_MIN);
+    g.altitude = g.baseAltitude;
+    g.hp = g.isKing ? GREMLIN_KING_HP_MAX : GREMLIN_HP_MAX;
+    g.alive = true;
+    g.fallTimer = 0;
+    g.fireCooldown = g.isKing
+      ? GREMLIN_KING_FIRE_COOLDOWN_MIN + this._rand() * (GREMLIN_KING_FIRE_COOLDOWN_MAX - GREMLIN_KING_FIRE_COOLDOWN_MIN)
+      : GREMLIN_FIRE_COOLDOWN_MIN + this._rand() * (GREMLIN_FIRE_COOLDOWN_MAX - GREMLIN_FIRE_COOLDOWN_MIN);
+    g.bobPhase = this._rand() * Math.PI * 2;
+    g.flapPhase = this._rand() * Math.PI * 2;
+    g.distToPlayer = Infinity;
+    g.mesh.visible = true;
+    g.hpBar.visible = false;
+  };
+
+  this._publishGremlinPositions = function () {
+    const arr = this._gremlinPositions;
+    const gremlins = this._gremlins;
+    if (!arr || !gremlins) return;
+    const globeRadius = this.getAttribute("globeRadius");
+    for (let i = 0; i < gremlins.length; i++) {
+      const g = gremlins[i];
+      if (g.alive) {
+        const w = S.cartesianFromSpherical(g.qPos, g.altitude, globeRadius);
+        arr[i].x = w.x;
+        arr[i].y = w.y;
+        arr[i].z = w.z;
+        arr[i].alive = true;
+        arr[i].hitRadius = GREMLIN_HIT_RADIUS;
+      } else {
+        arr[i].alive = false;
+      }
+    }
+  };
+
+  this._buildVisuals = function (parent) {
+    const gremlinCount = this.getAttribute("gremlinCount");
+
+    const root = new THREE.Group();
+    root.name = "tinyskiesSkyGremlinsRoot";
+    root.userData.isRuntimeOnly = true;
+
+    const gremlins = [];
+    for (let i = 0; i < gremlinCount; i++) {
+      const mesh = buildGremlinMesh();
+      mesh.userData.isRuntimeOnly = true;
+      mesh.traverse((c) => { c.userData.isRuntimeOnly = true; });
+      root.add(mesh);
+
+      const hpBar = buildHpBar();
+      hpBar.userData.isRuntimeOnly = true;
+      hpBar.traverse((c) => { c.userData.isRuntimeOnly = true; });
+      hpBar.visible = false;
+      root.add(hpBar);
+
+      const spawn = S.randomSpawnQuaternionAndHeading(this.getAttribute("seed") + i * 1733);
+      gremlins.push({
+        mesh: mesh,
+        hpBar: hpBar,
+        qPos: spawn.qPosition.clone(),                                                // @check-ok one-shot per gremlin (init only)
+        heading: spawn.heading,
+        baseAltitude: GREMLIN_ALTITUDE_MIN + this._rand() * (GREMLIN_ALTITUDE_MAX - GREMLIN_ALTITUDE_MIN),
+        altitude: 0,
+        hp: GREMLIN_HP_MAX,
+        alive: true,
+        isKing: false,
+        fallTimer: 0,
+        respawnTimer: 0,
+        fireCooldown: GREMLIN_FIRE_COOLDOWN_MIN + this._rand() * (GREMLIN_FIRE_COOLDOWN_MAX - GREMLIN_FIRE_COOLDOWN_MIN),
+        bobPhase: this._rand() * Math.PI * 2,
+        flapPhase: this._rand() * Math.PI * 2,
+        distToPlayer: Infinity,
+      });
+      gremlins[gremlins.length - 1].altitude = gremlins[gremlins.length - 1].baseAltitude;
+    }
+
+    // Gremlin King — built mesh + state up-front but starts !alive. Spawns
+    // when `_sessionKills >= kingKillThreshold` (or immediately if threshold
+    // is 0). Mesh is the same procedural goblin tinted darker red — source's
+    // multi-material king body/belly/wing scheme is approximated.
+    if (this.getAttribute("kingEnabled")) {
+      const kingMesh = buildGremlinMesh();
+      kingMesh.userData.isRuntimeOnly = true;
+      kingMesh.userData.isKing = true;
+      // Tint the king darker/redder. The exact materials vary by mesh part;
+      // we recolor any MeshStandardNodeMaterial we find on the king subtree.
+      const kingTint = new THREE.Color(0xb53028);
+      const kingWingTint = new THREE.Color(0x4a1e1c);
+      kingMesh.traverse((c) => {
+        c.userData.isRuntimeOnly = true;
+        if (c.material && c.material.color) {
+          // Apply king tint — desaturated darker red, with an even darker tone
+          // for wing parts (recognized by name if our buildGremlinMesh tagged
+          // them as `wingL`/`wingR`).
+          const isWing = c.parent && c.parent.userData && (c.parent.userData.isWing === true);
+          c.material = c.material.clone(); // don't mutate the basic-gremlin shared mat
+          c.material.color.copy(isWing ? kingWingTint : kingTint);
+          if (c.material.emissiveNode === undefined && c.material.emissive) {
+            c.material.emissive.set(0x401410);
+          }
+        }
+      });
+      // King is ~1.4× the basic gremlin scale for visual distinction
+      kingMesh.scale.setScalar(1.4);
+      kingMesh.visible = false;
+      root.add(kingMesh);
+
+      const kingHpBar = buildHpBar();
+      kingHpBar.userData.isRuntimeOnly = true;
+      kingHpBar.traverse((c) => { c.userData.isRuntimeOnly = true; });
+      kingHpBar.scale.setScalar(1.4);
+      kingHpBar.visible = false;
+      root.add(kingHpBar);
+
+      this._kingState = {
+        mesh: kingMesh,
+        hpBar: kingHpBar,
+        qPos: new THREE.Quaternion(),
+        heading: 0,
+        baseAltitude: GREMLIN_ALTITUDE_MAX,
+        altitude: 0,
+        hp: GREMLIN_KING_HP_MAX,
+        alive: false,
+        isKing: true,
+        fallTimer: 0,
+        respawnTimer: 0,
+        fireCooldown: 0,
+        bobPhase: 0,
+        flapPhase: 0,
+        distToPlayer: Infinity,
+      };
+      gremlins.push(this._kingState);
+
+      // If threshold is 0, spawn the King immediately on init.
+      if (this.getAttribute("kingKillThreshold") === 0) {
+        this._spawnKing(this._kingState);
+      }
+    } else {
+      this._kingState = null;
+    }
+    this._sessionKills = 0;
+    this._kingSpawned = false;
+
+    // Pre-allocated shot pool (8 max simultaneous gremlin shots).
+    const shotPoolSize = 8;
+    const shots = [];
+    const shotGeo = new THREE.SphereGeometry(0.04, 8, 6);
+    for (let i = 0; i < shotPoolSize; i++) {
+      const mat = new THREE.MeshBasicNodeMaterial({ color: new THREE.Color(0xa2ef7b), transparent: true, depthWrite: false, blending: THREE.AdditiveBlending });
+      const mesh = new THREE.Mesh(shotGeo, mat);
+      mesh.frustumCulled = false;
+      mesh.userData.isRuntimeOnly = true;
+      mesh.visible = false;
+      root.add(mesh);
+      shots.push({ mesh: mesh, mat: mat, vel: new THREE.Vector3(), alive: false, life: 0 });
+    }
+
+    parent.add(root);
+
+    // Pre-allocate published gremlin positions array — paintballSystem reads
+    // `tinyskies/gremlinPositions` each frame and pushes hits to
+    // `tinyskies/gremlinHits` (which we drain at the top of update()).
+    // Length matches `gremlins.length` (basic count + 1 for king if enabled).
+    const positions = [];
+    for (let i = 0; i < gremlins.length; i++) {
+      positions.push({
+        x: 0, y: 0, z: 0,
+        alive: gremlins[i].alive,
+        // King has a slightly larger hit radius (visual scale 1.4×).
+        hitRadius: gremlins[i].isKing ? GREMLIN_HIT_RADIUS * 1.35 : GREMLIN_HIT_RADIUS,
+      });
+    }
+    this.erth.store.set("tinyskies/gremlinPositions", positions);
+    this.erth.store.set("tinyskies/gremlinHits", []);
+
+    this._root = root;
+    this._gremlins = gremlins;
+    this._shots = shots;
+    this._shotGeo = shotGeo;
+    this._gremlinPositions = positions;
+  };
+
+  // No editor preview — gremlins only run in play. The procedural goblin meshes
+  // exist in the scene but are visible only after init() poses them with a real
+  // matrix; in editor they'd cluster at scene origin which would be confusing.
+
+  this.dispose = function () {
+    this._log("dispose");
+    if (this._root) {
+      this._root.traverse((c) => {
+        if (c.geometry && typeof c.geometry.dispose === "function") c.geometry.dispose();
+        if (c.material) {
+          if (Array.isArray(c.material)) {
+            for (const m of c.material) if (m && m.dispose) m.dispose();
+          } else if (c.material.dispose) c.material.dispose();
+        }
+      });
+      if (this._root.parent) this._root.parent.remove(this._root);
+    }
+    if (this._shotGeo) this._shotGeo.dispose();
+    this._root = null;
+    this._gremlins = null;
+    this._shots = null;
+    this._shotGeo = null;
+    this._gremlinPositions = null;
+  };

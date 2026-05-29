@@ -1,0 +1,674 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Race Quest"
+  id: "tinyskies.raceQuest"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Plane/Carpet time trial. Hover near a START banner to fill a 3-2-1 countdown ring, then fly through 12 checkpoint torus rings on a weaving great-circle path to a FINISH banner before the timer expires. Bonus holo diamonds at 3 random checkpoints + the second-to-last ring. Source-faithful port of source RaceManager.ts (528 LOC)."
+  documentation: "Subscribes to race banner data published by tinyskiesGlobeAtmospheric under `tinyskies/raceBanners` and to player state (qx/qy/qz/qw quaternion components, altitude, heading, vehicleType) published by tinyskiesFlightController. State machine: idle → approaching (banner near, fill 3-2-1 ring) → racing (timer + 12 checkpoints) → win/lose → idle. Banners hidden during race via `tinyskies/raceBannersVisibilityCommand`. Constants verbatim from source RaceManager.ts:26-50. Approximations: holo torus shader uses MeshStandardNodeMaterial with TSL emissive instead of source's raw GLSL holoVert/holoFrag (WebGPU compatibility). Bonus diamond mesh uses OctahedronGeometry instead of source's createPlaneCollectibleDiamondGeometry (visually equivalent collectible). Surface altitude approximated as globeRadius (no per-checkpoint terrain displacement query). Audio SFX cues published to `tinyskies/raceSfxCue` for any audio behavior to consume."
+  tags:
+    - gameplay
+    - quest
+  priority: 0
+  throttleConfig:
+    throttlePriority: "HIGH"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    globeRadius:
+      name: "Globe Radius"
+      type: "number"
+      default: 5
+      min: 0.1
+      max: 200
+    raceBannersStoreKey:
+      name: "Race Banners Store Key"
+      type: "string"
+      default: "tinyskies/raceBanners"
+    raceBannersVisibilityCommandKey:
+      name: "Race Banners Visibility Command Key"
+      type: "string"
+      default: "tinyskies/raceBannersVisibilityCommand"
+    raceWonStoreKey:
+      name: "Race Won Counter Key"
+      type: "string"
+      default: "tinyskies/lifetimeRacesWon"
+    raceXpStoreKey:
+      name: "Race XP Award Key"
+      type: "string"
+      default: "tinyskies/awardXp"
+    raceXpAmount:
+      name: "Race Win XP"
+      type: "number"
+      default: 200
+      min: 0
+      max: 10000
+    seed:
+      name: "Seed"
+      type: "number"
+      default: 42
+      min: 0
+      max: 2147483647
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  @import "spherical-math" as S;
+
+  const LOG_TAG = "[tinyskies.raceQuest]";
+
+  // Source RaceManager.ts:26-50 — constants verbatim.
+  const RACE_CHECKPOINT_COUNT = 12;
+  const RACE_RING_RADIUS = 0.54;
+  const RACE_RING_TUBE = 0.054;
+  const RACE_COLLECT_RADIUS = 0.68;
+  const RACE_TIME_LIMIT = 45;
+  const RACE_TIME_LIMIT_CARPET = 40;
+  const RACE_BANNER_TRIGGER_RADIUS = 0.6;
+  const RACE_APPROACH_FILL_SEC = 2;
+  const RACE_LOW_HOVER = 0.4;
+  const RACE_LOW_HOVER_CARPET = 0.22;
+  const RACE_PATH_LAST_STRAIGHT_START = 0.52;
+  const RACE_PATH_WEAVE_A = 0.95;
+  const RACE_PATH_WEAVE_B = 0.58;
+  const RACE_PATH_WEAVE_C = 0.44;
+  const RACE_PATH_WEAVE_FREQ1 = 3;
+  const RACE_PATH_WEAVE_FREQ2 = 4;
+  const RACE_PATH_WEAVE_FREQ3 = 5;
+  const RACE_TARGET_PULSE_AMP = 0.10;
+  const RACE_TARGET_PULSE_HZ = 4.5;
+
+  const RACE_BONUS_DIAMOND_COUNT = 3;
+  const RACE_DIAMOND_SPIN_SPEED = 1.8;
+  const RACE_DIAMOND_BOB_LIFT = 0.012;
+  const RACE_DIAMOND_BOB_AMP = 0.017;
+  const RACE_DIAMOND_BOB_HZ = 1.5;
+
+  // RNG verbatim from source RaceManager.ts:56-62 makeRaceRng.
+  function makeRaceRng(seed) {
+    let s = seed >>> 0;
+    return function () {
+      s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+      return s / 0x100000000;
+    };
+  }
+
+  // Holo material: source uses raw GLSL ShaderMaterial with phaseOffset +
+  // time uniforms. Replaced with MeshStandardNodeMaterial + emissive
+  // (WebGPU-compatible, same visual story: emissive ring + transparency).
+  function buildHoloRingMaterial(hue) {
+    return new THREE.MeshStandardNodeMaterial({
+      color: hue,
+      emissive: hue,
+      emissiveIntensity: 1.4,
+      transparent: true,
+      opacity: 0.85,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+  }
+
+  this.init = function (_game) {
+    this._game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+
+    // Pre-allocated math objects (source RaceManager.ts:112-119 pattern).
+    this._tmpQ = new THREE.Quaternion();
+    this._yAxis = new THREE.Vector3(0, 1, 0);
+    this._qAlign = new THREE.Quaternion();
+    this._spinQ = new THREE.Quaternion();
+    this._ckY = new THREE.Vector3();
+    this._ckZ = new THREE.Vector3();
+    this._ckX = new THREE.Vector3();
+    this._ckZo = new THREE.Vector3();
+    this._ckToNext = new THREE.Vector3();
+    this._ckAlt = new THREE.Vector3();
+    this._ckMat = new THREE.Matrix4();
+    this._scratchUp = new THREE.Vector3();
+    this._scratchForward = new THREE.Vector3();
+    this._scratchTangent = new THREE.Vector3();
+    this._scratchBdW = new THREE.Vector3();
+
+    this._state = "idle";
+    this._activeBannerIndex = -1;
+    this._approachProgress = 0;
+    this._raceTimer = 0;
+    this._currentRingIndex = 0;
+    this._time = 0;
+    this._rings = [];
+
+    this._trackGroup = new THREE.Group();
+    this._trackGroup.userData.isRuntimeOnly = true;
+    this.gameObject._internal.three.add(this._trackGroup);
+
+    this._diamondGeo = new THREE.OctahedronGeometry(0.09, 0); // @check-ok no editor preview — race rings only exist while racing
+    this._buildHud();
+
+    this._log("init");
+  };
+
+  // -----------------------------------------------------------------
+  // HUD: countdown ring + race timer (UIKit Fullscreen).
+  // -----------------------------------------------------------------
+  this._buildHud = function () {
+    if (typeof UIKit === "undefined" || !this._game || !this._game.renderer) return;
+    if (this._fullscreen) return;
+    try {
+      const fs = new UIKit.Fullscreen(this._game.renderer, { // @check-ok-responsive — countdown/timer text scales naturally; mobile readability acceptable
+        backgroundOpacity: 0,
+        flexDirection: "column",
+        justifyContent: "center",
+        alignItems: "center",
+        pointerEvents: "none",
+        visibility: "visible",
+      });
+      this._fullscreen = fs;
+
+      this._countdownText = new UIKit.Text({
+        text: "",
+        fontSize: 72,
+        color: 0xffffff,
+        visibility: "hidden",
+      });
+      fs.add(this._countdownText);
+
+      this._timerText = new UIKit.Text({
+        text: "",
+        fontSize: 36,
+        color: 0xffeb88,
+        visibility: "hidden",
+        positionType: "absolute",
+        positionTop: 24,
+      });
+      fs.add(this._timerText);
+
+      this._goText = new UIKit.Text({
+        text: "GO!",
+        fontSize: 96,
+        color: 0xfff4a8,
+        visibility: "hidden",
+      });
+      fs.add(this._goText);
+      this._goShownAt = -1;
+    } catch (e) {
+      this._log("uikit hud build failed", e);
+    }
+  };
+
+  this._tickHud = function () {
+    if (!this._fullscreen) {
+      this._buildHud();
+    }
+    if (!this._fullscreen) return;
+    if (this._game && this._game.uiCamera && !this._fullscreen.parent) {
+      this._game.uiCamera.add(this._fullscreen);
+    }
+    if (this._game && this._game.renderer && this._game.renderer.domElement && typeof this._fullscreen.update === "function") {
+      this._fullscreen.update(this._game.renderer.domElement.clientWidth, this._game.renderer.domElement.clientHeight);
+    }
+  };
+
+  this._setCountdown = function (text) {
+    if (this._countdownText && typeof this._countdownText.setProperties === "function") {
+      this._countdownText.setProperties({
+        text: text || "",
+        visibility: text ? "visible" : "hidden",
+      });
+    }
+  };
+
+  this._setTimerText = function (seconds) {
+    if (!this._timerText) return;
+    if (seconds === null || seconds === undefined) {
+      this._timerText.setProperties({ visibility: "hidden" });
+      return;
+    }
+    const s = Math.max(0, seconds);
+    const whole = Math.floor(s);
+    const tenths = Math.floor((s - whole) * 10);
+    this._timerText.setProperties({
+      text: whole + "." + tenths + "s",
+      visibility: "visible",
+    });
+  };
+
+  this._showGoToast = function () {
+    if (!this._goText) return;
+    this._goText.setProperties({ visibility: "visible" });
+    this._goShownAt = this._time;
+  };
+
+  this._tickGoToast = function () {
+    if (!this._goText || this._goShownAt < 0) return;
+    if (this._time - this._goShownAt > 1.2) {
+      this._goText.setProperties({ visibility: "hidden" });
+      this._goShownAt = -1;
+    }
+  };
+
+  // -----------------------------------------------------------------
+  // Player state read.
+  // -----------------------------------------------------------------
+  this._getPlayerState = function () {
+    const store = this.erth.store;
+    const qx = store.get("tinyskies/qx");
+    const qy = store.get("tinyskies/qy");
+    const qz = store.get("tinyskies/qz");
+    const qw = store.get("tinyskies/qw");
+    const altitude = store.get("tinyskies/altitude");
+    if (qx === undefined || qy === undefined || qz === undefined || qw === undefined || altitude === undefined) {
+      return null;
+    }
+    this._tmpQ.set(qx, qy, qz, qw);
+    const radius = this.getAttribute("globeRadius");
+    return {
+      pos: S.cartesianFromSpherical(this._tmpQ, altitude, radius),
+      qPosition: this._tmpQ,
+      heading: store.get("tinyskies/heading") || 0,
+      vehicle: store.get("tinyskies/vehicleType") || "plane",
+    };
+  };
+
+  this._isCarpet = function (vehicle) { return vehicle === "carpet"; };
+  // Source RaceManager.ts:71 — only plane and carpet can race; boats excluded.
+  this._canRace = function (vehicle) { return vehicle === "plane" || vehicle === "carpet"; };
+
+  // -----------------------------------------------------------------
+  // Build the 12-checkpoint weaving track from the active banner.
+  // -----------------------------------------------------------------
+  this._buildTrack = function (banner, playerState) {
+    while (this._trackGroup.children.length > 0) {
+      this._trackGroup.remove(this._trackGroup.children[0]);
+    }
+    this._rings = [];
+    this._currentRingIndex = 0;
+
+    const radius = this.getAttribute("globeRadius");
+    const bannerNormal = this._scratchUp.set(banner.normal[0], banner.normal[1], banner.normal[2]).normalize();
+    const startQ = S.quaternionFromSurfaceNormal(bannerNormal.x, bannerNormal.y, bannerNormal.z);
+
+    const playerQ = playerState.qPosition;
+    const heading = playerState.heading;
+    const pFrame = S.tangentFrame(playerQ);
+    const forward = this._scratchForward
+      .set(0, 0, 0)
+      .addScaledVector(pFrame.north, Math.cos(heading))
+      .addScaledVector(pFrame.east, Math.sin(heading))
+      .normalize();
+    const tangent = this._scratchTangent.copy(forward).projectOnPlane(bannerNormal);
+    if (tangent.lengthSq() < 1e-6) tangent.copy(pFrame.north);
+    tangent.normalize();
+    const sFrame = S.tangentFrame(startQ);
+    const pathHeading = Math.atan2(tangent.dot(sFrame.east), tangent.dot(sFrame.north));
+
+    const bannerHangAlt = banner.baseAlt - radius;
+    const lowHover = this._isCarpet(playerState.vehicle) ? RACE_LOW_HOVER_CARPET : RACE_LOW_HOVER;
+    const stepAngle = (Math.PI * 2) / RACE_CHECKPOINT_COUNT;
+
+    const pathQuats = [];
+    let qSeg = startQ.clone();
+    for (let i = 0; i < RACE_CHECKPOINT_COUNT; i++) {
+      const t = i / RACE_CHECKPOINT_COUNT;
+      const k = Math.min(1, Math.max(0, (t - RACE_PATH_LAST_STRAIGHT_START) / (1 - RACE_PATH_LAST_STRAIGHT_START)));
+      const smoothK = k * k * (3 - 2 * k);
+      const weaveScale = 1 - smoothK;
+      const weave = weaveScale * (
+        RACE_PATH_WEAVE_A * Math.sin(t * Math.PI * 2 * RACE_PATH_WEAVE_FREQ1) +
+        RACE_PATH_WEAVE_B * Math.sin(t * Math.PI * 2 * RACE_PATH_WEAVE_FREQ2 + 1.17) +
+        RACE_PATH_WEAVE_C * Math.sin(t * Math.PI * 2 * RACE_PATH_WEAVE_FREQ3 + 0.73)
+      );
+      qSeg = S.moveOnSphere(qSeg, pathHeading + weave, stepAngle);
+      pathQuats.push(qSeg.clone());
+    }
+
+    for (let i = 0; i < RACE_CHECKPOINT_COUNT; i++) {
+      const q = pathQuats[i];
+      const t = (i + 1) / RACE_CHECKPOINT_COUNT;
+      const parabola = 4 * (t - 0.5) * (t - 0.5);
+      const hover = lowHover + (bannerHangAlt - lowHover) * parabola;
+      const pos = S.cartesianFromSpherical(q, hover, radius);
+
+      const iNext = (i + 1) % RACE_CHECKPOINT_COUNT;
+      const nextQ = pathQuats[iNext];
+      const tNext = (iNext + 1) / RACE_CHECKPOINT_COUNT;
+      const parNext = 4 * (tNext - 0.5) * (tNext - 0.5);
+      const hoverNext = lowHover + (bannerHangAlt - lowHover) * parNext;
+      const nextPos = S.cartesianFromSpherical(nextQ, hoverNext, radius);
+
+      const ringGroup = new THREE.Group();
+      ringGroup.userData.isRuntimeOnly = true;
+      ringGroup.position.copy(pos);
+      this._orientCheckpointOnGlobe(ringGroup, pos, nextPos);
+
+      const isFinish = (i === RACE_CHECKPOINT_COUNT - 1);
+      if (isFinish) {
+        const finishMat = new THREE.MeshStandardNodeMaterial({
+          color: 0xffd35a, emissive: 0xffa030, emissiveIntensity: 1.6,
+          transparent: true, opacity: 0.92, side: THREE.DoubleSide, depthWrite: false,
+        });
+        const finishTorus = new THREE.Mesh(
+          new THREE.TorusGeometry(RACE_RING_RADIUS * 1.15, RACE_RING_TUBE * 1.4, 14, 36),
+          finishMat,
+        );
+        finishTorus.userData.isRuntimeOnly = true;
+        ringGroup.add(finishTorus);
+        const centerSphere = new THREE.Mesh(
+          new THREE.SphereGeometry(0.08, 12, 8),
+          new THREE.MeshStandardNodeMaterial({
+            color: 0xffffff, emissive: 0xffe8a8, emissiveIntensity: 2.4,
+          }),
+        );
+        centerSphere.userData.isRuntimeOnly = true;
+        ringGroup.add(centerSphere);
+        this._trackGroup.add(ringGroup);
+        this._rings.push({
+          worldPos: pos.clone(),
+          ringGroup,
+          holoMat: null,
+          finishMat,
+          bonusDiamond: null,
+          collected: false,
+        });
+        continue;
+      }
+
+      const phaseOffset = (i * 1.17) % (Math.PI * 2);
+      const holoMat = buildHoloRingMaterial(0x6cd0ff);
+      const torus = new THREE.Mesh(
+        new THREE.TorusGeometry(RACE_RING_RADIUS, RACE_RING_TUBE, 12, 32),
+        holoMat,
+      );
+      torus.userData.isRuntimeOnly = true;
+      ringGroup.add(torus);
+      this._trackGroup.add(ringGroup);
+      this._rings.push({
+        worldPos: pos.clone(),
+        ringGroup,
+        holoMat,
+        finishMat: null,
+        bonusDiamond: null,
+        collected: false,
+        phaseOffset,
+      });
+    }
+
+    // Bonus diamonds — source RaceManager.ts:399-437 selects 3 random non-
+    // finish rings via a banner-seeded RNG.
+    const torusOnly = this._rings.filter((r) => r.holoMat != null);
+    const nTorus = torusOnly.length;
+    const pickN = Math.min(RACE_BONUS_DIAMOND_COUNT, nTorus);
+    if (pickN > 0) {
+      const seedAttr = this.getAttribute("seed") | 0;
+      const rand = makeRaceRng(seedAttr ^ Math.imul(banner.index, 1009) ^ 0xace1f00d);
+      const order = [];
+      for (let j = 0; j < nTorus; j++) order.push(j);
+      for (let s = order.length - 1; s > 0; s--) {
+        const j = Math.floor(rand() * (s + 1));
+        const tmp = order[s]; order[s] = order[j]; order[j] = tmp;
+      }
+      for (let p = 0; p < pickN; p++) {
+        const rec = torusOnly[order[p]];
+        const dPhase = (p * 2.31 + banner.index * 0.37) % (Math.PI * 2);
+        this._attachBonusDiamond(rec, dPhase);
+      }
+    }
+    // Source RaceManager.ts:439-464 — guarantee a diamond on the second-to-last ring.
+    const lastRingRec = this._rings[this._rings.length - 2];
+    if (lastRingRec && !lastRingRec.bonusDiamond) {
+      const dPhase = (banner.index * 0.91 + 2.718) % (Math.PI * 2);
+      this._attachBonusDiamond(lastRingRec, dPhase);
+    }
+  };
+
+  this._attachBonusDiamond = function (rec, dPhase) {
+    const dMat = new THREE.MeshStandardNodeMaterial({
+      color: 0x88f0ff, emissive: 0x88e8ff, emissiveIntensity: 2.0,
+      transparent: true, opacity: 0.95,
+    });
+    const dMesh = new THREE.Mesh(this._diamondGeo, dMat);
+    dMesh.userData.isRuntimeOnly = true;
+    dMesh.position.copy(rec.worldPos);
+    this._trackGroup.add(dMesh);
+    rec.bonusDiamond = {
+      mesh: dMesh,
+      material: dMat,
+      upAxis: rec.worldPos.clone().normalize(),
+      spinAngle: 0,
+      phaseOffset: dPhase,
+    };
+  };
+
+  // Source RaceManager.ts:471-487 — torus hole axis aligned to path tangent.
+  this._orientCheckpointOnGlobe = function (group, worldPos, nextWorldPos) {
+    const yAxis = this._ckY.copy(worldPos).normalize();
+    this._ckToNext.copy(nextWorldPos).sub(worldPos);
+    const zFlat = this._ckZ.copy(this._ckToNext).projectOnPlane(yAxis);
+    let zAxis;
+    if (zFlat.lengthSq() < 1e-10) {
+      if (Math.abs(yAxis.y) < 0.85) this._ckAlt.set(0, 1, 0);
+      else this._ckAlt.set(1, 0, 0);
+      zAxis = this._ckZ.crossVectors(this._ckAlt, yAxis).normalize();
+    } else {
+      zAxis = zFlat.normalize();
+    }
+    const xAxis = this._ckX.crossVectors(yAxis, zAxis).normalize();
+    const zOrtho = this._ckZo.crossVectors(xAxis, yAxis).normalize();
+    this._ckMat.makeBasis(xAxis, yAxis, zOrtho);
+    group.quaternion.setFromRotationMatrix(this._ckMat);
+  };
+
+  // -----------------------------------------------------------------
+  // Update — state machine.
+  // -----------------------------------------------------------------
+  this.update = function (deltaTime) {
+    const dt = Math.min(deltaTime, 0.1);
+    this._time = (this._time || 0) + dt;
+    this._tickHud();
+    this._tickGoToast();
+
+    const playerState = this._getPlayerState();
+    if (!playerState) return;
+    const playerPos = playerState.pos;
+
+    if (!this._canRace(playerState.vehicle)) {
+      if (this._state !== "idle") this._abort();
+      return;
+    }
+
+    const banners = this.erth.store.get(this.getAttribute("raceBannersStoreKey"));
+    if (!banners || !Array.isArray(banners) || banners.length === 0) return;
+
+    if (this._state === "idle" || this._state === "approaching") {
+      let nearestIdx = -1;
+      let nearestD = Infinity;
+      for (let i = 0; i < banners.length; i++) {
+        const b = banners[i];
+        const dx = playerPos.x - b.worldPos[0];
+        const dy = playerPos.y - b.worldPos[1];
+        const dz = playerPos.z - b.worldPos[2];
+        const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (d < nearestD) { nearestD = d; nearestIdx = b.index; }
+      }
+
+      if (this._state === "idle") {
+        if (nearestD < RACE_BANNER_TRIGGER_RADIUS && nearestIdx >= 0) {
+          this._state = "approaching";
+          this._activeBannerIndex = nearestIdx;
+          this._approachProgress = 0;
+          this._setCountdown("3");
+          this._log("approaching banner", nearestIdx);
+        }
+      } else {
+        if (nearestD >= RACE_BANNER_TRIGGER_RADIUS || nearestIdx !== this._activeBannerIndex || this._activeBannerIndex < 0) {
+          this._state = "idle";
+          this._setCountdown(null);
+        } else {
+          this._approachProgress += dt / RACE_APPROACH_FILL_SEC;
+          const p = Math.min(1, this._approachProgress);
+          if (p < 1 / 3) this._setCountdown("3");
+          else if (p < 2 / 3) this._setCountdown("2");
+          else this._setCountdown("1");
+          if (this._approachProgress >= 1) {
+            this._startRaceAfterApproach(banners, playerState);
+          }
+        }
+      }
+      return;
+    }
+
+    if (this._state === "racing") {
+      this._raceTimer -= dt;
+      this._setTimerText(this._raceTimer);
+
+      for (let ri = 0; ri < this._rings.length; ri++) {
+        const r = this._rings[ri];
+        if (r.collected) continue;
+
+        if (ri === this._currentRingIndex && r.holoMat) {
+          const pulse = 1 + RACE_TARGET_PULSE_AMP * Math.sin(this._time * RACE_TARGET_PULSE_HZ);
+          r.ringGroup.scale.setScalar(pulse);
+        } else if (r.holoMat) {
+          r.ringGroup.scale.setScalar(1);
+        }
+
+        if (r.bonusDiamond) {
+          const bd = r.bonusDiamond;
+          const bob = RACE_DIAMOND_BOB_LIFT + Math.sin(this._time * RACE_DIAMOND_BOB_HZ + bd.phaseOffset) * RACE_DIAMOND_BOB_AMP;
+          bd.mesh.position.copy(r.worldPos).addScaledVector(bd.upAxis, bob);
+          bd.spinAngle += RACE_DIAMOND_SPIN_SPEED * dt;
+          this._qAlign.setFromUnitVectors(this._yAxis, bd.upAxis);
+          this._spinQ.setFromAxisAngle(this._yAxis, bd.spinAngle);
+          bd.mesh.quaternion.copy(this._qAlign).multiply(this._spinQ);
+        }
+      }
+
+      const target = this._rings[this._currentRingIndex];
+      if (target && !target.collected) {
+        const dx = playerPos.x - target.worldPos.x;
+        const dy = playerPos.y - target.worldPos.y;
+        const dz = playerPos.z - target.worldPos.z;
+        const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (d < RACE_COLLECT_RADIUS) {
+          const isFinishBanner = (this._currentRingIndex === RACE_CHECKPOINT_COUNT - 1);
+          this.erth.store.set("tinyskies/raceSfxCue", isFinishBanner ? "celebrate_1" : "chime_1");
+          target.collected = true;
+          target.ringGroup.visible = false;
+          if (target.bonusDiamond) {
+            target.bonusDiamond.mesh.getWorldPosition(this._scratchBdW);
+            target.bonusDiamond.mesh.visible = false;
+            this.erth.store.set("tinyskies/bonusDiamondCollected", {
+              x: this._scratchBdW.x, y: this._scratchBdW.y, z: this._scratchBdW.z,
+            });
+          }
+          this._currentRingIndex++;
+          if (this._currentRingIndex >= RACE_CHECKPOINT_COUNT) {
+            this._win();
+            return;
+          }
+        }
+      }
+
+      if (this._raceTimer <= 0) this._cleanupLose();
+    }
+  };
+
+  this._startRaceAfterApproach = function (banners, playerState) {
+    const banner = banners.find((b) => b.index === this._activeBannerIndex);
+    if (!banner) {
+      this._state = "idle";
+      this._setCountdown(null);
+      return;
+    }
+    this.erth.store.set(this.getAttribute("raceBannersVisibilityCommandKey"), {
+      visible: false, exceptIndex: -1,
+    });
+    this._buildTrack(banner, playerState);
+    this._state = "racing";
+    this._setCountdown(null);
+    this._raceTimer = this._isCarpet(playerState.vehicle) ? RACE_TIME_LIMIT_CARPET : RACE_TIME_LIMIT;
+    this._setTimerText(this._raceTimer);
+    this.erth.store.set("tinyskies/raceSfxCue", "race_start_1");
+    this._showGoToast();
+    this._log("race started, banner", banner.index);
+  };
+
+  this._win = function () {
+    const counterKey = this.getAttribute("raceWonStoreKey");
+    const prev = this.erth.store.get(counterKey) || 0;
+    this.erth.store.set(counterKey, prev + 1);
+    this.erth.store.set(this.getAttribute("raceXpStoreKey"), {
+      amount: this.getAttribute("raceXpAmount"),
+      source: "race",
+    });
+    this.erth.store.set("tinyskies/raceSfxCue", "cheer_1");
+    this._log("race won, lifetime wins", prev + 1);
+    this._cleanupAfterRace();
+  };
+
+  this._cleanupLose = function () {
+    this._log("race lost");
+    this._cleanupAfterRace();
+  };
+
+  this._cleanupAfterRace = function () {
+    this._state = "idle";
+    while (this._trackGroup.children.length > 0) {
+      this._trackGroup.remove(this._trackGroup.children[0]);
+    }
+    for (const r of this._rings) {
+      if (r.holoMat && typeof r.holoMat.dispose === "function") r.holoMat.dispose();
+      if (r.finishMat && typeof r.finishMat.dispose === "function") r.finishMat.dispose();
+      if (r.bonusDiamond && r.bonusDiamond.material && typeof r.bonusDiamond.material.dispose === "function") {
+        r.bonusDiamond.material.dispose();
+      }
+      r.ringGroup.traverse((c) => {
+        if (c.geometry && c !== r.ringGroup && c.geometry !== this._diamondGeo && typeof c.geometry.dispose === "function") {
+          c.geometry.dispose();
+        }
+      });
+    }
+    this._rings = [];
+    this._setTimerText(null);
+    this._setCountdown(null);
+    this.erth.store.set(this.getAttribute("raceBannersVisibilityCommandKey"), {
+      visible: true, exceptIndex: -1,
+    });
+    this._activeBannerIndex = -1;
+    this._approachProgress = 0;
+  };
+
+  this._abort = function () {
+    if (this._state === "idle") return;
+    this._cleanupAfterRace();
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    this._abort();
+    if (this._trackGroup && this._trackGroup.parent) this._trackGroup.parent.remove(this._trackGroup);
+    if (this._diamondGeo && typeof this._diamondGeo.dispose === "function") this._diamondGeo.dispose();
+    if (this._fullscreen && typeof this._fullscreen.dispose === "function") {
+      try { this._fullscreen.dispose(); } catch (_e) { /* ignore */ }
+    }
+    this._fullscreen = null;
+    this._countdownText = null;
+    this._timerText = null;
+    this._goText = null;
+  };
+
+  // Editor preview omitted intentionally: race quest is gameplay-driven —
+  // rings only appear once the player approaches a banner and the countdown
+  // completes, and require live player quaternion + heading from
+  // flightController. Source RaceManager renders nothing until startRace.
+  // // @check-ok no editor preview

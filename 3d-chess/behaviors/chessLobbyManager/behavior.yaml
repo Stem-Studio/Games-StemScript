@@ -1,0 +1,485 @@
+# StemStudio Export File
+# Do not edit manually unless you know what you're doing
+
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+  exportedAt: 2026-04-30T17:38:45.035Z
+config:
+  id: 69eb40a45b53803168c0a038
+  name: Chess Lobby Manager
+  description: ""
+  version: 1.0.0
+  isScript: true
+  attributes: {}
+  author: ""
+  main: ""
+  tags: []
+  dependencies: {}
+  objectSettings: {}
+  documentation: Displays Player names, and piece color. Also includes the option to swap piece color, and the start game button
+code: |-
+  let game;
+  let multiplayerState;
+
+  let ownerObject;
+  let behaviorId;
+  let erth;
+
+  const playerMap = new Map();
+
+  const MP_EVENTS = {
+    LOBBY_SCREEN: {
+      PLAYER_DATA_UPDATE: 'mpEvent:player-data-update',
+      START_GAME: 'mpEvent:start-game',
+    }
+  }
+
+  const mp = {
+    onAdded: undefined,
+    onRemoved: undefined,
+    onDataChanged: undefined,
+    onHostChange: undefined,
+  }
+
+  const lobbyScreen = {
+    root: undefined,
+    main: undefined,
+    playerListContainer: undefined,
+    startGameBtn: undefined,
+    startGameBtnText: undefined,
+    swapBtn: undefined,
+  }
+
+  const playerList = [];
+  let playerDisplayName = undefined;
+  let pieceColor = "white";
+  let playerCount = 0;
+  this.init = function (_game) {
+    game = _game;
+    multiplayerState = game.multiplayerState;
+  }
+
+  this.onStart = function () {
+    ownerObject = this.target;
+    behaviorId = this.id;
+    erth = this.erth;
+
+    console.warn("[Lobby Manager] Creating Lobby...");
+    subscribeEventListeners();
+  }
+
+  this.update = function (deltaTime) {
+    if (!lobbyScreen.root) return;
+    UIKitPointerEvents.update(deltaTime);
+  }
+
+  this.onEvent = function (msg, data) {
+    if (msg === "enterLobby") {
+      onEnterLobby(data);
+      return;
+    } else if (msg === "startGame") {
+      onStartGame();
+      return;
+    }
+  };
+
+  function subscribeEventListeners() {
+    if (multiplayerState) {
+      //mp.onAdded = multiplayerState.addOnPlayerAddedListener(onPlayerAdded);
+      mp.onRemoved = multiplayerState.addOnPlayerRemovedListener(onPlayerRemoved);
+      mp.onDataChanged = multiplayerState.addOnPlayerDataChangedListener(onPlayerDataChanged);
+      mp.onHostChange = multiplayerState.addOnHostChangedListener(onHostChange);
+    }
+  }
+
+  function removeEventListeners() {
+    if (multiplayerState) {
+      //multiplayerState.removeOnPlayerAddedListener(mp.onAdded);
+      multiplayerState.removeOnPlayerRemovedListener(mp.onRemoved);
+      multiplayerState.removeOnPlayerDataChangedListener(mp.onDataChanged);
+      multiplayerState.removeOnHostChangedListener(mp.onHostChange);
+    }
+  }
+
+  function onPlayerDataChanged(_player, _key) {
+    switch (_key) {
+      case MP_EVENTS.LOBBY_SCREEN.PLAYER_DATA_UPDATE:
+        updatePlayerList();
+        return;
+      case MP_EVENTS.LOBBY_SCREEN.START_GAME:
+        startGame();
+        return;
+    }
+  }
+
+  function onStartGame() {
+    hasEnteredLobby = false;
+    removeLobbyScreen();
+  }
+
+  let hasEnteredLobby = false;
+  function onEnterLobby(data) {
+    hasEnteredLobby = true;
+    game.cameraControl.pause();
+    game.inputManager.pause();
+
+    if (!multiplayerState) {
+      startGame();
+      return;
+    }
+
+    playerDisplayName ??= data.playerDisplayName;
+    initUi();
+    buildUi();
+
+    updatePlayerList();
+    const playerData = {
+      playerDisplayName,
+      pieceColor,
+    };
+
+    broadcastData(MP_EVENTS.LOBBY_SCREEN.PLAYER_DATA_UPDATE, playerData);
+  }
+
+  function initUi() {
+    if (lobbyScreen.root) return;
+    UIKitPointerEvents.initialize(game);
+    game.renderer.localClippingEnabled = true;
+    game.renderer.setTransparentSort(UIKit.reversePainterSortStable);
+
+    lobbyScreen.root = new UIKit.Fullscreen(game.renderer, {
+      flexDirection: 'column',
+      alignItems: 'flex-start',
+      justifyContent: 'flex-start',
+      pointerEvents: 'none',
+    });
+    game.uiCamera.add(lobbyScreen.root);
+    UIKitPointerEvents.registerRoot(lobbyScreen.root);
+  }
+
+  function buildUi() {
+    if (lobbyScreen.main) return;
+    const isLandscape = window.innerWidth > window.innerHeight;
+    const scale = isLandscape ? window.innerWidth / 1920 : window.innerWidth / 767;
+
+    const bg = new UIKit.Container({
+      positionType: 'absolute',
+      backgroundColor: 0x011701,
+      opacity: 0.25,
+      height: '100%',
+      width: '100%',
+    });
+    lobbyScreen.root.add(bg);
+
+    lobbyScreen.main = new UIKit.Container({
+      flexDirection: 'column',
+      alignItems: 'center',
+      gap: 16,
+      height: '100%',
+      width: '100%',
+    });
+
+    lobbyScreen.root.add(lobbyScreen.main);
+
+    const code = multiplayerState.getInviteCode();
+    const roomId = String(code).trim() || '';
+
+    const copiedToast = new UIKit.Container({
+      width: 100 * scale,
+      height: 25 * scale,
+      borderRadius: 12,
+      alignItems: 'center',
+      justifyContent: 'center',
+      backgroundColor: "#58e44b",
+      positionType: 'absolute',
+      positionTop: '8%',
+      visibility: "hidden",
+    });
+
+    copiedToast.add(
+      new UIKit.Text({
+        text: "copied",
+        fontSize: 12 * scale,
+        fontWeight: "bold",
+        color: "#ffffff",
+      })
+    )
+
+    let copiedToastTimeout = undefined;
+    const roomCode = new UIKit.Text({
+      text: `ROOM: ${roomId}`,
+      fontSize: 72 * scale,
+      fontWeight: 'bold',
+      color: 0xFFFFFF,
+      textAlign: 'center',
+      positionTop: '10%',
+      cursor: "pointer",
+      pointerEvents: "auto",
+      onClick: () => {
+        window.navigator.clipboard.writeText(roomId);
+        copiedToast.setProperties({ visibility: "visible" });
+        
+        if (copiedToastTimeout) clearTimeout(copiedToastTimeout);
+
+        copiedToastTimeout = setTimeout(() => {
+          copiedToast.setProperties({ visibility: "hidden" });
+          clearTimeout(copiedToastTimeout);
+          copiedToastTimeout = null;
+        }, 1000);
+      },
+      onPointerEnter: () => {
+        roomCode.setProperties({ transformScaleX: 1.05, transformScaleY: 1.05 });
+      },
+      onPointerLeave: () => {
+        roomCode.setProperties({ transformScaleX: 1, transformScaleY: 1 });
+      },
+    });
+
+    lobbyScreen.main.add(copiedToast, roomCode);
+
+    lobbyScreen.playerListContainer = new UIKit.Container({
+      flexDirection: 'column',
+      alignItems: 'center',
+      gap: 16,
+      width: '50%',
+      positionTop: '15%',
+    });
+
+    lobbyScreen.main.add(lobbyScreen.playerListContainer);
+    buildPlayerList();
+
+    const btnContainer = new UIKit.Container({
+      flexDirection: 'column',
+      alignItems: 'center',
+      width: 300 * scale,
+      height: 180 * scale,
+      paddingTop: 40 * scale,
+      positionTop: '20%',
+      gap: 12,
+    });
+
+    lobbyScreen.main.add(btnContainer);
+
+    const swapButton = addButton('Swap Colors', btnContainer, scale, swapColors);
+    if (!multiplayerState.isHost()) {
+      swapButton.button.setProperties({ backgroundColor: 0x2f3342, borderColor: 0x697185, pointerEvents: 'none' });
+    }
+
+    const { button, text } = addButton('Start Game', btnContainer, scale, startGame);
+    if (!multiplayerState.isHost()) {
+      button.setProperties({ backgroundColor: 0x2f3342, borderColor: 0x697185, pointerEvents: 'none' });
+      text.setProperties({ text: 'Waiting for Host' });
+    }
+
+    lobbyScreen.startGameBtn = button;
+    lobbyScreen.startGameBtnText = text;
+    lobbyScreen.swapBtn = swapButton.button;
+  }
+
+  function onLobbyScreenStartGame(event, data) {
+    if (multiplayerState.isHost()) return;
+    startGame();
+  }
+
+  function onPlayerRemoved() {
+    updatePlayerList();
+    const playerData = {
+      playerDisplayName,
+      pieceColor,
+    };
+
+    broadcastData(MP_EVENTS.LOBBY_SCREEN.PLAYER_DATA_UPDATE, playerData);
+  }
+
+  function onHostChange() {
+    if (!lobbyScreen.startGameBtn || !lobbyScreen.startGameBtnText) return;
+    if (multiplayerState.isHost()) {
+      lobbyScreen.startGameBtn.setProperties({ backgroundColor: 0xffffff, borderColor: 0xc1cae0, pointerEvents: 'all' });
+      lobbyScreen.swapBtn.setProperties({ backgroundColor: 0xffffff, borderColor: 0xc1cae0, pointerEvents: 'all' });
+      lobbyScreen.startGameBtnText.setProperties({ text: 'Start Game' });
+    } else {
+      lobbyScreen.startGameBtn.setProperties({ tbackgroundColor: 0x2f3342, borderColor: 0x697185, pointerEvents: 'none' });
+      lobbyScreen.swapBtn.setProperties({ tbackgroundColor: 0x2f3342, borderColor: 0x697185, pointerEvents: 'none' });
+      lobbyScreen.startGameBtnText.setProperties({ text: 'Waiting for Host' });
+    }
+  }
+
+  function buildPlayerList() {
+    const isLandscape = window.innerWidth > window.innerHeight;
+    const scale = isLandscape ? window.innerWidth / 1920 : window.innerWidth / 767;
+    playerList.length = 0;
+
+    for (let i = 0; i < 2; i++) {
+      const playerEntry = new UIKit.Container({
+        flexDirection: "row",
+        gap: 8,
+        width: '50%',
+        justifyContent: "center",
+      });
+
+      const playerPieceColor = new UIKit.Container({
+        width: 32 * scale,
+        height: 32 * scale,
+        backgroundColor: "#808080",
+        borderWidth: 4,
+        borderRadius: 999,
+        borderColor: "#ffda5f",
+        positionTop: 20 + (5 * i),
+      });
+
+      const playerName = new UIKit.Text({
+        text: 'None',
+        textAlign: "left",
+        fontSize: 32 * scale,
+        fontWeight: 'bold',
+        color: 0xFFFFFF,
+        textAlign: 'center',
+        positionTop: 20 + (5 * i),
+      });
+
+      playerEntry.add(playerPieceColor, playerName);
+      lobbyScreen.playerListContainer.add(playerEntry);
+      playerList.push({ name: playerName, color: playerPieceColor });
+    }
+  }
+
+  function updatePlayerList(updacePieceColor = true) {
+    const players = multiplayerState.getPlayers();
+
+    const playerList = [];
+
+    playerCount = 1;
+    let existingPieceColor = null;
+    players.forEach(p => {
+      const value = p.data.get(MP_EVENTS.LOBBY_SCREEN.PLAYER_DATA_UPDATE);
+      if (value) {
+        const playerData = JSON.parse(value);
+        playerList.push({ username: playerData.playerDisplayName, pieceColor: playerData.pieceColor });
+        existingPieceColor = playerData.pieceColor;
+        playerCount++;
+      }
+    });
+
+    if (updacePieceColor) {
+      if (existingPieceColor) {
+        pieceColor = existingPieceColor === "white" ? "black" : "white";
+      } else {
+        pieceColor = Math.random() < 0.5 ? "white" : "black";
+      }
+    }
+
+    playerList.unshift({ username: playerDisplayName, pieceColor: pieceColor });
+    updatePlayerListUi(playerList);
+  }
+
+  function updatePlayerListUi(playerData) {
+    for (let i = 0; i < 2; i++) {
+      let name = undefined;
+      let color = undefined;
+      let textColor = 0x606060;
+
+      if (!playerData[i]) {
+        name = 'None';
+        textColor = 0x606060;
+        color = pieceColor === "white" ? "black" : "white";
+      } else {
+        name = playerData[i].username;
+        color = playerData[i].pieceColor;
+        textColor = 0xffffff;
+      }
+
+      playerList[i].name.setProperties({ text: name, color: textColor });
+      playerList[i].color.setProperties({ backgroundColor: color === "white" ? 0xd9d9d9 : 0x404040 });
+      playerList[i].pieceColor = color;
+    }
+  }
+
+  function addButton(text, mainContainer, scale, onClick = () => { }) {
+    const _button = new UIKit.Container({
+      backgroundColor: 0xffffff,
+      backgroundOpacity: 1,
+      padding: 8,
+      cursor: 'pointer',
+      pointerEvents: 'all',
+      width: '100%',
+      height: '45%',
+      borderRadius: 16,
+      borderWidth: 2,
+      borderColor: 0xc1cae0,
+      onClick: onClick,
+    });
+
+    const _text = new UIKit.Text({
+      text: text,
+      textAlign: 'center',
+      fontSize: 24 * scale,
+      fontWeight: 'bold',
+      color: 0x101010,
+      width: '100%',
+    });
+
+    _button.add(_text);
+
+    _button.addEventListener('pointerenter', () => {
+      _button.setProperties({ backgroundColor: 0x2f3342, borderColor: 0x697185 });
+    });
+
+    _button.addEventListener('pointerleave', () => {
+      _button.setProperties({ backgroundColor: 0xffffff, borderColor: 0xc1cae0 });
+    });
+
+    mainContainer.add(_button);
+    return { button: _button, text: _text };
+  }
+
+  function startGame() {
+    erth.store.set('playerCount', playerCount);
+    erth.store.set("pieceColor", pieceColor);
+    removeLobbyScreen();
+
+    if (multiplayerState && multiplayerState.isHost()) {
+      const data = { state: 'startGame', time: Date.now() };
+      broadcastData(MP_EVENTS.LOBBY_SCREEN.START_GAME, data);
+    }
+
+    game.behaviorManager.sendEventToObjectBehaviors(ownerObject, "startGame", {});
+  }
+
+  function swapColors() {
+    pieceColor = pieceColor === "white" ? "black" : "white";
+
+    for (let i = 0; i < 2; i++) {
+      const color = playerList[i].pieceColor === "white" ? "black" : "white";
+      playerList[i].color.setProperties({ backgroundColor: color === "white" ? 0xd9d9d9 : 0x404040 });
+      playerList[i].pieceColor = color;
+    }
+
+    const playerData = {
+      playerDisplayName,
+      pieceColor,
+    };
+
+    broadcastData(MP_EVENTS.LOBBY_SCREEN.PLAYER_DATA_UPDATE, playerData);
+  }
+
+  function removeLobbyScreen() {
+    if (lobbyScreen.root) {
+      UIKitPointerEvents.unregisterRoot(lobbyScreen.root);
+      if (lobbyScreen.root.parent) {
+        lobbyScreen.root.parent.remove(lobbyScreen.root);
+      }
+
+      for (const key in lobbyScreen) {
+        lobbyScreen[key] = null;
+      }
+
+    }
+    UIKitPointerEvents.deinitialize();
+  }
+
+  function broadcastData(mpKey, data = {}) {
+    const payload = JSON.stringify(data);
+    multiplayerState.setPlayerData(mpKey, payload);
+  }

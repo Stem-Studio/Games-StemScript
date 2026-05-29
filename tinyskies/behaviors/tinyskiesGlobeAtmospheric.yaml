@@ -1,0 +1,846 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Globe Atmospheric"
+  id: "tinyskies.globeAtmospheric"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Atmospheric layer above the deformed globe — 30 puffy clouds drifting in a cloud ring, 5 hot-air balloons bobbing at altitude 0.6, 28 floating-tree clusters anchored to forest patches, and 3 race-banner gates with twin balloons. Faithful port of source Globe.ts createClouds / createBalloons + createBalloonMesh / createFloatingTreeClusters / createRaceBanners."
+  documentation: "Spawns four sky-layer systems at init. Source seeds: 77 (clouds — note: source uses literal 77, not seed-derived), 999+seed (balloons), 888+seed (floating trees), 112233+seed (race banners). Cloud puff ShaderMaterial replaced with TSL fresnel + vertical fade NodeMaterial (visual equivalent of source's `rim*rim*upFactor` formula). Cloud ring drifts every frame at CLOUD_DRIFT_SPEED=0.03 rad/s. Balloons bob along their normal at sin(time*0.5+phase)*0.04; inner spins at 0.05 rad/s. Floating trees: 28 cluster centers with 40 trees each (source-faithful counts), per-tree quaternion + sin bob via per-instance attribute. Race banner texture rendered to canvas with checker pattern + label text (START / FINISH); fabric sway shader simplified per FDR-006."
+  tags:
+    - visual
+    - environment
+    - atmospheric
+  priority: 0
+  throttleConfig:
+    throttlePriority: "HIGH"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    radius:
+      name: "Globe Radius"
+      type: "number"
+      default: 5
+      min: 0.5
+      max: 200
+    terrainSeed:
+      name: "Terrain Seed"
+      type: "number"
+      default: 42
+      min: 1
+      max: 1000000
+    terrainType:
+      name: "Terrain Type"
+      type: "string"
+      default: "default"
+    cloudCount:
+      name: "Cloud Count"
+      type: "number"
+      default: 30
+      min: 0
+      max: 100
+    cloudAltitude:
+      name: "Cloud Altitude"
+      type: "number"
+      default: 1.0
+      min: 0.1
+      max: 5
+    balloonCount:
+      name: "Balloon Count"
+      type: "number"
+      default: 5
+      min: 0
+      max: 20
+    balloonAltitude:
+      name: "Balloon Altitude"
+      type: "number"
+      default: 0.6
+      min: 0.1
+      max: 3
+    floatingTreeClusters:
+      name: "Floating Tree Clusters"
+      type: "number"
+      default: 28
+      min: 0
+      max: 80
+    floatingTreesPerCluster:
+      name: "Trees Per Cluster"
+      type: "number"
+      default: 40
+      min: 0
+      max: 200
+    raceBannerCount:
+      name: "Race Banner Count"
+      type: "number"
+      default: 3
+      min: 0
+      max: 12
+    raceBannersStoreKey:
+      name: "Race Banners Store Key"
+      type: "string"
+      default: "tinyskies/raceBanners"
+      description: "Published once at init as an array of {worldPos:[x,y,z], normal:[x,y,z], baseAlt, index} for the race-quest behavior to consume."
+    raceBannersVisibilityCommandKey:
+      name: "Race Banners Visibility Command Key"
+      type: "string"
+      default: "tinyskies/raceBannersVisibilityCommand"
+      description: "Watched in update; race quest sets {visible:bool, exceptIndex:number} to hide all banners except the active one during a race."
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  @import "terrain" as T;
+  @import "spherical-math" as S;
+
+  const LOG_TAG = "[tinyskies.globeAtmospheric]";
+  const CLOUD_DRIFT_SPEED = 0.03;
+
+  const BALLOON_SCHEMES = [
+    [0xcc2222, 0xf0d020],
+    [0x1e5cb0, 0x5eb8e8],
+    [0x228844, 0xd0e830],
+    [0xe85520, 0xf5c040],
+    [0x8822aa, 0xe868b0],
+    [0xcc2255, 0xff8844],
+    [0x1199aa, 0x88cc33],
+  ];
+
+  function applyRimLight(mat, rimColorHex, intensity, power) {
+    const TSL = THREE.TSL;
+    const c = new THREE.Color(rimColorHex);
+    const viewDir = TSL.normalize(TSL.cameraPosition.sub(TSL.positionWorld));
+    // dFdx/dFdy-derived normal — no `normal` attribute needed, so the material compiles cleanly in shadow / AO passes that strip lighting attrs (avoids TSL "Vertex attribute 'normal' not found" warnings that pin frame budget).
+    const nW = TSL.normalize(TSL.cross(TSL.dFdx(TSL.positionWorld), TSL.dFdy(TSL.positionWorld)));
+    const fresnel = TSL.float(1.0).sub(TSL.dot(viewDir, nW).abs());
+    const rim = TSL.vec3(c.r, c.g, c.b).mul(TSL.float(intensity)).mul(TSL.pow(fresnel, TSL.float(power)));
+    mat.emissiveNode = rim;
+    mat.needsUpdate = true;
+  }
+
+  function createTeardropGeo() {
+    const segments = 10;
+    const points = [];
+    for (let i = 0; i <= segments; i++) {
+      const t = i / segments;
+      const r = Math.pow(Math.sin(t * Math.PI), 0.35) * Math.pow(1 - t, 0.5);
+      points.push(new THREE.Vector2(r, t));
+    }
+    const geo = new THREE.LatheGeometry(points, 6);
+    const bottomColor = new THREE.Color(0.3, 0.55, 0.2);
+    const topColor = new THREE.Color(0.7, 0.92, 0.6);
+    const posAttr = geo.attributes.position;
+    const colors = new Float32Array(posAttr.count * 3);
+    for (let i = 0; i < posAttr.count; i++) {
+      const t = Math.max(0, Math.min(1, posAttr.getY(i)));
+      const c = bottomColor.clone().lerp(topColor, t);
+      const ao = THREE.MathUtils.lerp(0.1, 1.0, Math.min(1, t * 2.0));
+      c.multiplyScalar(ao);
+      colors[i * 3]     = c.r;
+      colors[i * 3 + 1] = c.g;
+      colors[i * 3 + 2] = c.b;
+    }
+    geo.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+    return geo;
+  }
+
+  // -----------------------------------------------------------------
+  // Source Globe.ts:5174 createClouds — TSL puff material with fresnel
+  // edge fade + vertical local-Y fade matches source's rim*rim*upFactor.
+  // Cloud ring rotates as a whole at CLOUD_DRIFT_SPEED rad/s.
+  // -----------------------------------------------------------------
+
+  function buildCloudPuffMat() {
+    const TSL = THREE.TSL;
+    const mat = new THREE.MeshBasicNodeMaterial({
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    });
+    // Top of cloud cooler/whiter, bottom warmer pink/peach (matches source).
+    const cloudTop = TSL.vec3(1.0, 0.97, 0.92);
+    const cloudBottom = TSL.vec3(1.0, 0.78, 0.62);
+    const viewDir = TSL.normalize(TSL.cameraPosition.sub(TSL.positionWorld));
+    // dFdx/dFdy-derived normal — no `normal` attribute needed, so the material compiles cleanly in shadow / AO passes that strip lighting attrs (avoids TSL "Vertex attribute 'normal' not found" warnings that pin frame budget).
+    const nW = TSL.normalize(TSL.cross(TSL.dFdx(TSL.positionWorld), TSL.dFdy(TSL.positionWorld)));
+    const rim = TSL.dot(viewDir, nW).abs();
+    const upFactor = TSL.smoothstep(TSL.float(-0.8), TSL.float(0.2), TSL.positionLocal.y);
+    const soft = rim.mul(rim).mul(TSL.float(0.35).add(TSL.float(0.75).mul(upFactor)));
+    const cloudColor = TSL.mix(cloudBottom, cloudTop, upFactor);
+    mat.colorNode = cloudColor.mul(soft);
+    mat.opacityNode = soft.mul(TSL.float(0.92));
+    return mat;
+  }
+
+  // -----------------------------------------------------------------
+  // Source Globe.ts:4745 createBalloonMesh — gored envelope + skirt +
+  // basket + 8 ropes + warm burner sphere on top of basket throat.
+  // -----------------------------------------------------------------
+
+  function createBalloonMesh(primary, secondary) {
+    const SC = 0.084;
+    const profile = [
+      new THREE.Vector2(SC * 0.28, SC * -1.15),
+      new THREE.Vector2(SC * 0.22, SC * -1.00),
+      new THREE.Vector2(SC * 0.30, SC * -0.80),
+      new THREE.Vector2(SC * 0.50, SC * -0.45),
+      new THREE.Vector2(SC * 0.75, SC * -0.05),
+      new THREE.Vector2(SC * 0.95, SC *  0.35),
+      new THREE.Vector2(SC * 1.05, SC *  0.65),
+      new THREE.Vector2(SC * 1.08, SC *  0.90),
+      new THREE.Vector2(SC * 1.02, SC *  1.10),
+      new THREE.Vector2(SC * 0.88, SC *  1.25),
+      new THREE.Vector2(SC * 0.65, SC *  1.38),
+      new THREE.Vector2(SC * 0.38, SC *  1.48),
+      new THREE.Vector2(SC * 0.12, SC *  1.54),
+      new THREE.Vector2(SC * 0.00, SC *  1.56),
+    ];
+    const GORE_COUNT = 12;
+    const LATHE_SEGS = 36;
+    const throatY = profile[0].y;
+    const throatR = profile[0].x;
+    const basketTopY = throatY - SC * 0.35;
+    const basketBotY = throatY - SC * 0.65;
+    const basketR = SC * 0.18;
+    const colA = new THREE.Color(primary);
+    const colB = new THREE.Color(secondary);
+
+    const balloon = new THREE.Group();
+    balloon.userData.isRuntimeOnly = true;
+
+    // Envelope with per-vertex gored coloring (alternating primary/secondary)
+    const envGeo = new THREE.LatheGeometry(profile, LATHE_SEGS);
+    const envPos = envGeo.attributes.position;
+    const envColArr = new Float32Array(envPos.count * 3);
+    for (let v = 0; v < envPos.count; v++) {
+      let a = Math.atan2(envPos.getZ(v), envPos.getX(v));
+      if (a < 0) a += Math.PI * 2;
+      const gore = Math.floor((a / (Math.PI * 2)) * GORE_COUNT);
+      const c = gore % 2 === 0 ? colA : colB;
+      envColArr[v * 3]     = c.r;
+      envColArr[v * 3 + 1] = c.g;
+      envColArr[v * 3 + 2] = c.b;
+    }
+    envGeo.setAttribute("color", new THREE.Float32BufferAttribute(envColArr, 3));
+    envGeo.computeVertexNormals();
+    const envMat = new THREE.MeshStandardNodeMaterial({ vertexColors: true, flatShading: false, roughness: 0.5, metalness: 0.0 });
+    applyRimLight(envMat, 0xffeedd, 0.3, 3.0);
+    const envMesh = new THREE.Mesh(envGeo, envMat);
+    envMesh.castShadow = true;
+    envMesh.userData.isRuntimeOnly = true;
+    envMesh.userData.paintSplatterSurface = true;
+    balloon.add(envMesh);
+
+    // Skirt + basket + rim + base
+    const skirtMat = new THREE.MeshStandardNodeMaterial({ color: primary, flatShading: true, roughness: 0.8, metalness: 0 });
+    const basketMat = new THREE.MeshStandardNodeMaterial({ color: 0x8b6914, flatShading: true, roughness: 0.85, metalness: 0 });
+    const rimMat = new THREE.MeshStandardNodeMaterial({ color: 0x6b4e10, flatShading: true, roughness: 0.85, metalness: 0 });
+    applyRimLight(skirtMat,  0xffeedd, 0.3, 3.0);
+    applyRimLight(basketMat, 0xffccaa, 0.3, 2.8);
+    applyRimLight(rimMat,    0xffe0aa, 0.32, 2.8);
+
+    const skirtGeo = new THREE.CylinderGeometry(throatR * 0.85, throatR * 1.05, SC * 0.12, 12, 1, true);
+    skirtGeo.translate(0, throatY - SC * 0.06, 0);
+    const skirtMesh = new THREE.Mesh(skirtGeo, skirtMat);
+    skirtMesh.userData.isRuntimeOnly = true;
+    balloon.add(skirtMesh);
+
+    const bodyGeo = new THREE.CylinderGeometry(basketR, basketR * 0.9, basketBotY - basketTopY, 8);
+    bodyGeo.translate(0, (basketTopY + basketBotY) / 2, 0);
+    const bodyMesh = new THREE.Mesh(bodyGeo, basketMat);
+    bodyMesh.castShadow = true;
+    bodyMesh.userData.isRuntimeOnly = true;
+    balloon.add(bodyMesh);
+
+    const rimGeo = new THREE.CylinderGeometry(basketR + SC * 0.01, basketR + SC * 0.01, SC * 0.02, 12);
+    rimGeo.translate(0, basketTopY, 0);
+    const rimMesh = new THREE.Mesh(rimGeo, rimMat);
+    rimMesh.userData.isRuntimeOnly = true;
+    balloon.add(rimMesh);
+
+    const baseGeo = new THREE.CylinderGeometry(basketR * 0.9, basketR * 0.9, SC * 0.015, 12);
+    baseGeo.translate(0, basketBotY, 0);
+    const baseMesh = new THREE.Mesh(baseGeo, rimMat);
+    baseMesh.userData.isRuntimeOnly = true;
+    balloon.add(baseMesh);
+
+    // 8 ropes from skirt to basket
+    const ropeMat = new THREE.MeshStandardNodeMaterial({ color: 0x554422, flatShading: true });
+    const REF_UP = new THREE.Vector3(0, 1, 0);
+    const dummy = new THREE.Object3D();
+    for (let r = 0; r < 8; r++) {
+      const a = (r / 8) * Math.PI * 2;
+      const topX = Math.cos(a) * throatR * 0.9;
+      const topZ = Math.sin(a) * throatR * 0.9;
+      const botX = Math.cos(a) * basketR * 0.85;
+      const botZ = Math.sin(a) * basketR * 0.85;
+      const dx = botX - topX;
+      const dy = basketTopY - throatY;
+      const dz = botZ - topZ;
+      const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      const ropeGeo = new THREE.CylinderGeometry(0.001, 0.001, len, 3);
+      dummy.position.set((topX + botX) / 2, (throatY + basketTopY) / 2, (topZ + botZ) / 2);
+      dummy.quaternion.setFromUnitVectors(REF_UP, new THREE.Vector3(dx, dy, dz).normalize());
+      dummy.updateMatrix();
+      ropeGeo.applyMatrix4(dummy.matrix);
+      const ropeMesh = new THREE.Mesh(ropeGeo, ropeMat);
+      ropeMesh.userData.isRuntimeOnly = true;
+      balloon.add(ropeMesh);
+    }
+
+    // Warm burner sphere
+    const TSL = THREE.TSL;
+    const burnerMat = new THREE.MeshStandardNodeMaterial({
+      color: 0xff8800,
+      transparent: true,
+      opacity: 0.5,
+    });
+    burnerMat.emissiveNode = TSL.vec3(1.0, 0.4, 0.1).mul(TSL.float(1.5));
+    const burnerGeo = new THREE.SphereGeometry(SC * 0.05, 6, 4);
+    burnerGeo.translate(0, throatY + SC * 0.02, 0);
+    const burnerMesh = new THREE.Mesh(burnerGeo, burnerMat);
+    burnerMesh.userData.isRuntimeOnly = true;
+    balloon.add(burnerMesh);
+
+    return balloon;
+  }
+
+  // -----------------------------------------------------------------
+  // Source Globe.ts:5111 drawRaceBannerLabelCanvas + createRaceBanners
+  // -----------------------------------------------------------------
+
+  function buildRaceBannerCanvasTexture(label) {
+    const canvas = document.createElement("canvas"); // @check-ok — UIKit not used here
+    canvas.width = 512;
+    canvas.height = 128;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, 512, 128);
+    ctx.fillStyle = "#000000";
+    for (let x = 0; x < 8; x++) {
+      for (let y = 0; y < 2; y++) {
+        if ((x + y) % 2 === 0) ctx.fillRect(x * 64, y * 64, 64, 64);
+      }
+    }
+    ctx.font = "bold 56px system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.lineJoin = "round";
+    ctx.miterLimit = 2;
+    ctx.lineWidth = 10;
+    ctx.strokeStyle = "#000000";
+    ctx.strokeText(label, 256, 64);
+    ctx.fillStyle = "#ffffff";
+    ctx.fillText(label, 256, 64);
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }
+
+  // -----------------------------------------------------------------
+  // Lifecycle
+  // -----------------------------------------------------------------
+
+  let game;
+
+  this.init = function (_game) {
+    game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._buildVisuals(this.gameObject._internal.three);
+    this._log("init");
+  };
+
+  this.onEditorAdded = function () {
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._buildVisuals(this.gameObject._internal.three);
+  };
+
+  this.onEditorAttributesUpdated = function () {
+    this._teardownVisuals();
+    this._buildVisuals(this.gameObject._internal.three);
+  };
+
+  this.onEditorDispose = function () {
+    this._teardownVisuals();
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    if (this._raceBannerTextures) {
+      for (const tex of this._raceBannerTextures) {
+        if (tex && typeof tex.dispose === "function") tex.dispose();
+      }
+      this._raceBannerTextures = null;
+    }
+    this._teardownVisuals();
+  };
+
+  // Source Globe.ts:5631-5731 update — cloud ring drift, balloon bob +
+  // inner spin, race banner bob + tilt, floating tree bob.
+  this.update = function (deltaTime) {
+    if (!this._root) return;
+    const dt = Math.min(deltaTime, 0.1);
+    this._time = (this._time || 0) + dt;
+    const t = this._time;
+
+    // Cloud ring drift around shared axis (source uses axis (0.2, 1, 0.1)
+    // normalized; we apply it as an incremental quaternion premultiply).
+    if (this._cloudRing) {
+      this._cloudDriftQuat.setFromAxisAngle(this._cloudDriftAxis, CLOUD_DRIFT_SPEED * dt);
+      this._cloudRing.quaternion.premultiply(this._cloudDriftQuat);
+    }
+
+    // Balloons: bob along their normal + slow inner spin
+    if (this._balloons) {
+      for (const b of this._balloons) {
+        const bob = Math.sin(t * 0.5 + b.phase) * 0.04;
+        const alt = b.baseAlt + bob;
+        b.pivot.position.copy(b.normal).multiplyScalar(alt);
+        b.inner.rotation.y += dt * 0.05;
+      }
+    }
+
+    // Race banners: similar bob + slight tilt
+    if (this._raceBanners) {
+      // Apply visibility command from race quest. Source equivalent:
+      // Globe.setRaceBannersVisible(visible, exceptIndex).
+      if (this.erth && this.erth.store) {
+        const cmd = this.erth.store.get(this.getAttribute("raceBannersVisibilityCommandKey"));
+        if (cmd && typeof cmd === "object") {
+          const want = cmd.visible !== false;
+          const exceptIdx = typeof cmd.exceptIndex === "number" ? cmd.exceptIndex : -1;
+          for (let i = 0; i < this._raceBanners.length; i++) {
+            const visible = want || i === exceptIdx;
+            if (this._raceBanners[i].pivot.visible !== visible) {
+              this._raceBanners[i].pivot.visible = visible;
+            }
+          }
+        }
+      }
+
+      for (const b of this._raceBanners) {
+        if (!b.pivot.visible) continue;
+        const bob = Math.sin(t * 1.2 + b.phase) * 0.06;
+        const alt = b.baseAlt + bob;
+        b.pivot.position.copy(b.normal).multiplyScalar(alt);
+        const tiltZ = Math.sin(t * 0.8 + b.phase * 1.5) * 0.08;
+        const tiltX = Math.cos(t * 0.6 + b.phase * 0.8) * 0.04;
+        b.inner.rotation.set(tiltX, 0, tiltZ);
+      }
+    }
+
+    // Floating tree clusters: per-instance bob via instanceMatrix update.
+    // Simplified — we only update the position (not the full quaternion lean)
+    // each frame for cost. The lean stays from init.
+    if (this._floatingTreeMesh && this._floatingTreeData) {
+      const inst = this._floatingTreeMesh;
+      const tmpMat = this._floatingTmpMat;
+      const tmpPos = this._floatingTmpPos;
+      const tmpScale = this._floatingTmpScale;
+      const tmpQuat = this._floatingTmpQuat;
+      const total = this._floatingTreeData.length;
+      const batchSize = Math.min(total, this._floatingUpdateBatchSize || total);
+      const start = this._floatingUpdateCursor || 0;
+      for (let s = 0; s < batchSize; s++) {
+        const i = (start + s) % total;
+        const d = this._floatingTreeData[i];
+        const wave = Math.sin(t * d.speed + d.phase) * d.amp;
+        const alt = d.baseHeight + wave;
+        tmpPos.copy(d.normal).multiplyScalar(this._globeRadius + alt);
+        tmpPos.add(d.tangentOffset);
+        tmpScale.set(d.sizeVar * 0.7, d.sizeVar * 2.0, d.sizeVar * 0.7);
+        tmpQuat.copy(d.quaternion);
+        tmpMat.compose(tmpPos, tmpQuat, tmpScale);
+        inst.setMatrixAt(i, tmpMat);
+      }
+      this._floatingUpdateCursor = (start + batchSize) % total;
+      inst.instanceMatrix.needsUpdate = true;
+    }
+  };
+
+  // -----------------------------------------------------------------
+  // Builders
+  // -----------------------------------------------------------------
+
+  this._buildVisuals = function (parent) {
+    const radius = this.getAttribute("radius");
+    const seed = this.getAttribute("terrainSeed");
+    const terrainType = this.getAttribute("terrainType");
+    this._globeRadius = radius;
+    this._time = 0;
+
+    const root = new THREE.Group();
+    root.name = "tinyskiesGlobeAtmospheric";
+    root.userData.isRuntimeOnly = true;
+
+    this._balloons = [];
+    this._raceBanners = [];
+    this._floatingTreeData = [];
+    this._raceBannerTextures = [];
+    this._cloudDriftAxis = new THREE.Vector3(0.2, 1, 0.1).normalize();
+    this._cloudDriftQuat = new THREE.Quaternion();
+    this._floatingTmpMat = new THREE.Matrix4();
+    this._floatingTmpPos = new THREE.Vector3();
+    this._floatingTmpScale = new THREE.Vector3();
+    this._floatingTmpQuat = new THREE.Quaternion();
+    this._floatingUpdateCursor = 0;
+    this._floatingUpdateBatchSize = 280;
+
+    this._buildClouds(root, radius, this.getAttribute("cloudCount"), this.getAttribute("cloudAltitude"));
+    this._buildBalloons(root, radius, seed, this.getAttribute("balloonCount"), this.getAttribute("balloonAltitude"));
+    this._buildFloatingTrees(root, radius, seed, terrainType, this.getAttribute("floatingTreeClusters"), this.getAttribute("floatingTreesPerCluster"));
+    this._buildRaceBanners(root, radius, seed, terrainType, this.getAttribute("raceBannerCount"), this.getAttribute("balloonAltitude"));
+
+    parent.add(root);
+    this._root = root;
+
+    // Publish race banner data for the race-quest behavior. World positions
+    // captured here are pivot-resolved (normal × baseAlt) so consumers don't
+    // need to recompute. Source RaceManager reads equivalent data through
+    // Globe.getRaceBanners().
+    if (this._raceBanners && this._raceBanners.length > 0 && this.erth && this.erth.store) {
+      const payload = this._raceBanners.map((b, idx) => ({
+        index: idx,
+        worldPos: [b.normal.x * b.baseAlt, b.normal.y * b.baseAlt, b.normal.z * b.baseAlt],
+        normal: [b.normal.x, b.normal.y, b.normal.z],
+        baseAlt: b.baseAlt,
+      }));
+      this.erth.store.set(this.getAttribute("raceBannersStoreKey"), payload);
+      this._log("published race banners to store", payload.length);
+    }
+  };
+
+  this._buildClouds = function (root, radius, cloudCount, cloudAltitude) {
+    const rand = S.seededRandom(77);
+    const REF_UP = new THREE.Vector3(0, 1, 0);
+    const cloudRing = new THREE.Group();
+    cloudRing.userData.isRuntimeOnly = true;
+
+    const puffGeo = new THREE.SphereGeometry(1, 16, 12);
+    const cloudMaterial = buildCloudPuffMat();
+    const cloudAlt = radius + cloudAltitude;
+    const puffMatrices = [];
+    const ONE = new THREE.Vector3(1, 1, 1);
+    const IDENTITY = new THREE.Quaternion();
+    const localMat = new THREE.Matrix4();
+    const cloudMatrix = new THREE.Matrix4();
+    const finalMat = new THREE.Matrix4();
+    const localPos = new THREE.Vector3();
+    const localScale = new THREE.Vector3();
+    const cloudPos = new THREE.Vector3();
+    const cloudQuat = new THREE.Quaternion();
+
+    const sizeBuckets = [
+      { puffs: [2, 3], baseScale: 0.12, spread: 0.2, weight: 0.3 },
+      { puffs: [4, 6], baseScale: 0.22, spread: 0.45, weight: 0.4 },
+      { puffs: [7, 10], baseScale: 0.3, spread: 0.7, weight: 0.2 },
+      { puffs: [10, 14], baseScale: 0.35, spread: 0.9, weight: 0.1 },
+    ];
+
+    for (let i = 0; i < cloudCount; i++) {
+      const r = rand();
+      let cum = 0;
+      let bucket = sizeBuckets[0];
+      for (const sb of sizeBuckets) { cum += sb.weight; if (r < cum) { bucket = sb; break; } }
+      const puffCount = bucket.puffs[0] + Math.floor(rand() * (bucket.puffs[1] - bucket.puffs[0] + 1));
+      const spread = bucket.spread;
+      const localPuffs = [];
+
+      for (let p = 0; p < puffCount; p++) {
+        const isCenter = p === 0;
+        const distRatio = isCenter ? 0 : Math.pow(rand(), 0.6);
+        const dist = distRatio * spread;
+        const angle = rand() * Math.PI * 2;
+        const baseRadius = bucket.baseScale * THREE.MathUtils.lerp(0.9, 1.1, rand());
+        const sizeFalloff = 1.0 - distRatio * 0.6;
+        const sx = baseRadius * sizeFalloff * THREE.MathUtils.lerp(1.2, 2.0, rand());
+        const sy = baseRadius * sizeFalloff * sizeFalloff * THREE.MathUtils.lerp(1.0, 1.8, rand());
+        const sz = baseRadius * sizeFalloff * THREE.MathUtils.lerp(1.2, 2.0, rand());
+        const bottomAlign = sy * 0.8;
+        const jitterY = (rand() - 0.5) * sy * 0.3;
+        localPos.set(Math.cos(angle) * dist, bottomAlign + jitterY, Math.sin(angle) * dist * 0.7);
+        localScale.set(sx, sy, sz);
+        localMat.compose(localPos, IDENTITY, localScale);
+        localPuffs.push(localMat.clone());
+      }
+      const theta = rand() * Math.PI * 2;
+      const phi = Math.acos(2 * rand() - 1);
+      const normal = new THREE.Vector3(
+        Math.sin(phi) * Math.cos(theta),
+        Math.sin(phi) * Math.sin(theta),
+        Math.cos(phi),
+      ).normalize();
+      const altVar = cloudAlt + (rand() - 0.5) * 0.3;
+      cloudPos.copy(normal).multiplyScalar(altVar);
+      cloudQuat.setFromUnitVectors(REF_UP, normal);
+      cloudMatrix.compose(cloudPos, cloudQuat, ONE);
+      for (const puffMat of localPuffs) {
+        finalMat.multiplyMatrices(cloudMatrix, puffMat);
+        puffMatrices.push(finalMat.clone());
+      }
+    }
+    if (puffMatrices.length > 0) {
+      const cloudPuffs = new THREE.InstancedMesh(puffGeo, cloudMaterial, puffMatrices.length);
+      cloudPuffs.userData.isRuntimeOnly = true;
+      cloudPuffs.frustumCulled = false;
+      for (let i = 0; i < puffMatrices.length; i++) cloudPuffs.setMatrixAt(i, puffMatrices[i]);
+      cloudPuffs.instanceMatrix.needsUpdate = true;
+      cloudRing.add(cloudPuffs);
+    } else {
+      puffGeo.dispose();
+      cloudMaterial.dispose();
+    }
+    root.add(cloudRing);
+    this._cloudRing = cloudRing;
+    this._log("clouds placed", cloudCount, "puffs", puffMatrices.length);
+  };
+
+  this._buildBalloons = function (root, radius, seed, balloonCount, balloonAltitude) {
+    const rand = S.seededRandom(999 + seed);
+    const REF_UP = new THREE.Vector3(0, 1, 0);
+    for (let i = 0; i < balloonCount; i++) {
+      const [primary, secondary] = BALLOON_SCHEMES[i % BALLOON_SCHEMES.length];
+      const balloon = createBalloonMesh(primary, secondary);
+      const theta = rand() * Math.PI * 2;
+      const phi = Math.acos(2 * rand() - 1);
+      const normal = new THREE.Vector3(
+        Math.sin(phi) * Math.cos(theta),
+        Math.cos(phi),
+        Math.sin(phi) * Math.sin(theta),
+      ).normalize();
+      const baseAlt = radius + balloonAltitude + (rand() - 0.5) * 0.3;
+      const scale = THREE.MathUtils.lerp(0.8, 1.2, rand());
+      balloon.scale.setScalar(scale);
+      const pivot = new THREE.Group();
+      pivot.userData.isRuntimeOnly = true;
+      pivot.position.copy(normal.clone().multiplyScalar(baseAlt));
+      pivot.quaternion.setFromUnitVectors(REF_UP, normal);
+      pivot.add(balloon);
+      root.add(pivot);
+      this._balloons.push({
+        pivot,
+        inner: balloon,
+        normal: normal.clone(),
+        baseAlt,
+        phase: rand() * Math.PI * 2,
+      });
+    }
+    this._log("balloons placed", this._balloons.length);
+  };
+
+  // Source Globe.ts:4172 createFloatingTreeClusters — 28 cluster centers
+  // anchored to forest-noise patches, 40 trees per cluster. Impact-bias
+  // (MOON_APPROACH_DIR) simplified to uniform sphere distribution since
+  // we don't model the moon-collision arc.
+  this._buildFloatingTrees = function (root, radius, seed, terrainType, clusterCount, treesPerCluster) {
+    const rand = S.seededRandom(888 + seed);
+    const forestNoise = T.createNoise3D(seed + 999);
+    const Y_UP = new THREE.Vector3(0, 1, 0);
+
+    // Find cluster centers anchored on forest patches.
+    const candidates = [];
+    for (let s = 0; s < 2000; s++) {
+      const theta = rand() * Math.PI * 2;
+      const phi = Math.acos(2 * rand() - 1);
+      const nx = Math.sin(phi) * Math.cos(theta);
+      const ny = Math.sin(phi) * Math.sin(theta);
+      const nz = Math.cos(phi);
+      if (!T.sampleTerrain(seed, terrainType, nx, ny, nz).isLand) continue;
+      const fv = forestNoise(nx * 2.5, ny * 2.5, nz * 2.5);
+      if (fv < 0.30) continue;
+      candidates.push({ normal: new THREE.Vector3(nx, ny, nz), score: fv });
+    }
+    candidates.sort((a, b) => b.score - a.score);
+    const chosen = [];
+    for (const c of candidates) {
+      if (chosen.length >= clusterCount) break;
+      let ok = true;
+      for (const v of chosen) { if (v.dot(c.normal) >= 0.90) { ok = false; break; } }
+      if (ok) chosen.push(c.normal);
+    }
+    if (chosen.length === 0) return;
+
+    const buildCluster = (clusterNormal, count, rng, spreadMin, spreadMax, heightMax) => {
+      let ref = Math.abs(clusterNormal.y) < 0.9 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0);
+      const tang1 = new THREE.Vector3().crossVectors(clusterNormal, ref).normalize();
+      const tang2 = new THREE.Vector3().crossVectors(clusterNormal, tang1).normalize();
+      const spread = spreadMin + rng() * (spreadMax - spreadMin);
+      for (let i = 0; i < count; i++) {
+        const angle = rng() * Math.PI * 2;
+        const r = Math.sqrt(rng()) * spread;
+        const tangentOffset = new THREE.Vector3()
+          .addScaledVector(tang1, Math.cos(angle) * r)
+          .addScaledVector(tang2, Math.sin(angle) * r);
+        const u = rng();
+        const baseHeight = 0.05 + u * u * heightMax;
+        const leanDir = rng() * Math.PI * 2;
+        const leanAngle = 0.12 + rng() * 0.55;
+        const leanAxis = new THREE.Vector3(Math.cos(leanDir), 0, Math.sin(leanDir));
+        const qBase = new THREE.Quaternion().setFromUnitVectors(Y_UP, clusterNormal);
+        const qLean = new THREE.Quaternion().setFromAxisAngle(leanAxis, leanAngle);
+        this._floatingTreeData.push({
+          normal: clusterNormal.clone(),
+          tangentOffset,
+          baseHeight,
+          amp: 0.022 + rng() * 0.042,
+          speed: 0.40 + rng() * 0.65,
+          phase: rng() * Math.PI * 2,
+          quaternion: new THREE.Quaternion().multiplyQuaternions(qBase, qLean),
+          sizeVar: 0.026 + rng() * 0.030,
+        });
+      }
+    };
+
+    for (const n of chosen) buildCluster(n, treesPerCluster, rand, 0.20, 0.48, 0.50);
+
+    const total = this._floatingTreeData.length;
+    if (total === 0) return;
+    const geo = createTeardropGeo();
+    const mat = new THREE.MeshStandardNodeMaterial({
+      vertexColors: true,
+      flatShading: true,
+      roughness: 0.85,
+      metalness: 0,
+    });
+    applyRimLight(mat, 0xffeeaa, 0.55, 3.0);
+    const inst = new THREE.InstancedMesh(geo, mat, total);
+    inst.castShadow = true;
+    inst.userData.isRuntimeOnly = true;
+    // Initialize matrices via the same path we use in update so positions
+    // are correct at t=0.
+    const tmpMat = new THREE.Matrix4();
+    const tmpPos = new THREE.Vector3();
+    const tmpScale = new THREE.Vector3();
+    for (let i = 0; i < total; i++) {
+      const d = this._floatingTreeData[i];
+      const wave = Math.sin(d.phase) * d.amp;
+      const alt = d.baseHeight + wave;
+      tmpPos.copy(d.normal).multiplyScalar(radius + alt);
+      tmpPos.add(d.tangentOffset);
+      tmpScale.set(d.sizeVar * 0.7, d.sizeVar * 2.0, d.sizeVar * 0.7);
+      tmpMat.compose(tmpPos, d.quaternion, tmpScale);
+      inst.setMatrixAt(i, tmpMat);
+    }
+    inst.instanceMatrix.needsUpdate = true;
+    root.add(inst);
+    this._floatingTreeMesh = inst;
+    this._log("floating-tree clusters", chosen.length, "total trees", total);
+  };
+
+  // Source Globe.ts:5059 createRaceBanners — 3 sites with twin balloons +
+  // double-sided checker banner + START/FINISH text texture.
+  this._buildRaceBanners = function (root, radius, seed, terrainType, count, balloonAltitude) {
+    const rand = S.seededRandom(112233 + seed);
+    const REF_UP = new THREE.Vector3(0, 1, 0);
+    const MIN_E = 0.05, MAX_E = 0.5, MIN_SEP = 0.85;
+
+    const candidates = [];
+    let attempts = 0;
+    while (attempts < 5000 && candidates.length < 100) {
+      attempts++;
+      const theta = rand() * Math.PI * 2;
+      const phi = Math.acos(2 * rand() - 1);
+      const nx = Math.sin(phi) * Math.cos(theta);
+      const ny = Math.cos(phi);
+      const nz = Math.sin(phi) * Math.sin(theta);
+      const sample = T.sampleTerrain(seed, terrainType, nx, ny, nz);
+      if (!sample.isLand) continue;
+      if (sample.elevation < MIN_E || sample.elevation > MAX_E) continue;
+      candidates.push({ normal: new THREE.Vector3(nx, ny, nz), elevation: sample.elevation });
+    }
+    const chosen = [];
+    for (const c of candidates) {
+      if (chosen.length >= count) break;
+      let tooClose = false;
+      for (const v of chosen) { if (c.normal.dot(v) > MIN_SEP) { tooClose = true; break; } }
+      if (!tooClose) chosen.push(c.normal);
+    }
+    if (chosen.length === 0) return;
+
+    const startTex = buildRaceBannerCanvasTexture("START");
+    if (startTex && this._raceBannerTextures) this._raceBannerTextures.push(startTex);
+    const startMat = startTex
+      ? new THREE.MeshStandardNodeMaterial({ map: startTex, side: THREE.DoubleSide, roughness: 0.6, metalness: 0 })
+      : new THREE.MeshStandardNodeMaterial({ color: 0xffffff, side: THREE.DoubleSide });
+    if (startMat) applyRimLight(startMat, 0xffeedd, 0.3, 3.0);
+
+    for (const normal of chosen) {
+      const bannerGroup = new THREE.Group();
+      bannerGroup.userData.isRuntimeOnly = true;
+
+      const [p1, s1] = BALLOON_SCHEMES[Math.floor(rand() * BALLOON_SCHEMES.length)];
+      const leftBalloon = createBalloonMesh(p1, s1);
+      leftBalloon.position.set(-0.25, 0, 0);
+      bannerGroup.add(leftBalloon);
+      const [p2, s2] = BALLOON_SCHEMES[Math.floor(rand() * BALLOON_SCHEMES.length)];
+      const rightBalloon = createBalloonMesh(p2, s2);
+      rightBalloon.position.set(0.25, 0, 0);
+      bannerGroup.add(rightBalloon);
+
+      const bannerGeo = new THREE.PlaneGeometry(0.5, 0.12, 16, 2);
+      const bannerMesh = new THREE.Mesh(bannerGeo, startMat);
+      bannerMesh.position.set(0, -0.11, 0);
+      bannerMesh.castShadow = true;
+      bannerMesh.userData.isRuntimeOnly = true;
+      bannerGroup.add(bannerMesh);
+
+      const baseAlt = radius + balloonAltitude + (rand() - 0.5) * 0.2;
+      const spin = rand() * Math.PI * 2;
+      const pivot = new THREE.Group();
+      pivot.userData.isRuntimeOnly = true;
+      pivot.position.copy(normal.clone().multiplyScalar(baseAlt));
+      pivot.quaternion.setFromUnitVectors(REF_UP, normal);
+      pivot.rotateY(spin);
+      pivot.add(bannerGroup);
+      root.add(pivot);
+      this._raceBanners.push({
+        pivot,
+        inner: bannerGroup,
+        normal: normal.clone(),
+        baseAlt,
+        phase: rand() * Math.PI * 2,
+      });
+    }
+    this._log("race banners placed", this._raceBanners.length);
+  };
+
+  this._teardownVisuals = function () {
+    if (!this._root) return;
+    if (this._raceBannerTextures) {
+      for (const tex of this._raceBannerTextures) {
+        if (tex && typeof tex.dispose === "function") tex.dispose();
+      }
+    }
+    this._root.traverse((child) => {
+      if (child.geometry && typeof child.geometry.dispose === "function") child.geometry.dispose();
+      if (child.material) {
+        if (Array.isArray(child.material)) {
+          for (const m of child.material) if (m && typeof m.dispose === "function") m.dispose();
+        } else if (typeof child.material.dispose === "function") {
+          child.material.dispose();
+        }
+      }
+    });
+    if (this._root.parent) this._root.parent.remove(this._root);
+    this._root = null;
+    this._cloudRing = null;
+    this._balloons = null;
+    this._raceBanners = null;
+    this._floatingTreeMesh = null;
+    this._floatingTreeData = null;
+    this._raceBannerTextures = null;
+    this._floatingUpdateCursor = 0;
+    this._time = 0;
+  };

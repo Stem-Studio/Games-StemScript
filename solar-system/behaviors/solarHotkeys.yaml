@@ -1,0 +1,270 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "Solar Hotkeys HUD"
+  id: "sw.solarHotkeys"
+  author: "scriptwizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Top-left hotkeys overlay with mobile tap shortcuts"
+  tags:
+    - ui
+  priority: 20
+  attributes: {}
+  documentation: "Hotkeys helper overlay for desktop and mobile."
+
+code: |
+  /**
+   * Solar System — Hotkeys HUD
+   * Separate overlay behavior, center-left, always on top.
+   *
+   * Renders identically in editor preview and play mode via the inlined
+   * dual-mode helper (see docs/examples/canonical/uikit_dual_mode_init.js).
+   */
+
+  const uikit = (function () {
+    function createPlayContext(g) {
+      return {
+        kind: "play",
+        renderer: (g.app && g.app.renderer) || g.renderer,
+        getUICamera: function () { return g.uiCamera; },
+        gameLike: g,
+      };
+    }
+    async function createEditorContext(editor) {
+      const uiCamera = await editor.ensureUICamera();
+      const gameLike = {
+        renderer: editor.renderer,
+        uiCamera: uiCamera,
+        scene: editor.scene,
+        app: { renderer: editor.renderer },
+      };
+      return {
+        kind: "editor",
+        renderer: editor.renderer,
+        getUICamera: function () { return uiCamera; },
+        gameLike: gameLike,
+      };
+    }
+    function buildRoot(ctx, properties) {
+      const overrides = properties || {};
+      const root = new UIKit.Fullscreen(ctx.renderer, {
+        pixelSize: overrides.pixelSize !== undefined ? overrides.pixelSize : 0.002,
+        pointerEvents: overrides.pointerEvents || "listener",
+        visibility: overrides.visibility || "visible",
+      });
+      root.userData.isRuntimeOnly = true;
+      return root;
+    }
+    function attach(behavior, ctx) {
+      if (!behavior._uiRoot) return false;
+      if (behavior._uiAttached) return true;
+      const uiCamera = ctx.getUICamera();
+      if (!uiCamera) return false;
+      UIKitPointerEvents.initialize(ctx.gameLike);
+      uiCamera.add(behavior._uiRoot);
+      UIKitPointerEvents.registerRoot(behavior._uiRoot);
+      behavior._uiAttached = true;
+      return true;
+    }
+    function tick(behavior, deltaTime) {
+      if (!behavior._uikitCtx) return;
+      if (!behavior._uiAttached) attach(behavior, behavior._uikitCtx);
+      if (behavior._uiAttached) UIKitPointerEvents.update(deltaTime || 16);
+    }
+    function teardown(behavior) {
+      if (behavior._uiRoot) {
+        try { UIKitPointerEvents.unregisterRoot(behavior._uiRoot); } catch (_e) {}
+        if (behavior._uiRoot.parent) behavior._uiRoot.parent.remove(behavior._uiRoot);
+        if (behavior._uiRoot.dispose) behavior._uiRoot.dispose();
+        behavior._uiRoot = null;
+      }
+      try { UIKitPointerEvents.deinitialize(); } catch (_e) {}
+      behavior._uiAttached = false;
+      behavior._uikitCtx = null;
+    }
+    return {
+      createPlayContext: createPlayContext,
+      createEditorContext: createEditorContext,
+      buildRoot: buildRoot,
+      attach: attach,
+      tick: tick,
+      teardown: teardown,
+    };
+  })();
+
+  let store = null;
+  let panelRef = null;
+  let titleTextRef = null;
+  let keyRows = [];
+  let keyCaps = [];
+  let keyTexts = [];
+  let descTexts = [];
+  let lastViewportW = -1;
+  const MOBILE_UI_MAX_WIDTH = 768;
+  const MOBILE_UI_SCALE = 0.5;
+  const DESKTOP_KEY_LABELS = ["SPACE", "1 - 5", "O"];
+  const MOBILE_KEY_LABELS = ["⏯️", "⚡", "🪐"];
+
+  // navigator is not exposed in the SES compartment — rely on window only.
+  function isMobileUi() {
+    if (typeof window === "undefined") return false;
+    const touchCapable = ("ontouchstart" in window);
+    const coarsePointer = !!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches);
+    return window.innerWidth <= MOBILE_UI_MAX_WIDTH || (touchCapable && coarsePointer);
+  }
+
+  function applyResponsiveLayout() {
+    if (!panelRef) return;
+    const mobile = isMobileUi();
+    const s = mobile ? MOBILE_UI_SCALE : 1;
+    const sf = function(n) { return Math.max(1, Math.round(n * s)); };
+    const widthScale = mobile ? Math.max(1.15, s) : 1.05;
+    panelRef.setProperties({
+      width: (11 * widthScale) + "%",
+      gap: sf(7),
+      padding: sf(10),
+      borderRadius: sf(7)
+    });
+    if (titleTextRef) titleTextRef.setProperties({ fontSize: sf(11) });
+    for (let i = 0; i < keyRows.length; i++) keyRows[i].setProperties({ gap: sf(8) });
+    for (let i = 0; i < keyCaps.length; i++) {
+      keyCaps[i].setProperties({
+        minWidth: sf(50),
+        height: sf(21),
+        paddingLeft: sf(6),
+        paddingRight: sf(6),
+        borderRadius: sf(5)
+      });
+    }
+    for (let i = 0; i < keyTexts.length; i++) keyTexts[i].setProperties({ fontSize: sf(12), text: mobile ? MOBILE_KEY_LABELS[i] : DESKTOP_KEY_LABELS[i] });
+    for (let i = 0; i < descTexts.length; i++) descTexts[i].setProperties({ fontSize: sf(11) });
+  }
+
+  function buildPanel() {
+    const panel = new UIKit.Container({
+      positionType: "absolute",
+      positionLeft: "2%",
+      positionTop: "2%",
+      width: "11%",
+      flexDirection: "column",
+      gap: 7,
+      padding: 10,
+      borderRadius: 7,
+      borderWidth: 1,
+      borderColor: 0x3f3f46,
+      backgroundColor: 0x080c14,
+      backgroundOpacity: 0.94,
+      pointerEvents: "none",
+      visibility: "visible",
+      zIndex: 100
+    });
+    const addKeycapRow = (keyLabel, description, keyBg, keyBorder, actionKey) => {
+      const row = new UIKit.Container({
+        flexDirection: "row",
+        alignItems: "center",
+        gap: 8,
+        width: "100%",
+        pointerEvents: "none",
+        visibility: "visible"
+      });
+      keyRows.push(row);
+      const keyCap = new UIKit.Container({
+        minWidth: 50,
+        height: 21,
+        paddingLeft: 6,
+        paddingRight: 6,
+        justifyContent: "center",
+        alignItems: "center",
+        borderRadius: 5,
+        borderWidth: 1,
+        borderColor: new THREE.Color(keyBorder),
+        backgroundColor: new THREE.Color(keyBg),
+        backgroundOpacity: 0.92,
+        pointerEvents: "auto",
+        cursor: "pointer",
+        visibility: "visible",
+        onClick: function() {
+          if (!store || !isMobileUi() || !actionKey) return;
+          store.set(actionKey, true);
+        }
+      });
+      keyCaps.push(keyCap);
+      const keyText = new UIKit.Text({ text: keyLabel, fontSize: 12, color: 0xffffff, pointerEvents: "none", visibility: "visible" });
+      keyTexts.push(keyText);
+      keyCap.add(keyText);
+      row.add(keyCap);
+      const descText = new UIKit.Text({ text: description, fontSize: 11, color: 0xe8edf7, textAlign: "left", pointerEvents: "none", visibility: "visible" });
+      descTexts.push(descText);
+      row.add(descText);
+      panel.add(row);
+    };
+    titleTextRef = new UIKit.Text({ text: "Click planet  -  Show info", fontSize: 11, color: 0xffffff, pointerEvents: "none", visibility: "visible" });
+    panel.add(titleTextRef);
+    addKeycapRow("SPACE", "Pause / Resume", 0x5a2a2a, 0xff8d8d, "solarMobilePauseTap");
+    addKeycapRow("1 - 5", "Speed -> 1x", 0x1f3f75, 0x6cb2ff, "solarMobileSpeedTap");
+    addKeycapRow("O", "Toggle orbit rings", 0x1f4f36, 0x6cffb2, "solarMobileOrbitTap");
+    return panel;
+  }
+
+  function resetUiState() {
+    panelRef = null;
+    titleTextRef = null;
+    keyRows = [];
+    keyCaps = [];
+    keyTexts = [];
+    descTexts = [];
+    lastViewportW = -1;
+  }
+
+  this._buildUIKitContent = function() {
+    if (!this._uiRoot) return;
+    resetUiState();
+    panelRef = buildPanel();
+    this._uiRoot.add(panelRef);
+    lastViewportW = typeof window !== "undefined" ? window.innerWidth : -1;
+    applyResponsiveLayout();
+  };
+
+  this.init = function(_game) {
+    store = this.erth ? this.erth.store : null;
+    this._uikitCtx = uikit.createPlayContext(_game);
+    this._uiRoot = uikit.buildRoot(this._uikitCtx);
+    this._buildUIKitContent();
+    uikit.attach(this, this._uikitCtx);
+  };
+
+  this.update = function(deltaTime) {
+    if (!this._uiRoot) return;
+    uikit.tick(this, deltaTime);
+    if (typeof window !== "undefined" && window.innerWidth !== lastViewportW) {
+      lastViewportW = window.innerWidth;
+      applyResponsiveLayout();
+    }
+  };
+
+  this.dispose = function() {
+    uikit.teardown(this);
+    resetUiState();
+    store = null;
+  };
+
+  this.onEditorAdded = async function(editor) {
+    if (!this._uiRoot) {
+      this._uikitCtx = await uikit.createEditorContext(editor);
+      this._uiRoot = uikit.buildRoot(this._uikitCtx);
+      this._buildUIKitContent();
+    } else if (!this._uiAttached) {
+      this._uikitCtx = await uikit.createEditorContext(editor);
+    }
+    uikit.attach(this, this._uikitCtx);
+  };
+
+  this.onEditorDispose = function() {
+    uikit.teardown(this);
+    resetUiState();
+  };

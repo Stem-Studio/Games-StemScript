@@ -1,0 +1,71 @@
+# ============================================================
+# PMNDRS Racing Game — StemStudio Conversion
+# Source: pmndrs/racing-game (React Three Fiber + Cannon)
+# ============================================================
+
+project title "PMNDRS Racing Game"
+
+# --- Imports: Models ---
+import model name="TrackWorld" filepath="models/track-draco.glb" comment="Desert race environment with track, terrain, train, birds, and clouds"
+import model name="ChassisModel" filepath="models/chassis-draco.glb" comment="Player vehicle body"
+import model name="WheelFL" filepath="models/wheel-draco.glb" comment="Front-left wheel"
+import model name="WheelFR" filepath="models/wheel-draco.glb" comment="Front-right wheel"
+import model name="WheelBL" filepath="models/wheel-draco.glb" comment="Rear-left wheel"
+import model name="WheelBR" filepath="models/wheel-draco.glb" comment="Rear-right wheel"
+
+# --- Imports: Audio ---
+import audio name="EngineSound" filepath="audio/engine.mp3" comment="Engine idle/loop"
+import audio name="AccelerateSound" filepath="audio/accelerate.mp3" comment="Acceleration loop"
+import audio name="BoostSound" filepath="audio/boost.mp3" comment="Boost loop"
+import audio name="HonkSound" filepath="audio/honk.mp3" comment="Horn"
+import audio name="CrashSound" filepath="audio/crash.mp3" comment="Collision impact"
+import audio name="TrainSound" filepath="audio/train.mp3" comment="Train ambience"
+import audio name="WaterSound" filepath="audio/water.mp3" comment="Water ambience"
+import audio name="BrakeSound" filepath="audio/tire-brake.mp3" comment="Brake / skid loop"
+
+# --- Imports: Behaviors ---
+import behavior name="PRG Race Game" filepath="behaviors/prgRaceGame.yaml" comment="Driving, camera, HUD, race flow, world motion, and audio"
+import behavior name="PRG Leaderboard" filepath="behaviors/prgLeaderboard.yaml" comment="Leaderboard UI modal and leaderboard events"
+
+# --- Scene Settings ---
+scene background type=Gradient gradient="linear-gradient(180deg, #9dc4dd 0%, #f6f4ef 58%, #ead3a2 100%)"
+scene fog type=linear color=#ffffff near=0 far=500
+scene lighting ambient={intensity:0.12,color:#ffffff} hemisphere={skyColor:#eef6ff,groundColor:#d0b78b,intensity:0.55}
+update "Directional Light" position=0,50,150
+light "Directional Light" intensity=1 castShadow=true shadowMapSize=4096
+render settings useShadows=true
+game settings enabled=true showHUD=false
+
+# --- Player Rig ---
+add group name="Player" position=-110,0.75,220
+update Player tag=Player
+move ChassisModel parent=Player
+move WheelFL parent=Player
+move WheelFR parent=Player
+move WheelBL parent=Player
+move WheelBR parent=Player
+update ChassisModel position=0,-0.2,-0.2
+update WheelFL position=-0.85,-0.3,1.35 scale=-1.118,1.118,1.118
+update WheelFR position=0.85,-0.3,1.35 scale=1.118,1.118,1.118
+update WheelBL position=-0.85,-0.3,-1.3 scale=-1.118,1.118,1.118
+update WheelBR position=0.85,-0.3,-1.3 scale=1.118,1.118,1.118
+
+# --- Race Gates ---
+add box name="StartGate" position=-27,1,180 scale=2,10,18 color=#ffffff
+add box name="FinishGate" position=-104,1,-189 scale=2,10,18 color=#ffffff
+add box name="CheckpointGate" position=-50,1,-5 scale=2,10,18 color=#ffffff
+update StartGate rotation=0,31.5,0 objectSettings={gameVisibility:false,enableAtStart:false}
+update FinishGate rotation=0,-68.75,0 objectSettings={gameVisibility:false,enableAtStart:false}
+update CheckpointGate rotation=0,-28.65,0 objectSettings={gameVisibility:false,enableAtStart:false}
+
+# --- Manager ---
+add group name="RaceManager" position=0,0,0
+add group name="Leaderboard" position=0,0,0
+behavior attach RaceManager behaviorId=69e9eb868a0240c443d139c9 config={maxSpeed:88,acceleration:42,reverseMaxSpeed:26,brakeStrength:34,steerStrength:2.6,boostMultiplier:1.5,collisionRadius:0.85,gravity:32,engineSound:"EngineSound",accelerateSound:"AccelerateSound",boostSound:"BoostSound",brakeSound:"BrakeSound",honkSound:"HonkSound",crashSound:"CrashSound",trainSound:"TrainSound",waterSound:"WaterSound"}
+behavior attach Leaderboard behaviorId=69eaecd45b53803168c0889a
+
+# --- Camera ---
+camera "DefaultCamera" cameraType=NONE fov=75 near=0.01 far=1000
+
+# --- Touch Controls ---
+behavior attach "Default Scene" behaviorId=touchControls config={mobileEnabled:true,tabletEnabled:true,desktopEnabled:false,mobileHorizontalLayout:{joystick:{joystickEnabled:false},steeringWheel:{steeringWheelEnabled:true,steeringWheelPosition:[0.15,0.22],steeringWheelSize:120,steeringWheelSensitivity:1,steeringWheelMaxRotation:90,steeringWheelReturnSpeed:5},buttons:[{buttonId:"gasBtn",buttonType:"jump",buttonEnabled:true,buttonPosition:[0.85,0.24],buttonSize:74},{buttonId:"brakeBtn",buttonType:"interact",buttonEnabled:true,buttonPosition:[0.72,0.11],buttonSize:60}]},mobileVerticalLayout:{joystick:{joystickEnabled:false},steeringWheel:{steeringWheelEnabled:true,steeringWheelPosition:[0.15,0.15],steeringWheelSize:100,steeringWheelSensitivity:1,steeringWheelMaxRotation:90,steeringWheelReturnSpeed:5},buttons:[{buttonId:"gasBtn",buttonType:"jump",buttonEnabled:true,buttonPosition:[0.85,0.16],buttonSize:64},{buttonId:"brakeBtn",buttonType:"interact",buttonEnabled:true,buttonPosition:[0.72,0.08],buttonSize:52}]},tabletHorizontalLayout:{joystick:{joystickEnabled:false},steeringWheel:{steeringWheelEnabled:true,steeringWheelPosition:[0.12,0.2],steeringWheelSize:140,steeringWheelSensitivity:1,steeringWheelMaxRotation:90,steeringWheelReturnSpeed:5},buttons:[{buttonId:"gasBtn",buttonType:"jump",buttonEnabled:true,buttonPosition:[0.88,0.23],buttonSize:84},{buttonId:"brakeBtn",buttonType:"interact",buttonEnabled:true,buttonPosition:[0.75,0.12],buttonSize:68}]}}

@@ -1,0 +1,153 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+config:
+  priority: 0
+  name: FP3 Message Feed
+  id: fp3.messageFeed
+  author: flight-sim
+  isScript: true
+  main: script.js
+  version: 1.0.0
+  description: "Kill feed, crash messages, and system messages displayed top-center. Auto-fades after 5 seconds. Watches fp3_combatMessage store key."
+  tags:
+    - gameplay
+    - ui
+  attributes: {}
+  documentation: "Anchored top-center message feed showing up to 5 messages. New messages push down existing ones. Each message auto-removes after 5 seconds. Message types include kill notifications, crash alerts, and system messages. Watches fp3_combatMessage for incoming messages."
+code: |
+  // ============================================================
+  // FP3 Message Feed
+  // Kill feed / crash / system messages — top-center overlay.
+  // Watches fp3_combatMessage store key.
+  // ============================================================
+
+  let game;
+  let store;
+  let fullscreen = null;
+  let rootParented = false;
+  let feedContainer = null;
+  let messages = []; // { element, timer }
+  let MAX_MESSAGES = 5;
+  let FADE_TIME = 5.0;
+  let lastMessageVal = null;
+
+  function parentToCamera() {
+    if (rootParented || !fullscreen) return;
+    if (game.uiCamera) {
+      game.uiCamera.add(fullscreen);
+      rootParented = true;
+    }
+  }
+
+  function getMessageColor(type) {
+    if (type === 'kill') return '#ff4444';
+    if (type === 'crash') return '#ff8800';
+    if (type === 'system') return '#44aaff';
+    return '#ffffff';
+  }
+
+  function addMessage(text, type) {
+    // Remove oldest if at capacity
+    if (messages.length >= MAX_MESSAGES) {
+      let oldest = messages.shift();
+      if (oldest.element && oldest.element.parent) {
+        oldest.element.parent.remove(oldest.element);
+      }
+    }
+
+    let msgColor = getMessageColor(type);
+
+    let msgContainer = new UIKit.Container({
+      width: 380,
+      backgroundColor: 'rgba(0,0,0,0.6)',
+      borderRadius: 6,
+      padding: 6,
+      justifyContent: 'center',
+      alignItems: 'center',
+      visibility: 'visible'
+    });
+
+    let msgText = new UIKit.Text({
+      text: text,
+      fontSize: 13,
+      color: msgColor,
+      fontWeight: 'bold',
+      textAlign: 'center',
+      visibility: 'visible'
+    });
+    msgContainer.add(msgText);
+    feedContainer.add(msgContainer);
+
+    messages.push({ element: msgContainer, timer: FADE_TIME });
+  }
+
+  this.init = function(_game) {
+    game = _game;
+    store = this.erth.store;
+  };
+
+  this.onStart = function() {
+    fullscreen = new UIKit.Fullscreen(game.renderer, { visibility: 'visible' });
+    parentToCamera();
+
+    // ── Feed container anchored top-center ──
+    feedContainer = new UIKit.Container({
+      width: 400,
+      flexDirection: 'column',
+      alignItems: 'center',
+      gap: 4,
+      padding: 8,
+      positionType: 'absolute',
+      positionTop: 10,
+      positionLeft: '50%',
+      visibility: 'visible'
+    });
+    fullscreen.add(feedContainer);
+  };
+
+  this.update = function(deltaTime) {
+    if (!rootParented) parentToCamera();
+
+    // ── Check for new messages ──
+    let msgVal = store.get('fp3_combatMessage');
+    if (msgVal !== null && msgVal !== undefined && msgVal !== lastMessageVal) {
+      lastMessageVal = msgVal;
+      // msgVal expected as { text: string, type: 'kill'|'crash'|'system' }
+      if (typeof msgVal === 'object' && msgVal.text) {
+        addMessage(msgVal.text, msgVal.type || 'system');
+      } else if (typeof msgVal === 'string') {
+        addMessage(msgVal, 'system');
+      }
+    }
+
+    // ── Tick timers, remove expired ──
+    let i = messages.length;
+    while (i--) {
+      messages[i].timer -= deltaTime;
+      if (messages[i].timer <= 0) {
+        let expired = messages.splice(i, 1)[0];
+        if (expired.element && expired.element.parent) {
+          expired.element.parent.remove(expired.element);
+        }
+      }
+    }
+  };
+
+  this.dispose = function() {
+    // Remove all message elements
+    for (let i = 0; i < messages.length; i++) {
+      if (messages[i].element && messages[i].element.parent) {
+        messages[i].element.parent.remove(messages[i].element);
+      }
+    }
+    messages = [];
+    if (fullscreen && fullscreen.parent) {
+      fullscreen.parent.remove(fullscreen);
+    }
+    fullscreen = null;
+    feedContainer = null;
+    game = null;
+    store = null;
+  };

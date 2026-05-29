@@ -1,0 +1,110 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+config:
+  priority: 0
+  name: "FP3-Stars"
+  id: "fp3.stars"
+  author: "flight-sim"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Star field visible at high altitude using InstancedMesh"
+  tags:
+    - gameplay
+  attributes: {}
+  documentation: "Creates 500 star instances distributed in a sphere around the player. Visible only when fp3_showStars store key is true (altitude > 2000)."
+code: |
+  const SEA_LEVEL = 0;
+  const GROUND_LEVEL = 10;
+
+  let game;
+  const disposables = [];
+  const STAR_COUNT = 500;
+  const MIN_RADIUS = 3000;
+  const MAX_RADIUS = 5000;
+
+  let starMesh = null;
+  let starContainer = null;
+  const offsets = []; // pre-computed offsets from player
+
+  function trackGeo(geo) { disposables.push(geo); return geo; }
+  function trackMat(mat) { disposables.push(mat); return mat; }
+
+  this.init = function(_game) {
+    game = _game;
+
+    const geo = trackGeo(new THREE.BoxGeometry(0.5, 0.5, 0.5));
+    const mat = trackMat(new THREE.MeshBasicNodeMaterial({
+      color: 0xffffff,
+      toneMapped: false,
+    }));
+
+    starMesh = new THREE.InstancedMesh(geo, mat, STAR_COUNT);
+    starMesh.userData.isRuntimeOnly = true;
+    disposables.push(starMesh);
+
+    const dummy = new THREE.Object3D();
+    for (let i = 0; i < STAR_COUNT; i++) {
+      // Distribute on sphere shell
+      const theta = Math.random() * Math.PI * 2;
+      const phi = Math.acos(2 * Math.random() - 1);
+      const r = MIN_RADIUS + Math.random() * (MAX_RADIUS - MIN_RADIUS);
+      const x = r * Math.sin(phi) * Math.cos(theta);
+      const y = r * Math.sin(phi) * Math.sin(theta);
+      const z = r * Math.cos(phi);
+      offsets.push({ x: x, y: y, z: z });
+
+      // Random star brightness via scale
+      const s = 0.5 + Math.random() * 1.5;
+      dummy.position.set(x, y, z);
+      dummy.scale.setScalar(s);
+      dummy.updateMatrix();
+      starMesh.setMatrixAt(i, dummy.matrix);
+    }
+    starMesh.instanceMatrix.needsUpdate = true;
+
+    starContainer = new THREE.Group();
+    starContainer.userData.isRuntimeOnly = true;
+    starContainer.visible = false;
+    starContainer.add(starMesh);
+
+    this.gameObject._internal.three.add(starContainer);
+  };
+
+  this.update = function(delta) {
+    const store = this.erth.store;
+    const showStars = store.get('fp3_showStars');
+    starContainer.visible = !!showStars;
+
+    if (!showStars) return;
+
+    // Move star sphere to follow player
+    const playerPos = store.get('fp3_playerPosition');
+    if (playerPos) {
+      starContainer.position.set(playerPos.x || 0, playerPos.y || 0, playerPos.z || 0);
+    }
+  };
+
+  this.dispose = function() {
+    if (starContainer && starContainer.parent) {
+      starContainer.parent.remove(starContainer);
+    }
+    for (let i = disposables.length - 1; i >= 0; i--) {
+      disposables[i].dispose();
+    }
+    disposables.length = 0;
+    offsets.length = 0;
+    starMesh = null;
+    starContainer = null;
+    game = null;
+  };
+
+  this.onEditorAdded = function() {
+    // No editor preview for runtime-only procedural geometry
+  };
+
+  this.onEditorDispose = function() {
+    // Nothing to clean up in editor
+  };

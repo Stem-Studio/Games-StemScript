@@ -1,0 +1,41 @@
+{
+  "exportVersion": 1,
+  "sourceScene": {
+    "id": "[redacted-scene-id]",
+    "name": "100 cars"
+  },
+  "bundle": {
+    "rootFile": "100-cars.stemscript",
+    "generatedAt": "2026-03-28T05:49:00.686Z",
+    "zipRoot": "100-cars"
+  },
+  "files": [
+    "100-cars.stemscript",
+    "README.md",
+    "audio/EngineSound.ogg",
+    "audio/ImpactSound.ogg",
+    "audio/SkidSound.ogg",
+    "behaviors/SKR-Audio-Controller.yaml",
+    "behaviors/SKR-Camera-Follow.yaml",
+    "behaviors/SKR-Shared-Colormap.yaml",
+    "behaviors/SKR-Track-Builder.yaml",
+    "behaviors/SKR-Vehicle-Controller.yaml",
+    "conversion-manifest.json",
+    "conversion-notes.md",
+    "conversion-plan.md",
+    "models/DecoEmpty.glb",
+    "models/DecoForest.glb",
+    "models/DecoTents.glb",
+    "models/NpcTruckGreen.glb",
+    "models/NpcTruckPurple.glb",
+    "models/NpcTruckRed.glb",
+    "models/PlayerTruck.glb",
+    "models/TrackBump.glb",
+    "models/TrackCorner.glb",
+    "models/TrackFinish.glb",
+    "models/TrackStraight.glb",
+    "source-analysis.json",
+    "source-map.md",
+    "textures/VehicleColormap.png"
+  ]
+}

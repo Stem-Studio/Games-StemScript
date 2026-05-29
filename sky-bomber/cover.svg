@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" shape-rendering="geometricPrecision">
+  <defs>
+    <linearGradient id="sky" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0" stop-color="#0a2a6e"/>
+      <stop offset="0.58" stop-color="#5cb1e6"/>
+      <stop offset="1" stop-color="#2c6fb0"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="160%">
+      <feDropShadow dx="0" dy="18" stdDeviation="16" flood-color="#082140" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+  <rect width="1024" height="1024" fill="url(#sky)"/>
+  <g opacity="0.55" fill="#ffffff">
+    <ellipse cx="180" cy="760" rx="190" ry="44"/>
+    <ellipse cx="315" cy="746" rx="110" ry="32"/>
+    <ellipse cx="730" cy="700" rx="220" ry="52"/>
+    <ellipse cx="875" cy="682" rx="115" ry="34"/>
+  </g>
+  <g filter="url(#shadow)">
+    <ellipse cx="512" cy="558" rx="300" ry="132" fill="#406d35"/>
+    <path d="M224 558c54 120 152 196 288 228 136-32 234-108 288-228-78 72-174 108-288 108s-210-36-288-108z" fill="#6f4b2b"/>
+    <path d="M286 568c48 44 122 66 226 66 102 0 177-22 226-66-50-32-125-50-226-50-102 0-177 18-226 50z" fill="#66aa44"/>
+    <g fill="#8a6a3d">
+      <rect x="292" y="526" width="92" height="28" rx="4"/>
+      <rect x="380" y="526" width="92" height="28" rx="4"/>
+      <rect x="556" y="526" width="92" height="28" rx="4"/>
+      <rect x="644" y="526" width="92" height="28" rx="4"/>
+    </g>
+    <g fill="#6e7178">
+      <rect x="355" y="476" width="54" height="54" rx="6"/>
+      <rect x="612" y="466" width="54" height="54" rx="6"/>
+      <rect x="484" y="592" width="54" height="54" rx="6"/>
+    </g>
+    <g fill="#9c5f2e">
+      <rect x="432" y="468" width="52" height="52" rx="5"/>
+      <rect x="534" y="460" width="52" height="52" rx="5"/>
+      <rect x="585" y="584" width="52" height="52" rx="5"/>
+    </g>
+    <g>
+      <circle cx="512" cy="404" r="74" fill="#161823"/>
+      <rect x="488" y="328" width="48" height="78" rx="12" fill="#6b4a26"/>
+      <path d="M524 318c20-62 74-78 118-34" fill="none" stroke="#6b4a26" stroke-width="24" stroke-linecap="round"/>
+      <path d="M658 256l34 22 40-8-18 38 18 38-40-8-34 22-4-40-31-26 31-26z" fill="#ffaa33"/>
+      <path d="M686 286l15 10 18-4-8 17 8 17-18-4-15 10-2-18-14-12 14-12z" fill="#ffd145"/>
+      <rect x="468" y="378" width="36" height="36" rx="8" fill="#5e6f8a"/>
+    </g>
+  </g>
+  <g font-family="Arial Black, Impact, sans-serif" font-weight="900" text-anchor="middle">
+    <text x="512" y="142" font-size="100" fill="#ffffff" stroke="#17365f" stroke-width="10" paint-order="stroke">SKY</text>
+    <text x="512" y="234" font-size="100" fill="#ffd145" stroke="#17365f" stroke-width="10" paint-order="stroke">BOMBER</text>
+  </g>
+</svg>

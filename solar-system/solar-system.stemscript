@@ -1,0 +1,120 @@
+# ============================================================
+# Solar System — StemStudio Conversion
+# Source: https://github.com/themrboyd/solar-system-threejs
+# Genre: Interactive Visualization / Educational
+# ============================================================
+
+project title "Solar System"
+import image name="ProjectCover" filepath="cover.png" comment="Generated cover art for project discovery surfaces"
+
+# --- Import Textures ---
+import image name="SunTex" filepath="textures/2k_sun.jpg" comment="Sun surface texture"
+import image name="MercuryTex" filepath="textures/2k_mercury.jpg" comment="Mercury surface"
+import image name="VenusTex" filepath="textures/2k_venus_surface.jpg" comment="Venus surface"
+import image name="EarthTex" filepath="textures/2k_earth_daymap.jpg" comment="Earth daymap"
+import image name="MarsTex" filepath="textures/2k_mars.jpg" comment="Mars surface"
+import image name="JupiterTex" filepath="textures/2k_jupiter.jpg" comment="Jupiter surface"
+import image name="SaturnTex" filepath="textures/2k_saturn.jpg" comment="Saturn surface"
+import image name="SaturnRingTex" filepath="textures/2k_saturn_ring_alpha.png" comment="Saturn ring alpha"
+import image name="UranusTex" filepath="textures/2k_uranus.jpg" comment="Uranus surface"
+import image name="NeptuneTex" filepath="textures/2k_neptune.jpg" comment="Neptune surface"
+import image name="MoonTex" filepath="textures/2k_moon.jpg" comment="Moon surface"
+
+# --- Import Behaviors ---
+import behavior name="Planet Orbit" filepath="behaviors/planetOrbit.yaml" comment="Orbital motion + self-rotation"
+import behavior name="Sun Glow" filepath="behaviors/sunGlow.yaml" comment="Sun point light + emissive texture"
+import behavior name="Saturn Ring" filepath="behaviors/saturnRing.yaml" comment="Saturn ring geometry"
+import behavior name="Solar Controller" filepath="behaviors/solarController.yaml" comment="Stars, orbit rings, speed controls, HUD"
+import behavior name="Solar Orbit Camera" filepath="behaviors/orbitCamera.yaml" comment="Free orbit camera"
+import behavior name="Solar Info Panel" filepath="behaviors/solarInfoPanel.yaml" comment="Planet info card UI"
+import behavior name="Solar Hotkeys HUD" filepath="behaviors/solarHotkeys.yaml" comment="Desktop/mobile hotkeys helper"
+
+# --- Scene Settings ---
+scene background type=Color color=#000000
+scene fog type=none
+scene lighting ambient={intensity:0.1}
+light "AmbientLight" intensity=0.1
+light "Directional Light" intensity=0
+delete "HemisphereLight"
+render settings useShadows=false
+
+# --- Game Settings ---
+game settings enabled=true showHUD=false
+
+# --- Camera Target (invisible player required for game mode) ---
+add group name="CameraTarget" position=0,0,0
+update "CameraTarget" tag=Player
+
+# --- Camera (custom orbit camera drives it) ---
+camera "DefaultCamera" cameraType=NONE fov=60 near=0.01 far=500
+
+# --- Runtime Behavior Hosts (avoid attaching to Default Scene/Camera) ---
+add group name="Solar Controller" position=0,0,0
+add group name="SolarUiHost" position=0,0,0
+
+# --- Sun (radius 2.5 → scale 5) ---
+add sphere name="Sun" position=0,0,0 scale=5,5,5
+material Sun metalness=0 roughness=1
+behavior attach Sun behaviorId=sw.sunGlow config={textureName:"SunTex",lightIntensity:2,lightDistance:100}
+behavior attach Sun behaviorId=sw.planetOrbit config={orbitRadius:0,orbitSpeed:0,rotationSpeed:0.2,textureName:""}
+
+# --- Mercury (radius 0.25 → scale 0.5) ---
+add sphere name="Mercury" position=4,0,0 scale=0.5,0.5,0.5
+material Mercury metalness=0.1 roughness=0.8
+behavior attach Mercury behaviorId=sw.planetOrbit config={orbitRadius:4,orbitSpeed:4.15,rotationSpeed:0.01,textureName:"MercuryTex"}
+
+# --- Venus (radius 0.45 → scale 0.9) ---
+add sphere name="Venus" position=5.5,0,0 scale=0.9,0.9,0.9
+material Venus metalness=0.1 roughness=0.8
+behavior attach Venus behaviorId=sw.planetOrbit config={orbitRadius:5.5,orbitSpeed:1.62,rotationSpeed:0.005,textureName:"VenusTex"}
+
+# --- Earth (radius 0.5 → scale 1.0) ---
+add sphere name="Earth" position=7,0,0 scale=1,1,1
+material Earth metalness=0.1 roughness=0.7
+behavior attach Earth behaviorId=sw.planetOrbit config={orbitRadius:7,orbitSpeed:1.0,rotationSpeed:1.0,textureName:"EarthTex"}
+
+# --- Mars (radius 0.35 → scale 0.7) ---
+add sphere name="Mars" position=8.5,0,0 scale=0.7,0.7,0.7
+material Mars metalness=0.1 roughness=0.8
+behavior attach Mars behaviorId=sw.planetOrbit config={orbitRadius:8.5,orbitSpeed:0.53,rotationSpeed:0.97,textureName:"MarsTex"}
+
+# --- Jupiter (radius 1.2 → scale 2.4) ---
+add sphere name="Jupiter" position=11,0,0 scale=2.4,2.4,2.4
+material Jupiter metalness=0.1 roughness=0.8
+behavior attach Jupiter behaviorId=sw.planetOrbit config={orbitRadius:11,orbitSpeed:0.084,rotationSpeed:2.4,textureName:"JupiterTex"}
+
+# --- Saturn (radius 1.0 → scale 2.0) ---
+add sphere name="Saturn" position=14,0,0 scale=2,2,2
+material Saturn metalness=0.1 roughness=0.8
+behavior attach Saturn behaviorId=sw.planetOrbit config={orbitRadius:14,orbitSpeed:0.034,rotationSpeed:2.2,textureName:"SaturnTex"}
+behavior attach Saturn behaviorId=sw.saturnRing config={ringTextureName:"SaturnRingTex"}
+
+# --- Uranus (radius 0.7 → scale 1.4) ---
+add sphere name="Uranus" position=17,0,0 scale=1.4,1.4,1.4
+material Uranus metalness=0.1 roughness=0.8
+behavior attach Uranus behaviorId=sw.planetOrbit config={orbitRadius:17,orbitSpeed:0.012,rotationSpeed:1.4,textureName:"UranusTex"}
+
+# --- Neptune (radius 0.65 → scale 1.3) ---
+add sphere name="Neptune" position=20,0,0 scale=1.3,1.3,1.3
+material Neptune metalness=0.1 roughness=0.8
+behavior attach Neptune behaviorId=sw.planetOrbit config={orbitRadius:20,orbitSpeed:0.006,rotationSpeed:1.5,textureName:"NeptuneTex"}
+
+# --- Moon (radius 0.15 → scale 0.3, orbits Earth) ---
+add sphere name="Moon" position=8.2,0,0 scale=0.3,0.3,0.3
+material Moon metalness=0.1 roughness=0.9
+behavior attach Moon behaviorId=sw.planetOrbit config={orbitRadius:1.2,orbitSpeed:2.5,rotationSpeed:0.5,orbitTarget:"Earth",textureName:"MoonTex"}
+
+# --- Runtime Behaviors ---
+behavior attach "Solar Controller" behaviorId=sw.solarController
+behavior attach "Solar Controller" behaviorId=sw.solarOrbitCamera config={distance:30,minDistance:5,maxDistance:60}
+behavior attach "SolarUiHost" behaviorId=sw.solarInfoPanel
+behavior attach "SolarUiHost" behaviorId=sw.solarHotkeys
+
+# ============================================================
+# CONTROLS:
+#   Mouse drag  — Orbit camera
+#   Scroll      — Zoom in/out
+#   Space       — Pause / Resume
+#   1-5         — Set speed multiplier
+#   O           — Toggle orbit rings
+# ============================================================

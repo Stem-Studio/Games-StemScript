@@ -1,0 +1,1005 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Globe Vegetation"
+  id: "tinyskies.globeVegetation"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Procedural vegetation on the deformed globe — trees, coconut palms, rocks, and giant pastel mushrooms. Faithful port of source Globe.ts createTrees / createCoconutTrees / createRocks / createMushrooms with biome-aware Poisson-style scatter. Wind sway and mushroom spore particles deferred to a polish pass; documented in fidelity-decision-record.md FDR-006."
+  documentation: "Spawns four instanced vegetation systems at init. Same SEEDS as source (42+seed for trees, 300+seed for coconut, 500+seed for rocks, 445566+seed for mushrooms). Uses imports/terrain.js for biome sampling + heightmap displacement; counts and constants verbatim from source. Materials are MeshStandardNodeMaterial with TSL fresnel rim emissive (no MeshPhongMaterial / onBeforeCompile available on WebGPU). All meshes carry `userData.isRuntimeOnly=true`."
+  tags:
+    - visual
+    - environment
+    - vegetation
+  priority: 0
+  throttleConfig:
+    throttlePriority: "HIGH"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: false
+  attributes:
+    radius:
+      name: "Globe Radius"
+      type: "number"
+      default: 5
+      min: 0.5
+      max: 200
+    terrainSeed:
+      name: "Terrain Seed"
+      type: "number"
+      default: 42
+      min: 1
+      max: 1000000
+    terrainType:
+      name: "Terrain Type"
+      type: "string"
+      default: "default"
+    treeCount:
+      name: "Tree Count"
+      type: "number"
+      default: 10000
+      min: 0
+      max: 50000
+    coconutClusters:
+      name: "Coconut Tree Clusters"
+      type: "number"
+      default: 270
+      min: 0
+      max: 1000
+    rockCount:
+      name: "Rock Count"
+      type: "number"
+      default: 400
+      min: 0
+      max: 2000
+    mushroomCount:
+      name: "Mushroom Grove Count"
+      type: "number"
+      default: 4
+      min: 0
+      max: 20
+    mushroomNormalsStoreKey:
+      name: "Mushroom Normals Store Key"
+      type: "string"
+      default: "tinyskies/mushroomNormals"
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  @import "terrain" as T;
+  @import "spherical-math" as S;
+
+  const LOG_TAG = "[tinyskies.globeVegetation]";
+
+  // -----------------------------------------------------------------
+  // VFX helpers (three.quarks). Built once per behavior init, shared
+  // across all groves so spore particles batch into one draw call.
+  // -----------------------------------------------------------------
+
+  // Soft circular sprite — used by spore + steam + sparkle particle
+  // systems across multiple behaviors. Rendered to a 64×64 canvas with
+  // a radial alpha gradient. Returns a THREE.CanvasTexture in sRGB.
+  function buildSoftSpriteTexture() {
+    const canvas = document.createElement("canvas"); // @check-ok
+    canvas.width = 64;
+    canvas.height = 64;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+    const grad = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+    grad.addColorStop(0, "rgba(255,255,255,1)");
+    grad.addColorStop(0.4, "rgba(255,255,255,0.6)");
+    grad.addColorStop(1, "rgba(255,255,255,0)");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, 64, 64);
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }
+
+  // -----------------------------------------------------------------
+  // Helpers
+  // -----------------------------------------------------------------
+
+  // TSL fresnel-rim emissive — replaces source addRimLight (which patched
+  // MeshPhongMaterial via onBeforeCompile). Adds a per-frame Fresnel halo to
+  // the emissive channel of any NodeMaterial. Visual equivalent of the
+  // RimLight.ts shader injection.
+  function applyRimLight(mat, rimColorHex, intensity, power) {
+    const TSL = THREE.TSL;
+    const c = new THREE.Color(rimColorHex);
+    const viewDir = TSL.normalize(TSL.cameraPosition.sub(TSL.positionWorld));
+    // dFdx/dFdy-derived normal — no `normal` attribute needed, so the material compiles cleanly in shadow / AO passes that strip lighting attrs (avoids TSL "Vertex attribute 'normal' not found" warnings that pin frame budget).
+    const nW = TSL.normalize(TSL.cross(TSL.dFdx(TSL.positionWorld), TSL.dFdy(TSL.positionWorld)));
+    const fresnel = TSL.float(1.0).sub(TSL.dot(viewDir, nW).abs());
+    const rim = TSL.vec3(c.r, c.g, c.b)
+      .mul(TSL.float(intensity))
+      .mul(TSL.pow(fresnel, TSL.float(power)));
+    mat.emissiveNode = rim;
+    mat.needsUpdate = true;
+  }
+
+  // Source Globe.ts:635 createTeardropGeo — lathed conifer-ish tree shape +
+  // vertex-color trunk → canopy gradient + bottom-AO darkening.
+  function createTeardropGeo() {
+    const segments = 10;
+    const points = [];
+    for (let i = 0; i <= segments; i++) {
+      const t = i / segments;
+      const y = t; // height = 1, scaled per-instance later
+      const r = Math.pow(Math.sin(t * Math.PI), 0.35) * Math.pow(1 - t, 0.5);
+      points.push(new THREE.Vector2(r, y));
+    }
+    const geo = new THREE.LatheGeometry(points, 6);
+    const bottomColor = new THREE.Color(0.3, 0.55, 0.2);
+    const topColor = new THREE.Color(0.7, 0.92, 0.6);
+    const posAttr = geo.attributes.position;
+    const count = posAttr.count;
+    const colors = new Float32Array(count * 3);
+    for (let i = 0; i < count; i++) {
+      const yv = posAttr.getY(i);
+      const t = Math.max(0, Math.min(1, yv));
+      const c = bottomColor.clone().lerp(topColor, t);
+      const ao = THREE.MathUtils.lerp(0.1, 1.0, Math.min(1, t * 2.0));
+      c.multiplyScalar(ao);
+      colors[i * 3]     = c.r;
+      colors[i * 3 + 1] = c.g;
+      colors[i * 3 + 2] = c.b;
+    }
+    geo.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+    return geo;
+  }
+
+  // Source Globe.ts:986 makeBlockyRock — base box / cylinder + chunks +
+  // per-vertex pseudo-noise displacement + per-face shaded vertex colors.
+  // Returns a non-indexed BufferGeometry with `position` + `color` attrs.
+  function makeBlockyRock(sx, sy, sz, chunks, baseSides) {
+    const geos = [];
+    let baseGeo;
+    if (baseSides) {
+      const cyl = new THREE.CylinderGeometry(sx / 2, sz / 2, sy, baseSides, 1);
+      cyl.translate(0, sy / 2, 0);
+      baseGeo = cyl;
+    } else {
+      baseGeo = new THREE.BoxGeometry(sx, sy, sz);
+      baseGeo.translate(0, sy / 2, 0);
+    }
+    geos.push(baseGeo.toNonIndexed());
+    baseGeo.dispose();
+
+    for (const c of chunks) {
+      let chunkGeo;
+      if (c.sides) {
+        const cyl = new THREE.CylinderGeometry(c.w / 2, c.d / 2, c.h, c.sides, 1);
+        cyl.translate(c.x, c.y, c.z);
+        chunkGeo = cyl;
+      } else {
+        chunkGeo = new THREE.BoxGeometry(c.w, c.h, c.d);
+        chunkGeo.translate(c.x, c.y, c.z);
+      }
+      geos.push(chunkGeo.toNonIndexed());
+      chunkGeo.dispose();
+    }
+
+    let totalVerts = 0;
+    for (const g of geos) totalVerts += g.attributes.position.count;
+    const positions = new Float32Array(totalVerts * 3);
+    let vOff = 0;
+    for (const g of geos) {
+      const pos = g.attributes.position;
+      for (let i = 0; i < pos.count; i++) {
+        positions[(vOff + i) * 3]     = pos.getX(i);
+        positions[(vOff + i) * 3 + 1] = pos.getY(i);
+        positions[(vOff + i) * 3 + 2] = pos.getZ(i);
+      }
+      vOff += pos.count;
+      g.dispose();
+    }
+    for (let i = 0; i < totalVerts; i++) {
+      const px = positions[i * 3];
+      const py = positions[i * 3 + 1];
+      const pz = positions[i * 3 + 2];
+      const h = px * 73.1 + py * 37.9 + pz * 51.3;
+      positions[i * 3]     += Math.sin(h) * 0.07;
+      positions[i * 3 + 1] += Math.sin(h * 1.7) * 0.035;
+      positions[i * 3 + 2] += Math.cos(h * 1.3) * 0.07;
+    }
+    const colors = new Float32Array(totalVerts * 3);
+    for (let i = 0; i < totalVerts; i += 3) {
+      const px = positions[i * 3];
+      const py = positions[i * 3 + 1];
+      const pz = positions[i * 3 + 2];
+      const ao = THREE.MathUtils.lerp(0.15, 1.0, Math.min(1, Math.max(0, py / (sy * 0.7))));
+      const shade = (0.85 + Math.sin(px * 31.7 + py * 47.3 + pz * 19.1) * 0.15) * ao;
+      for (let v = 0; v < 3; v++) {
+        colors[(i + v) * 3]     = shade;
+        colors[(i + v) * 3 + 1] = shade;
+        colors[(i + v) * 3 + 2] = shade;
+      }
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+    geo.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+    geo.computeVertexNormals();
+    return geo;
+  }
+
+  // Source Globe.ts:775 createCoconutTreeGeo — palm trunk + 8 fronds + 3
+  // coconuts, merged into a single colored geometry. Vertex colors carry
+  // trunk / frond / coconut shades; AO falloff omitted (palms are short).
+  function createCoconutTreeGeo() {
+    const trunkColor = new THREE.Color(0x6E4F24);
+    const frondShadow = new THREE.Color(0x1A6B37).multiplyScalar(0.88);
+    const frondHighlight = new THREE.Color(0x2D8A4E).multiplyScalar(0.88);
+    const frondColor = frondShadow.clone().lerp(frondHighlight, 0.43);
+    const frondLight = frondShadow.clone().lerp(frondHighlight, 0.57);
+    const coconutColor = new THREE.Color(0x5D3A1A);
+
+    const parts = [];
+
+    const trunk = new THREE.CylinderGeometry(0.06, 0.09, 0.55, 8, 4);
+    const tPos = trunk.attributes.position;
+    for (let i = 0; i < tPos.count; i++) {
+      const y = tPos.getY(i);
+      const t = y / 0.55 + 0.5;
+      tPos.setX(i, tPos.getX(i) + t * t * 0.04);
+    }
+    trunk.translate(0, 0.275, 0);
+    trunk.computeVertexNormals();
+    parts.push({ geo: trunk, color: trunkColor });
+
+    const frondCount = 8;
+    const tilts = [-0.9, -1.6, -1.0, -1.8, -0.95, -1.7, -1.0, -1.55];
+    const droopLower = 0.48;
+    const droopUpper = 0.2;
+    const crownYBase = 0.52;
+    const crownYShiftTop = 0.018;
+    for (let i = 0; i < frondCount; i++) {
+      const frond = new THREE.SphereGeometry(0.205, 18, 14);
+      const spineScale = 1.32;
+      const widthScale = 0.55;
+      frond.scale(widthScale, 0.38, spineScale);
+      const fPos = frond.attributes.position;
+      const zSpan = 0.205 * spineScale;
+      const halfW = 0.205 * widthScale;
+      for (let vi = 0; vi < fPos.count; vi++) {
+        const x = fPos.getX(vi);
+        const y = fPos.getY(vi);
+        const z = fPos.getZ(vi);
+        const z01 = THREE.MathUtils.clamp((z + zSpan * 0.5) / zSpan, 0, 1);
+        const tip = Math.pow(z01, 1.75);
+        const tipSharp = THREE.MathUtils.lerp(1.0, 0.62, tip);
+        let nx = x * tipSharp;
+        let ny = y * THREE.MathUtils.lerp(1.0, 0.55, tip);
+        const nz = z;
+        const edgeT = Math.min(1, Math.abs(nx) / halfW);
+        ny += 0.052 * Math.sin(z01 * Math.PI) * (1 - 0.4 * Math.pow(edgeT, 1.2));
+        const w = THREE.MathUtils.clamp(nx / halfW, -1, 1);
+        ny += 0.085 * w * w * (0.4 + 0.6 * z01);
+        const edge = Math.pow(Math.abs(nx), 1.35);
+        const fold = edge * (0.032 + 0.03 * z01);
+        ny -= fold;
+        fPos.setX(vi, nx);
+        fPos.setY(vi, ny);
+        fPos.setZ(vi, nz);
+      }
+      frond.computeVertexNormals();
+      frond.translate(0, 0, zSpan * 0.5);
+      const upperCrown = i < frondCount / 2;
+      const baseDroop = -tilts[i] * (upperCrown ? droopUpper : droopLower);
+      const yaw = (i / frondCount) * Math.PI * 2 + 0.1;
+      const spineFacesUp = i % 3 === 0;
+      const pitchTowardSky = upperCrown ? 0.24 : 0.34;
+      if (spineFacesUp) {
+        frond.rotateX(-pitchTowardSky);
+        frond.rotateY(yaw);
+        frond.rotateX(baseDroop);
+      } else {
+        frond.rotateX(baseDroop);
+        frond.rotateY(yaw);
+      }
+      frond.translate(0, crownYBase + (upperCrown ? crownYShiftTop : 0), 0);
+      parts.push({ geo: frond, color: i % 2 === 0 ? frondColor : frondLight });
+    }
+
+    for (let c = 0; c < 3; c++) {
+      const coconut = new THREE.SphereGeometry(0.032, 8, 6);
+      const a = (c / 3) * Math.PI * 2 + 0.5;
+      coconut.translate(Math.cos(a) * 0.045, 0.5, Math.sin(a) * 0.045);
+      parts.push({ geo: coconut, color: coconutColor });
+    }
+    return mergeColoredParts(parts);
+  }
+
+  // Source Globe.ts:1268 mergeColoredParts — concatenate parts into a single
+  // BufferGeometry with `position`, `normal`, and per-vertex `color`. The
+  // bottom-AO bake from source is preserved (multiplies vertex color by
+  // mix(0.15, 1, clamp(y/0.5))). Window-glow UV flag dropped (no windowed
+  // parts in this behavior; villages will reintroduce it).
+  function mergeColoredParts(parts) {
+    let totalVerts = 0;
+    for (const p of parts) totalVerts += p.geo.attributes.position.count;
+    const positions = new Float32Array(totalVerts * 3);
+    const normals = new Float32Array(totalVerts * 3);
+    const colors = new Float32Array(totalVerts * 3);
+    const indices = [];
+    let vOffset = 0;
+    for (const { geo, color } of parts) {
+      const pos = geo.attributes.position;
+      const norm = geo.attributes.normal;
+      for (let i = 0; i < pos.count; i++) {
+        const idx = (vOffset + i) * 3;
+        const yv = pos.getY(i);
+        const ao = THREE.MathUtils.lerp(0.15, 1.0, Math.min(1, Math.max(0, yv / 0.5)));
+        positions[idx]     = pos.getX(i);
+        positions[idx + 1] = yv;
+        positions[idx + 2] = pos.getZ(i);
+        normals[idx]     = norm ? norm.getX(i) : 0;
+        normals[idx + 1] = norm ? norm.getY(i) : 1;
+        normals[idx + 2] = norm ? norm.getZ(i) : 0;
+        colors[idx]     = color.r * ao;
+        colors[idx + 1] = color.g * ao;
+        colors[idx + 2] = color.b * ao;
+      }
+      if (geo.index) {
+        for (let i = 0; i < geo.index.count; i++) indices.push(geo.index.getX(i) + vOffset);
+      }
+      vOffset += pos.count;
+    }
+    const merged = new THREE.BufferGeometry();
+    merged.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+    merged.setAttribute("normal", new THREE.Float32BufferAttribute(normals, 3));
+    merged.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+    if (indices.length > 0) merged.setIndex(indices);
+    for (const { geo } of parts) geo.dispose();
+    return merged;
+  }
+
+  // -----------------------------------------------------------------
+  // Lifecycle
+  // -----------------------------------------------------------------
+
+  let game;
+
+  this.init = function (_game) {
+    game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._buildVisuals(this.gameObject._internal.three);
+    this._registerParticleSystemsWithBatchedRenderer();
+    this._log("init");
+  };
+
+  this._registerParticleSystemsWithBatchedRenderer = function () {
+    if (!this._particleEmitters || this._particleEmitters.length === 0) return;
+    const br = game?.scene?.getObjectByProperty?.("type", "BatchedRenderer");
+    if (!br) {
+      this._log("BatchedRenderer not found — particles will not render this frame");
+      return;
+    }
+    for (const e of this._particleEmitters) {
+      if (e && e.system) br.addSystem(e.system);
+    }
+    this._batchedRenderer = br;
+  };
+
+  this.onEditorAdded = function () {
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._buildVisuals(this.gameObject._internal.three);
+  };
+
+  this.onEditorAttributesUpdated = function () {
+    this._teardownVisuals();
+    this._buildVisuals(this.gameObject._internal.three);
+  };
+
+  this.onEditorDispose = function () {
+    this._teardownVisuals();
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    this._teardownVisuals();
+  };
+
+  // -----------------------------------------------------------------
+  // Builder
+  // -----------------------------------------------------------------
+
+  this._buildVisuals = function (parent) {
+    const radius = this.getAttribute("radius");
+    const seed = this.getAttribute("terrainSeed");
+    const terrainType = this.getAttribute("terrainType");
+    const treeCount = this.getAttribute("treeCount");
+    const coconutClusters = this.getAttribute("coconutClusters");
+    const rockCount = this.getAttribute("rockCount");
+    const mushroomCount = this.getAttribute("mushroomCount");
+
+    const root = new THREE.Group();
+    root.name = "tinyskiesGlobeVegetation";
+    root.userData.isRuntimeOnly = true;
+
+    this._buildTrees(root, radius, seed, terrainType, treeCount);
+    this._buildCoconutTrees(root, radius, seed, terrainType, coconutClusters);
+    this._buildRocks(root, radius, seed, terrainType, rockCount);
+    this._buildMushrooms(root, radius, seed, terrainType, mushroomCount);
+
+    parent.add(root);
+    this._root = root;
+  };
+
+  // Source Globe.ts:670 createTrees — Poisson over the sphere keeping land
+  // tiles below elevation 0.6 with a forest-noise mask threshold of 0.3.
+  // Five greenShades, each its own InstancedMesh sharing a single teardrop
+  // geometry. Per-instance scale + tilt-to-normal. Wind sway omitted
+  // (FDR-006).
+  this._buildTrees = function (root, radius, seed, terrainType, treeCount) {
+    const rand = S.seededRandom(42 + seed);
+    const forestNoise = T.createNoise3D(seed + 999);
+    const propSink = T.getPropTerrainSink();
+
+    const greenShades = [0x4a9a3a, 0x55a545, 0x48953a, 0x8aaa35, 0xb59a30];
+    const matsPerShade = greenShades.length;
+
+    const transformsByShade = Array.from({ length: matsPerShade }, () => []);
+    const dummy = new THREE.Object3D();
+
+    let attempts = 0;
+    let placed = 0;
+    const maxAttempts = treeCount * 12;
+    const REF_UP = new THREE.Vector3(0, 1, 0);
+
+    while (placed < treeCount && attempts < maxAttempts) {
+      attempts++;
+      const theta = rand() * Math.PI * 2;
+      const phi = Math.acos(2 * rand() - 1);
+      const nx = Math.sin(phi) * Math.cos(theta);
+      const ny = Math.sin(phi) * Math.sin(theta);
+      const nz = Math.cos(phi);
+
+      const sample = T.sampleTerrain(seed, terrainType, nx, ny, nz);
+      if (!sample.isLand) continue;
+      if (sample.elevation > 0.6) continue;
+      if (forestNoise(nx * 2.5, ny * 2.5, nz * 2.5) < 0.3) continue;
+
+      const disp = T.surfaceDisplacementAt(seed, terrainType, nx, ny, nz);
+      const surfaceR = radius + disp - propSink;
+      const treeScale = THREE.MathUtils.lerp(0.025, 0.06, rand());
+      const shadeIdx = Math.floor(rand() * matsPerShade);
+      const treeH = treeScale * 2.5;
+      const treeR = treeScale * 0.7;
+
+      const normal = new THREE.Vector3(nx, ny, nz);
+      const surfacePos = normal.clone().multiplyScalar(surfaceR);
+      dummy.position.copy(surfacePos).addScaledVector(normal, -treeH * 0.05);
+      dummy.quaternion.setFromUnitVectors(REF_UP, normal);
+      dummy.scale.set(treeR, treeH, treeR);
+      dummy.updateMatrix();
+      transformsByShade[shadeIdx].push(dummy.matrix.clone());
+      placed++;
+    }
+
+    const sharedGeo = createTeardropGeo();
+    for (let s = 0; s < matsPerShade; s++) {
+      const tforms = transformsByShade[s];
+      if (tforms.length === 0) continue;
+      const mat = new THREE.MeshStandardNodeMaterial({
+        color: greenShades[s],
+        vertexColors: true,
+        flatShading: true,
+        roughness: 0.85,
+        metalness: 0.0,
+      });
+      applyRimLight(mat, 0xffeeaa, 0.7, 3.0);
+      const inst = new THREE.InstancedMesh(sharedGeo, mat, tforms.length);
+      inst.castShadow = true;
+      inst.receiveShadow = false;
+      inst.userData.isRuntimeOnly = true;
+      for (let i = 0; i < tforms.length; i++) inst.setMatrixAt(i, tforms[i]);
+      inst.instanceMatrix.needsUpdate = true;
+      root.add(inst);
+    }
+    this._log("trees placed", placed, "across", matsPerShade, "shades");
+  };
+
+  // Source Globe.ts:867 createCoconutTrees — beach clusters of 4-8 palms.
+  // Each cluster center must be (a) land, (b) elevation ≤ 0.10, (c) have at
+  // least one water tile within WATER_CHECK_DIST=0.04 (i.e. coastal). Then
+  // 4-8 palms scatter around the center.
+  this._buildCoconutTrees = function (root, radius, seed, terrainType, clusterTarget) {
+    const rand = S.seededRandom(300 + seed);
+    const propSink = T.getPropTerrainSink();
+    const MAX_ELEVATION = 0.10;
+    const WATER_CHECK_DIST = 0.04;
+    const WATER_CHECKS = 6;
+
+    const transforms = [];
+    const dummy = new THREE.Object3D();
+    const REF_UP = new THREE.Vector3(0, 1, 0);
+    let attempts = 0;
+    let clusters = 0;
+
+    while (clusters < clusterTarget && attempts < clusterTarget * 20) {
+      attempts++;
+      const theta = rand() * Math.PI * 2;
+      const phi = Math.acos(2 * rand() - 1);
+      const nx = Math.sin(phi) * Math.cos(theta);
+      const ny = Math.sin(phi) * Math.sin(theta);
+      const nz = Math.cos(phi);
+
+      const sample = T.sampleTerrain(seed, terrainType, nx, ny, nz);
+      if (!sample.isLand) continue;
+      if (sample.elevation > MAX_ELEVATION) continue;
+      if (T.waterRatioAround(seed, terrainType, nx, ny, nz, WATER_CHECK_DIST, WATER_CHECKS) <= 0) continue;
+
+      const centerNormal = new THREE.Vector3(nx, ny, nz);
+      const clusterCount = 4 + Math.floor(rand() * 5);
+
+      for (let t = 0; t < clusterCount; t++) {
+        let treeNormal;
+        if (t === 0) {
+          treeNormal = centerNormal.clone();
+        } else {
+          let tang = new THREE.Vector3(-ny, nx, 0);
+          if (tang.lengthSq() < 0.001) tang.set(0, -nz, ny);
+          tang.normalize();
+          const bitang = new THREE.Vector3().crossVectors(centerNormal, tang).normalize();
+          const a = rand() * Math.PI * 2;
+          const d = 0.006 + rand() * 0.022;
+          treeNormal = centerNormal.clone()
+            .addScaledVector(tang, Math.cos(a) * d)
+            .addScaledVector(bitang, Math.sin(a) * d)
+            .normalize();
+        }
+        const tn = T.sampleTerrain(seed, terrainType, treeNormal.x, treeNormal.y, treeNormal.z);
+        if (!tn.isLand) continue;
+
+        const disp = T.surfaceDisplacementAt(seed, terrainType, treeNormal.x, treeNormal.y, treeNormal.z);
+        const surfaceR = radius + disp - propSink;
+        const scale = THREE.MathUtils.lerp(0.09, 0.15, rand());
+        dummy.position.copy(treeNormal.clone().multiplyScalar(surfaceR));
+        dummy.quaternion.setFromUnitVectors(REF_UP, treeNormal);
+        dummy.rotateY(rand() * Math.PI * 2);
+        dummy.rotateZ((rand() - 0.4) * 0.12);
+        dummy.scale.set(scale, scale, scale);
+        dummy.updateMatrix();
+        transforms.push(dummy.matrix.clone());
+      }
+      clusters++;
+    }
+
+    if (transforms.length === 0) return;
+    const coconutGeo = createCoconutTreeGeo();
+    const mat = new THREE.MeshStandardNodeMaterial({
+      vertexColors: true,
+      flatShading: false,
+      roughness: 0.7,
+      metalness: 0.0,
+    });
+    applyRimLight(mat, 0xffeeaa, 0.7, 3.0);
+    const inst = new THREE.InstancedMesh(coconutGeo, mat, transforms.length);
+    inst.castShadow = true;
+    inst.receiveShadow = false;
+    inst.userData.isRuntimeOnly = true;
+    for (let i = 0; i < transforms.length; i++) inst.setMatrixAt(i, transforms[i]);
+    inst.instanceMatrix.needsUpdate = true;
+    root.add(inst);
+    this._log("coconut trees placed", transforms.length, "in", clusters, "clusters");
+  };
+
+  // Source Globe.ts:1068 createRocks — 5 rock geometries, scattered in
+  // clusters of 3-4 rocks. Probability skewed toward coastlines (elevation
+  // ≤ 0.1 → 0.9 chance, ≤ 0.25 → 0.5, otherwise 0.2). Each cluster has 50%
+  // chance of also placing 1-3 small trees nearby.
+  this._buildRocks = function (root, radius, seed, terrainType, rockCount) {
+    const rand = S.seededRandom(500 + seed);
+    const propSink = T.getPropTerrainSink();
+    const REF_UP = new THREE.Vector3(0, 1, 0);
+
+    const ROCK_TYPES = 5;
+    const rockGeos = [
+      makeBlockyRock(0.9, 0.35, 0.8, [{ x: 0.7, y: 0.1, z: 0.3, w: 0.3, h: 0.2, d: 0.25, sides: 5 }], 6),
+      makeBlockyRock(1.0, 0.25, 0.9, [{ x: 0.15, y: 0.3, z: 0, w: 0.4, h: 0.2, d: 0.4, sides: 5 }], 5),
+      makeBlockyRock(0.7, 0.4, 0.6, [{ x: -0.55, y: 0.08, z: -0.35, w: 0.25, h: 0.15, d: 0.2, sides: 6 }], 5),
+      makeBlockyRock(0.85, 0.3, 0.8, [
+        { x: -0.1, y: 0.35, z: 0.08, w: 0.35, h: 0.2, d: 0.3, sides: 5 },
+        { x: 0.6, y: 0.07, z: -0.4, w: 0.22, h: 0.14, d: 0.2, sides: 6 },
+      ], 6),
+      makeBlockyRock(0.65, 0.45, 0.6, [{ x: 0.08, y: 0.48, z: -0.04, w: 0.28, h: 0.18, d: 0.25, sides: 5 }], 6),
+    ];
+    const rockColors = [0x5a554e, 0x65605a, 0x4e4a44, 0x585350, 0x524e48];
+    const transformsByType = Array.from({ length: ROCK_TYPES }, () => []);
+    const rockTreeTransforms = [];
+    const dummy = new THREE.Object3D();
+
+    let attempts = 0;
+    let clusters = 0;
+    const targetClusters = Math.ceil(rockCount / 2.5);
+
+    while (clusters < targetClusters && attempts < targetClusters * 10) {
+      attempts++;
+      const theta = rand() * Math.PI * 2;
+      const phi = Math.acos(2 * rand() - 1);
+      const nx = Math.sin(phi) * Math.cos(theta);
+      const ny = Math.sin(phi) * Math.sin(theta);
+      const nz = Math.cos(phi);
+      const sample = T.sampleTerrain(seed, terrainType, nx, ny, nz);
+      if (!sample.isLand) continue;
+      if (sample.elevation > 0.7) continue;
+      const coastChance = sample.elevation < 0.1 ? 0.9 : sample.elevation < 0.25 ? 0.5 : 0.2;
+      if (rand() > coastChance) continue;
+
+      const centerNormal = new THREE.Vector3(nx, ny, nz);
+      const rocksInCluster = 3 + Math.floor(rand() * 2);
+
+      for (let r = 0; r < rocksInCluster; r++) {
+        let rockNormal;
+        if (r === 0) {
+          rockNormal = centerNormal.clone();
+        } else {
+          let tang = new THREE.Vector3(-ny, nx, 0);
+          if (tang.lengthSq() < 0.01) tang.set(0, 0, 1).cross(centerNormal).normalize();
+          else tang.normalize();
+          const bitang = new THREE.Vector3().crossVectors(centerNormal, tang).normalize();
+          const a = rand() * Math.PI * 2;
+          const d = 0.005 + rand() * 0.01;
+          rockNormal = centerNormal.clone()
+            .addScaledVector(tang, Math.cos(a) * d)
+            .addScaledVector(bitang, Math.sin(a) * d)
+            .normalize();
+        }
+        const rs = T.sampleTerrain(seed, terrainType, rockNormal.x, rockNormal.y, rockNormal.z);
+        if (!rs.isLand) continue;
+
+        const disp = T.surfaceDisplacementAt(seed, terrainType, rockNormal.x, rockNormal.y, rockNormal.z);
+        const surfaceR = radius + disp - propSink;
+        const scale = THREE.MathUtils.lerp(0.045, 0.12, rand());
+        const rockType = sample.elevation < 0.1
+          ? (rand() < 0.5 ? 3 : 4)
+          : Math.floor(rand() * ROCK_TYPES);
+
+        dummy.position.copy(rockNormal.clone().multiplyScalar(surfaceR - scale * 0.12));
+        dummy.quaternion.setFromUnitVectors(REF_UP, rockNormal);
+        dummy.rotateY(rand() * Math.PI * 2);
+        const scaleX = scale * THREE.MathUtils.lerp(0.8, 1.3, rand());
+        const scaleZ = scale * THREE.MathUtils.lerp(0.8, 1.3, rand());
+        dummy.scale.set(scaleX, scale * 0.6, scaleZ);
+        dummy.updateMatrix();
+        transformsByType[rockType].push(dummy.matrix.clone());
+      }
+
+      // 50% chance of nearby small trees
+      if (rand() < 0.5) {
+        const treesNear = 1 + Math.floor(rand() * 3);
+        for (let tr = 0; tr < treesNear; tr++) {
+          const tAngle = rand() * Math.PI * 2;
+          const tDist = 0.012 + rand() * 0.015;
+          let tang = new THREE.Vector3(-centerNormal.y, centerNormal.x, 0);
+          if (tang.lengthSq() < 0.01) tang.set(0, 0, 1).cross(centerNormal).normalize();
+          else tang.normalize();
+          const bitang = new THREE.Vector3().crossVectors(centerNormal, tang).normalize();
+          const treeNormal = centerNormal.clone()
+            .addScaledVector(tang, Math.cos(tAngle) * tDist)
+            .addScaledVector(bitang, Math.sin(tAngle) * tDist)
+            .normalize();
+          const ts = T.sampleTerrain(seed, terrainType, treeNormal.x, treeNormal.y, treeNormal.z);
+          if (!ts.isLand) continue;
+          const tDisp = T.surfaceDisplacementAt(seed, terrainType, treeNormal.x, treeNormal.y, treeNormal.z);
+          const tSurfR = radius + tDisp - propSink;
+          const treeScale = THREE.MathUtils.lerp(0.014, 0.025, rand());
+          const treeH = treeScale * 2.5;
+          dummy.position.copy(treeNormal.clone().multiplyScalar(tSurfR).addScaledVector(treeNormal, -treeH * 0.05));
+          dummy.quaternion.setFromUnitVectors(REF_UP, treeNormal);
+          dummy.scale.set(treeScale * 0.7, treeH, treeScale * 0.7);
+          dummy.updateMatrix();
+          rockTreeTransforms.push(dummy.matrix.clone());
+        }
+      }
+      clusters++;
+    }
+
+    if (rockTreeTransforms.length > 0) {
+      const treeGeo = createTeardropGeo();
+      const treeMat = new THREE.MeshStandardNodeMaterial({
+        color: 0x3a8a2a,
+        vertexColors: true,
+        flatShading: true,
+        roughness: 0.85,
+        metalness: 0.0,
+      });
+      applyRimLight(treeMat, 0xffeeaa, 0.7, 3.0);
+      const treeInst = new THREE.InstancedMesh(treeGeo, treeMat, rockTreeTransforms.length);
+      treeInst.castShadow = true;
+      treeInst.receiveShadow = false;
+      treeInst.userData.isRuntimeOnly = true;
+      for (let i = 0; i < rockTreeTransforms.length; i++) treeInst.setMatrixAt(i, rockTreeTransforms[i]);
+      treeInst.instanceMatrix.needsUpdate = true;
+      root.add(treeInst);
+    }
+    for (let t = 0; t < ROCK_TYPES; t++) {
+      const tforms = transformsByType[t];
+      if (tforms.length === 0) continue;
+      const mat = new THREE.MeshStandardNodeMaterial({
+        color: rockColors[t],
+        vertexColors: true,
+        flatShading: true,
+        roughness: 0.95,
+        metalness: 0.05,
+      });
+      applyRimLight(mat, 0xffeebb, 0.5, 3.0);
+      const inst = new THREE.InstancedMesh(rockGeos[t], mat, tforms.length);
+      inst.castShadow = true;
+      inst.receiveShadow = true;
+      inst.userData.isRuntimeOnly = true;
+      for (let i = 0; i < tforms.length; i++) inst.setMatrixAt(i, tforms[i]);
+      inst.instanceMatrix.needsUpdate = true;
+      root.add(inst);
+    }
+    this._log("rocks placed in", clusters, "clusters; rock-trees", rockTreeTransforms.length);
+  };
+
+  // Source Globe.ts:2503 createMushrooms — capped pastel grove placements.
+  // Land + 0.05 ≤ elevation ≤ 0.65 + inland (water ≤ 0.26 around) + flat
+  // ground (ring elevation roughness ≤ 0.26). De-conflict against other
+  // landmarks omitted (other systems not yet ported). Spore particle stream
+  // omitted (FDR-006: requires ShaderMaterial, WebGPU-incompatible).
+  this._buildMushrooms = function (root, radius, seed, terrainType, mushroomCount) {
+    const rand = S.seededRandom(445566 + seed);
+    const propSink = T.getPropTerrainSink();
+    const MIN_ELEVATION = 0.05;
+    const MAX_ELEVATION = 0.65;
+    const MIN_SEPARATION_DOT = 0.78;
+    const INLAND_CHECKS = 8;
+    const INLAND_CHECK_DIST = 0.07;
+    const MAX_WATER_RATIO = 0.26;
+    const ROUGH_RING_DIST = 0.085;
+    const MAX_ROUGHNESS = 0.26;
+    const REF_UP = new THREE.Vector3(0, 1, 0);
+
+    const candidates = [];
+    let attempts = 0;
+    while (attempts < 8000 && candidates.length < 220) {
+      attempts++;
+      const theta = rand() * Math.PI * 2;
+      const phi = Math.acos(2 * rand() - 1);
+      const nx = Math.sin(phi) * Math.cos(theta);
+      const ny = Math.cos(phi);
+      const nz = Math.sin(phi) * Math.sin(theta);
+      const sample = T.sampleTerrain(seed, terrainType, nx, ny, nz);
+      if (!sample.isLand) continue;
+      if (sample.elevation < MIN_ELEVATION || sample.elevation > MAX_ELEVATION) continue;
+      if (T.waterRatioAround(seed, terrainType, nx, ny, nz, INLAND_CHECK_DIST, INLAND_CHECKS) > MAX_WATER_RATIO) continue;
+      if (T.terrainRingElevationRoughness(seed, terrainType, nx, ny, nz, ROUGH_RING_DIST) > MAX_ROUGHNESS) continue;
+      candidates.push({ normal: new THREE.Vector3(nx, ny, nz), elevation: sample.elevation });
+    }
+    candidates.sort((a, b) => a.elevation - b.elevation);
+
+    const chosen = [];
+    for (const c of candidates) {
+      if (chosen.length >= mushroomCount) break;
+      let tooClose = false;
+      for (const v of chosen) {
+        if (c.normal.dot(v) > MIN_SEPARATION_DOT) { tooClose = true; break; }
+      }
+      if (!tooClose) chosen.push(c.normal);
+    }
+    if (chosen.length === 0) return;
+
+    const stalkGeo = new THREE.CylinderGeometry(0.0015, 0.0025, 0.02, 5);
+    stalkGeo.translate(0, 0.01, 0);
+    const capGeo = new THREE.SphereGeometry(0.008, 7, 5);
+    capGeo.scale(1, 0.6, 1);
+    capGeo.translate(0, 0.02, 0);
+
+    const pastelColors = [0xffb3ba, 0xbaffc9, 0xbae1ff, 0xe6b3ff, 0xffffba, 0xffdfba];
+    const stalkMat = new THREE.MeshStandardNodeMaterial({ color: 0xddddcc, flatShading: true, roughness: 0.9, metalness: 0 });
+    applyRimLight(stalkMat, 0xffffff, 0.3, 2.0);
+    const capMats = pastelColors.map((c) => {
+      const m = new THREE.MeshStandardNodeMaterial({ color: c, flatShading: true, roughness: 0.6, metalness: 0 });
+      applyRimLight(m, 0xffffff, 0.4, 2.5);
+      return m;
+    });
+
+    for (let groveIdx = 0; groveIdx < chosen.length; groveIdx++) {
+      const normal = chosen[groveIdx];
+      const groveGroup = new THREE.Group();
+      groveGroup.userData.isRuntimeOnly = true;
+
+      let tang = new THREE.Vector3(-normal.y, normal.x, 0);
+      if (tang.lengthSq() < 0.001) tang.set(0, -normal.z, normal.y);
+      tang.normalize();
+      const bitang = new THREE.Vector3().crossVectors(normal, tang).normalize();
+
+      // Ring of larger mushrooms
+      const numLarge = 6 + Math.floor(rand() * 3);
+      for (let i = 0; i < numLarge; i++) {
+        const angle = (i / numLarge) * Math.PI * 2 + rand() * 0.5;
+        const dist = 0.04 + rand() * 0.005;
+        const mNormal = normal.clone()
+          .addScaledVector(tang, Math.cos(angle) * dist)
+          .addScaledVector(bitang, Math.sin(angle) * dist)
+          .normalize();
+        const disp = T.surfaceDisplacementAt(seed, terrainType, mNormal.x, mNormal.y, mNormal.z);
+        const surfaceR = radius + disp - propSink;
+        const mPos = mNormal.clone().multiplyScalar(surfaceR);
+        const scale = 2.0 + rand() * 1.2;
+        const capColorIdx = Math.floor(rand() * capMats.length);
+
+        const stalk = new THREE.Mesh(stalkGeo, stalkMat);
+        stalk.scale.setScalar(scale);
+        stalk.position.copy(mPos);
+        stalk.quaternion.setFromUnitVectors(REF_UP, mNormal);
+        stalk.rotateX((rand() - 0.5) * 0.3);
+        stalk.rotateZ((rand() - 0.5) * 0.3);
+        stalk.rotateY(rand() * Math.PI * 2);
+        stalk.castShadow = true;
+        stalk.receiveShadow = true;
+        stalk.userData.isRuntimeOnly = true;
+        groveGroup.add(stalk);
+
+        const cap = new THREE.Mesh(capGeo, capMats[capColorIdx]);
+        cap.scale.setScalar(scale);
+        cap.position.copy(stalk.position);
+        cap.quaternion.copy(stalk.quaternion);
+        cap.castShadow = true;
+        cap.receiveShadow = true;
+        cap.userData.isRuntimeOnly = true;
+        groveGroup.add(cap);
+      }
+
+      // Scatter of smaller mushrooms
+      const numSmall = 15 + Math.floor(rand() * 10);
+      for (let i = 0; i < numSmall; i++) {
+        const angle = rand() * Math.PI * 2;
+        const dist = rand() * 0.035;
+        const mNormal = normal.clone()
+          .addScaledVector(tang, Math.cos(angle) * dist)
+          .addScaledVector(bitang, Math.sin(angle) * dist)
+          .normalize();
+        const disp = T.surfaceDisplacementAt(seed, terrainType, mNormal.x, mNormal.y, mNormal.z);
+        const surfaceR = radius + disp - propSink;
+        const mPos = mNormal.clone().multiplyScalar(surfaceR);
+        const scale = 0.5 + rand() * 1.2;
+        const capColorIdx = Math.floor(rand() * capMats.length);
+
+        const stalk = new THREE.Mesh(stalkGeo, stalkMat);
+        stalk.scale.setScalar(scale);
+        stalk.position.copy(mPos);
+        stalk.quaternion.setFromUnitVectors(REF_UP, mNormal);
+        stalk.rotateX((rand() - 0.5) * 0.4);
+        stalk.rotateZ((rand() - 0.5) * 0.4);
+        stalk.rotateY(rand() * Math.PI * 2);
+        stalk.castShadow = true;
+        stalk.receiveShadow = true;
+        stalk.userData.isRuntimeOnly = true;
+        groveGroup.add(stalk);
+
+        const cap = new THREE.Mesh(capGeo, capMats[capColorIdx]);
+        cap.scale.setScalar(scale);
+        cap.position.copy(stalk.position);
+        cap.quaternion.copy(stalk.quaternion);
+        cap.castShadow = true;
+        cap.receiveShadow = true;
+        cap.userData.isRuntimeOnly = true;
+        groveGroup.add(cap);
+      }
+
+      // Mushroom spore particle emitter — source Globe.ts:2596-2660 used a
+      // raw ShaderMaterial billboard with per-instance attributes; we now
+      // use the engine-batched three.quarks ParticleSystem (single emitter
+      // per grove, registered with the shared BatchedRenderer in update).
+      const sporeEmitter = this._addMushroomSpores(normal, radius, rand);
+      if (sporeEmitter) groveGroup.add(sporeEmitter);
+
+      root.add(groveGroup);
+    }
+    this._log("mushroom groves placed", chosen.length);
+
+    // Publish mushroom-grove normals for the carpet selfie quest.
+    if (this.erth && this.erth.store) {
+      const payload = chosen.map((n, i) => ({ index: i, normal: [n.x, n.y, n.z] }));
+      this.erth.store.set(this.getAttribute("mushroomNormalsStoreKey") || "tinyskies/mushroomNormals", payload);
+    }
+  };
+
+  this._addMushroomSpores = function (normal, radius, rand) {
+    if (typeof ParticleSystem === "undefined") return null;
+    if (!this._spriteTexture) this._spriteTexture = buildSoftSpriteTexture();
+    if (!this._spriteTexture) return null;
+    if (!this._particleEmitters) this._particleEmitters = [];
+
+    const propSink = T.getPropTerrainSink();
+    const disp = T.surfaceDisplacementAt(this.getAttribute("terrainSeed"), this.getAttribute("terrainType"), normal.x, normal.y, normal.z);
+    const surfaceR = radius + disp - propSink + 0.005;
+    const pos = normal.clone().multiplyScalar(surfaceR);
+
+    // Source pastel palette
+    const palette = [
+      new THREE.Vector4(1.00, 0.70, 0.73, 0.85), // pink
+      new THREE.Vector4(0.73, 1.00, 0.79, 0.85), // mint
+      new THREE.Vector4(0.73, 0.88, 1.00, 0.85), // blue
+      new THREE.Vector4(0.90, 0.70, 1.00, 0.85), // lavender
+      new THREE.Vector4(1.00, 1.00, 0.73, 0.85), // yellow
+      new THREE.Vector4(1.00, 0.87, 0.73, 0.85), // peach
+    ];
+    const colorIdx = Math.floor(rand() * palette.length);
+    const colorA = palette[colorIdx];
+    const colorB = palette[(colorIdx + 1) % palette.length];
+
+    const mat = new THREE.MeshBasicNodeMaterial({
+      map: this._spriteTexture,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    });
+    const ps = new ParticleSystem({
+      duration: 5,
+      looping: true,
+      startLife: new Quarks.IntervalValue(2.0, 3.5),
+      startSpeed: new Quarks.IntervalValue(0.05, 0.15),
+      startSize: new Quarks.IntervalValue(0.012, 0.022),
+      startColor: new Quarks.RandomColor(colorA, colorB),
+      emissionOverTime: new Quarks.ConstantValue(12),
+      shape: new SphereEmitter({ radius: 0.045 }),
+      material: mat,
+      renderMode: Quarks.RenderMode.BillBoard,
+      worldSpace: true,
+    });
+    const emitter = new ParticleEmitter(ps);
+    emitter.userData.isRuntimeOnly = true;
+    emitter.position.copy(pos);
+    emitter.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), normal);
+    this._particleEmitters.push(emitter);
+    return emitter;
+  };
+
+  // -----------------------------------------------------------------
+  // Teardown
+  // -----------------------------------------------------------------
+
+  this._teardownVisuals = function () {
+    if (!this._root) return;
+    // Un-register particle systems from the BatchedRenderer first so we
+    // don't tick a system whose buffers are about to be disposed.
+    if (this._batchedRenderer && this._particleEmitters) {
+      for (const e of this._particleEmitters) {
+        if (e && e.system) {
+          try { this._batchedRenderer.deleteSystem(e.system); } catch (_) {}
+        }
+      }
+    }
+    if (this._particleEmitters) {
+      for (const e of this._particleEmitters) {
+        if (e && e.system && typeof e.system.dispose === "function") {
+          try { e.system.dispose(); } catch (_) {}
+        }
+      }
+    }
+    this._root.traverse((child) => {
+      if (child.geometry && typeof child.geometry.dispose === "function") child.geometry.dispose();
+      if (child.material) {
+        if (Array.isArray(child.material)) {
+          for (const m of child.material) if (m && typeof m.dispose === "function") m.dispose();
+        } else if (typeof child.material.dispose === "function") {
+          child.material.dispose();
+        }
+      }
+    });
+    if (this._spriteTexture) {
+      try { this._spriteTexture.dispose(); } catch (_) {}
+      this._spriteTexture = null;
+    }
+    if (this._root.parent) this._root.parent.remove(this._root);
+    this._root = null;
+    this._particleEmitters = null;
+    this._batchedRenderer = null;
+  };

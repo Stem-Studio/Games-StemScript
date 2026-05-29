@@ -1,0 +1,214 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  priority: 0
+  name: "FP3 Multiplayer Manager"
+  id: "fp3.multiplayerManager"
+  author: "flight-sim"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Colyseus multiplayer room join, state sync, remote vehicle spawn, chat and hit relay"
+  tags:
+    - gameplay
+  attributes: {}
+  documentation: Manages multiplayer state broadcasting at 20Hz, remote player tracking
+    with 10s timeout, chat message relay, and hit/damage event forwarding. Reads local
+    player state from store and writes remote player map for FP3-Remote-Vehicle to consume.
+
+code: |
+  let game;
+  let store;
+
+  // --- Constants ---
+  let BROADCAST_INTERVAL = 0.05;
+  let PLAYER_TIMEOUT = 10;
+  let ROUND_DURATION = 15 * 60;
+
+  // --- State ---
+  let broadcastTimer = 0;
+  let remotePlayers = {};
+  let room = null;
+  let sessionId = null;
+  let roundTimer = 0;
+  let connected = false;
+
+  this.init = function(_game) {
+    game = _game;
+    store = this.erth.store;
+  };
+
+  this.onStart = function() {
+    roundTimer = ROUND_DURATION;
+
+    // Attempt to join multiplayer room
+    tryJoinRoom();
+  };
+
+  function tryJoinRoom() {
+    try {
+      if (game.multiplayer) {
+        room = game.multiplayer.getRoom ? game.multiplayer.getRoom() : null;
+      }
+
+      if (!room) {
+        // Multiplayer not available — run in offline mode
+        connected = false;
+        return;
+      }
+
+      sessionId = room.sessionId;
+      connected = true;
+
+      // Send join message
+      let username = store.get('fp3_username') || 'Pilot';
+      let vehicleName = store.get('fp3_vehicleName') || 'cessna';
+
+      room.send('playerJoin', {
+        username: username,
+        vehicleName: vehicleName
+      });
+
+      // Listen for remote player updates
+      room.onMessage('playerUpdate', function(message) {
+        handleRemotePlayerUpdate(message);
+      });
+
+      // Listen for player leave
+      room.onMessage('playerLeave', function(message) {
+        if (message.playerId && remotePlayers[message.playerId]) {
+          delete remotePlayers[message.playerId];
+          store.set('fp3_remotePlayers', Object.assign({}, remotePlayers));
+        }
+      });
+
+      // Listen for chat messages
+      room.onMessage('chat', function(message) {
+        let chatLog = store.get('fp3_chatLog') || [];
+        chatLog.push({
+          from: message.username || 'Unknown',
+          text: message.text || '',
+          time: Date.now()
+        });
+        // Keep last 50 messages
+        if (chatLog.length > 50) {
+          chatLog = chatLog.slice(chatLog.length - 50);
+        }
+        store.set('fp3_chatLog', chatLog);
+      });
+
+      // Listen for hit events
+      room.onMessage('hit', function(message) {
+        if (message.targetId === sessionId) {
+          let currentHealth = store.get('fp3_health') || 100;
+          currentHealth -= (message.damage || 25);
+          if (currentHealth < 0) currentHealth = 0;
+          store.set('fp3_health', currentHealth);
+        }
+      });
+    } catch (e) {
+      console.warn('FP3 Multiplayer: Could not join room', e);
+      connected = false;
+    }
+  }
+
+  function handleRemotePlayerUpdate(message) {
+    let playerId = message.playerId;
+    if (!playerId || playerId === sessionId) return;
+
+    remotePlayers[playerId] = {
+      x: message.x || 0,
+      y: message.y || 0,
+      z: message.z || 0,
+      rx: message.rx || 0,
+      ry: message.ry || 0,
+      rz: message.rz || 0,
+      speed: message.speed || 0,
+      health: message.health !== undefined ? message.health : 100,
+      vehicleName: message.vehicleName || 'cessna',
+      username: message.username || 'Pilot',
+      lastUpdate: Date.now()
+    };
+
+    store.set('fp3_remotePlayers', Object.assign({}, remotePlayers));
+  }
+
+  this.update = function(dt) {
+    // Round timer
+    roundTimer -= dt;
+    store.set('fp3_roundTimer', Math.max(0, roundTimer));
+
+    // Broadcast local state at 20Hz
+    broadcastTimer += dt;
+    if (broadcastTimer >= BROADCAST_INTERVAL) {
+      broadcastTimer = 0;
+      broadcastState();
+    }
+
+    // Timeout stale players
+    let now = Date.now();
+    let changed = false;
+    let playerIds = Object.keys(remotePlayers);
+    for (let i = 0; i < playerIds.length; i++) {
+      let pid = playerIds[i];
+      if ((now - remotePlayers[pid].lastUpdate) / 1000 > PLAYER_TIMEOUT) {
+        delete remotePlayers[pid];
+        changed = true;
+      }
+    }
+    if (changed) {
+      store.set('fp3_remotePlayers', Object.assign({}, remotePlayers));
+    }
+  };
+
+  function broadcastState() {
+    if (!connected || !room) return;
+
+    let pos = store.get('fp3_playerPosition');
+    let flightState = store.get('fp3_flightState');
+    let health = store.get('fp3_health');
+    let vehicleName = store.get('fp3_vehicleName') || 'cessna';
+
+    if (!pos) return;
+
+    let data = {
+      type: 'playerUpdate',
+      x: pos.x || 0,
+      y: pos.y || 0,
+      z: pos.z || 0,
+      rx: flightState ? (flightState.rotX || 0) : 0,
+      ry: flightState ? (flightState.rotY || 0) : 0,
+      rz: flightState ? (flightState.rotZ || 0) : 0,
+      speed: flightState ? (flightState.speed || 0) : 0,
+      health: health !== undefined ? health : 100,
+      vehicleName: vehicleName
+    };
+
+    try {
+      room.send('playerUpdate', data);
+    } catch (e) {
+      // Connection lost
+      connected = false;
+    }
+  }
+
+  this.sendChat = function(text) {
+    if (!connected || !room) return;
+    let username = store.get('fp3_username') || 'Pilot';
+    room.send('chat', { username: username, text: text });
+  };
+
+  this.sendHit = function(targetPlayerId, damage) {
+    if (!connected || !room) return;
+    room.send('hit', { targetId: targetPlayerId, damage: damage || 25 });
+  };
+
+  this.dispose = function() {
+    remotePlayers = {};
+    room = null;
+    connected = false;
+    sessionId = null;
+  };

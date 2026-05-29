@@ -1,0 +1,1081 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Globe Structures"
+  id: "tinyskies.globeStructures"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Civic structures on the deformed globe — 20 villages (4 house types), 3 coastal lighthouses with rotating warm beams, and 4 windmill clusters. Faithful port of source Globe.ts createVillages / createHouseGeo / createLighthouses / buildWindmill / createWindmills with cross-system de-conflict (villages → lighthouses → windmills) preserved. Window-glow night emission + lighthouse glow billboard simplified per FDR-006."
+  documentation: "Spawns three civic systems at init in the same order the source Game.ts does (villages → lighthouses → windmills), so each later system can keep its source-fidelity de-conflict checks against the prior `_centers` arrays. Materials are MeshStandardNodeMaterial + TSL fresnel emissive (no MeshPhongMaterial / onBeforeCompile on WebGPU). Windmill blades rotate in update at the per-mill speed seeded from source. Lighthouse beams rotate in update via `lighthouseBeamTime` accumulator at the source 0.8 rad/s rate. Source seeds preserved: 200+seed (villages), 555+seed (windmills), 777+seed (lighthouses)."
+  tags:
+    - visual
+    - environment
+    - structures
+  priority: 0
+  throttleConfig:
+    throttlePriority: "HIGH"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: false
+  attributes:
+    radius:
+      name: "Globe Radius"
+      type: "number"
+      default: 5
+      min: 0.5
+      max: 200
+    terrainSeed:
+      name: "Terrain Seed"
+      type: "number"
+      default: 42
+      min: 1
+      max: 1000000
+    terrainType:
+      name: "Terrain Type"
+      type: "string"
+      default: "default"
+    villageCount:
+      name: "Village Count"
+      type: "number"
+      default: 20
+      min: 0
+      max: 60
+    lighthouseCount:
+      name: "Lighthouse Count"
+      type: "number"
+      default: 3
+      min: 0
+      max: 12
+    windmillClusterCount:
+      name: "Windmill Cluster Count"
+      type: "number"
+      default: 4
+      min: 0
+      max: 16
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  @import "terrain" as T;
+  @import "spherical-math" as S;
+
+  const LOG_TAG = "[tinyskies.globeStructures]";
+  const HOUSES_PER_VILLAGE = [8, 10, 12, 14, 16];
+
+  function buildSoftSpriteTexture() {
+    const canvas = document.createElement("canvas"); // @check-ok
+    canvas.width = 64;
+    canvas.height = 64;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+    const grad = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+    grad.addColorStop(0, "rgba(255,255,255,1)");
+    grad.addColorStop(0.4, "rgba(255,255,255,0.6)");
+    grad.addColorStop(1, "rgba(255,255,255,0)");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, 64, 64);
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }
+
+  // -----------------------------------------------------------------
+  // Shared helpers (mirror tinyskiesGlobeVegetation; kept inline so this
+  // behavior is self-contained — script-import couldn't expose them since
+  // the vegetation file uses behavior-scope helpers, not script-asset ones).
+  // -----------------------------------------------------------------
+
+  function applyRimLight(mat, rimColorHex, intensity, power) {
+    const TSL = THREE.TSL;
+    const c = new THREE.Color(rimColorHex);
+    const viewDir = TSL.normalize(TSL.cameraPosition.sub(TSL.positionWorld));
+    // dFdx/dFdy-derived normal — no `normal` attribute needed, so the material compiles cleanly in shadow / AO passes that strip lighting attrs (avoids TSL "Vertex attribute 'normal' not found" warnings that pin frame budget).
+    const nW = TSL.normalize(TSL.cross(TSL.dFdx(TSL.positionWorld), TSL.dFdy(TSL.positionWorld)));
+    const fresnel = TSL.float(1.0).sub(TSL.dot(viewDir, nW).abs());
+    const rim = TSL.vec3(c.r, c.g, c.b)
+      .mul(TSL.float(intensity))
+      .mul(TSL.pow(fresnel, TSL.float(power)));
+    mat.emissiveNode = rim;
+    mat.needsUpdate = true;
+  }
+
+  function createTeardropGeo() {
+    const segments = 10;
+    const points = [];
+    for (let i = 0; i <= segments; i++) {
+      const t = i / segments;
+      const r = Math.pow(Math.sin(t * Math.PI), 0.35) * Math.pow(1 - t, 0.5);
+      points.push(new THREE.Vector2(r, t));
+    }
+    const geo = new THREE.LatheGeometry(points, 6);
+    const bottomColor = new THREE.Color(0.3, 0.55, 0.2);
+    const topColor = new THREE.Color(0.7, 0.92, 0.6);
+    const posAttr = geo.attributes.position;
+    const colors = new Float32Array(posAttr.count * 3);
+    for (let i = 0; i < posAttr.count; i++) {
+      const t = Math.max(0, Math.min(1, posAttr.getY(i)));
+      const c = bottomColor.clone().lerp(topColor, t);
+      const ao = THREE.MathUtils.lerp(0.1, 1.0, Math.min(1, t * 2.0));
+      c.multiplyScalar(ao);
+      colors[i * 3]     = c.r;
+      colors[i * 3 + 1] = c.g;
+      colors[i * 3 + 2] = c.b;
+    }
+    geo.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+    return geo;
+  }
+
+  // mergeColoredParts — extended with `isWindow` flag stored in UV.x so the
+  // village shader can light windows from inside (matched against `vIsWindow`
+  // in the TSL emissive node).
+  function mergeColoredParts(parts) {
+    let totalVerts = 0;
+    for (const p of parts) totalVerts += p.geo.attributes.position.count;
+    const positions = new Float32Array(totalVerts * 3);
+    const normals = new Float32Array(totalVerts * 3);
+    const colors = new Float32Array(totalVerts * 3);
+    const uvs = new Float32Array(totalVerts * 2);
+    const indices = [];
+    let vOffset = 0;
+    for (const { geo, color, isWindow } of parts) {
+      const pos = geo.attributes.position;
+      const norm = geo.attributes.normal;
+      for (let i = 0; i < pos.count; i++) {
+        const idx = (vOffset + i) * 3;
+        const uvIdx = (vOffset + i) * 2;
+        const yv = pos.getY(i);
+        const ao = isWindow ? 1.0 : THREE.MathUtils.lerp(0.15, 1.0, Math.min(1, Math.max(0, yv / 0.5)));
+        positions[idx]     = pos.getX(i);
+        positions[idx + 1] = yv;
+        positions[idx + 2] = pos.getZ(i);
+        normals[idx]     = norm ? norm.getX(i) : 0;
+        normals[idx + 1] = norm ? norm.getY(i) : 1;
+        normals[idx + 2] = norm ? norm.getZ(i) : 0;
+        colors[idx]     = color.r * ao;
+        colors[idx + 1] = color.g * ao;
+        colors[idx + 2] = color.b * ao;
+        uvs[uvIdx]     = isWindow ? 1.0 : 0.0;
+        uvs[uvIdx + 1] = 0.0;
+      }
+      if (geo.index) {
+        for (let i = 0; i < geo.index.count; i++) indices.push(geo.index.getX(i) + vOffset);
+      }
+      vOffset += pos.count;
+    }
+    const merged = new THREE.BufferGeometry();
+    merged.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+    merged.setAttribute("normal", new THREE.Float32BufferAttribute(normals, 3));
+    merged.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+    merged.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+    if (indices.length > 0) merged.setIndex(indices);
+    for (const { geo } of parts) geo.dispose();
+    return merged;
+  }
+
+  // -----------------------------------------------------------------
+  // House geometry (4 types) — source Globe.ts:1329 createHouseGeo
+  // -----------------------------------------------------------------
+
+  function createHouseGeo(type) {
+    const wallColor = new THREE.Color(0xf4f0e8);
+    const domeColors = [
+      new THREE.Color(0x2866b0),
+      new THREE.Color(0x3478c0),
+      new THREE.Color(0x1e5898),
+      new THREE.Color(0xc04040),
+    ];
+    const domeColor = domeColors[type % domeColors.length];
+    const flatRoofColor = new THREE.Color(0xe8e4dc);
+    const doorColor = new THREE.Color(0x5a4030);
+    const windowColor = new THREE.Color(0xffcc66);
+    const frameColor = new THREE.Color(0x8e8984);
+
+    const parts = [];
+
+    const addWindow = (w, h, d, px, py, pz) => {
+      const frameThick = 0.04;
+      const frameDepth = d * 1.2;
+      const frame = new THREE.BoxGeometry(w + frameThick * 2, h + frameThick * 2, frameDepth);
+      frame.translate(px, py, pz);
+      parts.push({ geo: frame, color: frameColor });
+      const win = new THREE.BoxGeometry(w, h, d * 1.4);
+      win.translate(px, py, pz);
+      parts.push({ geo: win, color: windowColor, isWindow: true });
+    };
+    const addDoor = (w, h, d, px, py, pz) => {
+      const frameThick = 0.05;
+      const frameDepth = d * 1.2;
+      const frame = new THREE.BoxGeometry(w + frameThick * 2, h + frameThick, frameDepth);
+      frame.translate(px, py + frameThick * 0.5, pz);
+      parts.push({ geo: frame, color: frameColor });
+      const door = new THREE.BoxGeometry(w, h, d * 1.4);
+      door.translate(px, py, pz);
+      parts.push({ geo: door, color: doorColor });
+    };
+
+    if (type === 0) {
+      const wall = new THREE.BoxGeometry(1, 0.8, 1); wall.translate(0, 0.4, 0);
+      parts.push({ geo: wall, color: wallColor });
+      const cornice = new THREE.BoxGeometry(1.08, 0.06, 1.08); cornice.translate(0, 0.8, 0);
+      parts.push({ geo: cornice, color: flatRoofColor });
+      const dome = new THREE.SphereGeometry(0.45, 12, 8, 0, Math.PI * 2, 0, Math.PI / 2);
+      dome.translate(0, 0.8, 0);
+      parts.push({ geo: dome, color: domeColor });
+      const finial = new THREE.CylinderGeometry(0.02, 0.04, 0.15, 6);
+      finial.translate(0, 1.3, 0);
+      parts.push({ geo: finial, color: frameColor });
+      addDoor(0.22, 0.36, 0.05, 0, 0.18, 0.5);
+      addWindow(0.16, 0.22, 0.05, -0.5, 0.45, 0);
+      addWindow(0.16, 0.22, 0.05, 0.5, 0.45, 0);
+    } else if (type === 1) {
+      const base = new THREE.BoxGeometry(1.2, 0.6, 0.9); base.translate(0, 0.3, 0);
+      parts.push({ geo: base, color: wallColor });
+      const roof = new THREE.BoxGeometry(1.28, 0.08, 0.98); roof.translate(0, 0.64, 0);
+      parts.push({ geo: roof, color: flatRoofColor });
+      const upper = new THREE.BoxGeometry(0.6, 0.45, 0.6); upper.translate(0.2, 0.925, 0.05);
+      parts.push({ geo: upper, color: wallColor });
+      const upperRoof = new THREE.BoxGeometry(0.68, 0.06, 0.68); upperRoof.translate(0.2, 1.18, 0.05);
+      parts.push({ geo: upperRoof, color: flatRoofColor });
+      const dome = new THREE.SphereGeometry(0.25, 10, 6, 0, Math.PI * 2, 0, Math.PI / 2);
+      dome.translate(0.2, 1.18, 0.05);
+      parts.push({ geo: dome, color: domeColor });
+      addDoor(0.22, 0.3, 0.05, -0.2, 0.15, 0.45);
+      addWindow(0.16, 0.2, 0.05, 0.3, 0.35, 0.45);
+      addWindow(0.14, 0.18, 0.05, 0.2, 0.9, 0.35);
+    } else if (type === 2) {
+      const wall = new THREE.BoxGeometry(0.7, 1.1, 0.7); wall.translate(0, 0.55, 0);
+      parts.push({ geo: wall, color: wallColor });
+      const cornice = new THREE.BoxGeometry(0.78, 0.06, 0.78); cornice.translate(0, 1.1, 0);
+      parts.push({ geo: cornice, color: flatRoofColor });
+      const dome = new THREE.SphereGeometry(0.35, 12, 8, 0, Math.PI * 2, 0, Math.PI / 2);
+      dome.translate(0, 1.1, 0);
+      parts.push({ geo: dome, color: domeColor });
+      addDoor(0.18, 0.4, 0.05, 0, 0.2, 0.35);
+      addWindow(0.14, 0.24, 0.05, 0, 0.75, 0.35);
+      addWindow(0.14, 0.24, 0.05, 0, 0.75, -0.35);
+    } else {
+      const base = new THREE.BoxGeometry(0.9, 0.5, 0.8); base.translate(0, 0.25, 0);
+      parts.push({ geo: base, color: wallColor });
+      const baseRoof = new THREE.BoxGeometry(0.98, 0.06, 0.88); baseRoof.translate(0, 0.53, 0);
+      parts.push({ geo: baseRoof, color: flatRoofColor });
+      const mid = new THREE.BoxGeometry(0.55, 0.45, 0.55); mid.translate(-0.1, 0.785, 0.05);
+      parts.push({ geo: mid, color: wallColor });
+      const midRoof = new THREE.BoxGeometry(0.63, 0.06, 0.63); midRoof.translate(-0.1, 1.04, 0.05);
+      parts.push({ geo: midRoof, color: flatRoofColor });
+      const top = new THREE.BoxGeometry(0.35, 0.35, 0.35); top.translate(0.05, 1.245, 0);
+      parts.push({ geo: top, color: wallColor });
+      const dome = new THREE.SphereGeometry(0.22, 10, 6, 0, Math.PI * 2, 0, Math.PI / 2);
+      dome.translate(0.05, 1.42, 0);
+      parts.push({ geo: dome, color: domeColor });
+      addDoor(0.2, 0.28, 0.05, 0.15, 0.14, 0.4);
+      addWindow(0.14, 0.16, 0.05, -0.2, 0.35, 0.4);
+      addWindow(0.12, 0.16, 0.05, -0.375, 0.75, 0.05);
+    }
+    return mergeColoredParts(parts);
+  }
+
+  // -----------------------------------------------------------------
+  // Windmill geometry — source Globe.ts:1693 buildWindmill
+  // -----------------------------------------------------------------
+
+  function buildWindmillGeometry(scale) {
+    const COL_TOWER = new THREE.Color(0xf0ece0);
+    const COL_TOWER_BAND = new THREE.Color(0xd8d0c0);
+    const COL_CAP = new THREE.Color(0x4a3828);
+    const COL_DOOR = new THREE.Color(0x4a3018);
+    const COL_DOOR_FRAME = new THREE.Color(0x3a2818);
+    const COL_WINDOW = new THREE.Color(0x7ab8d0);
+    const COL_WINDOW_FRAME = new THREE.Color(0x5a4030);
+    const COL_BALCONY = new THREE.Color(0x6b5540);
+    const COL_BLADE_SAIL = new THREE.Color(0xe0d8c8);
+    const COL_BLADE_ARM = new THREE.Color(0x7a6a50);
+    const COL_TAIL = new THREE.Color(0x8a7a60);
+
+    const parts = [];
+    const bladeParts = [];
+
+    const tH = 0.13 * scale;
+    const rBot = 0.032 * scale;
+    const rTop = 0.022 * scale;
+    const rMid = (rBot + rTop) / 2;
+
+    const towerLower = new THREE.CylinderGeometry(rMid, rBot, tH * 0.5, 10);
+    towerLower.translate(0, tH * 0.25, 0);
+    parts.push({ geo: towerLower, color: COL_TOWER });
+
+    const towerUpper = new THREE.CylinderGeometry(rTop, rMid, tH * 0.5, 10);
+    towerUpper.translate(0, tH * 0.75, 0);
+    parts.push({ geo: towerUpper, color: COL_TOWER });
+
+    const bandGeo = new THREE.CylinderGeometry(rMid + 0.002 * scale, rMid + 0.002 * scale, 0.005 * scale, 10);
+    bandGeo.translate(0, tH * 0.5, 0);
+    parts.push({ geo: bandGeo, color: COL_TOWER_BAND });
+
+    const baseRing = new THREE.CylinderGeometry(rBot + 0.003 * scale, rBot + 0.005 * scale, 0.006 * scale, 10);
+    baseRing.translate(0, 0.003 * scale, 0);
+    parts.push({ geo: baseRing, color: COL_TOWER_BAND });
+
+    const capH = 0.028 * scale;
+    const capBase = rTop + 0.004 * scale;
+    const capMid = new THREE.CylinderGeometry(capBase * 0.6, capBase, capH * 0.6, 8);
+    capMid.translate(0, tH + capH * 0.3, 0);
+    parts.push({ geo: capMid, color: COL_CAP });
+    const capTip = new THREE.CylinderGeometry(0.002 * scale, capBase * 0.6, capH * 0.4, 8);
+    capTip.translate(0, tH + capH * 0.8, 0);
+    parts.push({ geo: capTip, color: COL_CAP });
+
+    const doorW = rBot * 0.55;
+    const doorH = tH * 0.22;
+    const doorGeo = new THREE.BoxGeometry(doorW, doorH, 0.004 * scale);
+    doorGeo.translate(0, doorH / 2 + 0.003 * scale, rBot + 0.002 * scale);
+    parts.push({ geo: doorGeo, color: COL_DOOR });
+    const doorFrame = new THREE.BoxGeometry(doorW + 0.004 * scale, doorH + 0.003 * scale, 0.003 * scale);
+    doorFrame.translate(0, doorH / 2 + 0.004 * scale, rBot + 0.003 * scale);
+    parts.push({ geo: doorFrame, color: COL_DOOR_FRAME });
+
+    const winSize = 0.008 * scale;
+    const windowPositions = [
+      { y: tH * 0.45, angle: Math.PI * 0.3 },
+      { y: tH * 0.45, angle: -Math.PI * 0.3 },
+      { y: tH * 0.68, angle: 0 },
+    ];
+    for (const wp of windowPositions) {
+      const wr = THREE.MathUtils.lerp(rBot, rTop, wp.y / tH);
+      const wx = Math.sin(wp.angle) * (wr + 0.002 * scale);
+      const wz = Math.cos(wp.angle) * (wr + 0.002 * scale);
+      const winGeo = new THREE.BoxGeometry(winSize, winSize, 0.003 * scale);
+      winGeo.lookAt(new THREE.Vector3(Math.sin(wp.angle), 0, Math.cos(wp.angle)));
+      winGeo.translate(wx, wp.y, wz);
+      parts.push({ geo: winGeo, color: COL_WINDOW });
+      const frameGeo = new THREE.BoxGeometry(winSize + 0.004 * scale, winSize + 0.004 * scale, 0.002 * scale);
+      frameGeo.lookAt(new THREE.Vector3(Math.sin(wp.angle), 0, Math.cos(wp.angle)));
+      frameGeo.translate(wx, wp.y, wz);
+      parts.push({ geo: frameGeo, color: COL_WINDOW_FRAME });
+    }
+
+    const balcR = rTop + 0.008 * scale;
+    const balcFloor = new THREE.CylinderGeometry(balcR, balcR, 0.003 * scale, 12);
+    balcFloor.translate(0, tH - 0.002 * scale, 0);
+    parts.push({ geo: balcFloor, color: COL_BALCONY });
+    const balcRail = new THREE.CylinderGeometry(balcR + 0.001, balcR + 0.001, 0.008 * scale, 12, 1, true);
+    balcRail.translate(0, tH + 0.002 * scale, 0);
+    parts.push({ geo: balcRail, color: COL_BALCONY });
+
+    const tailLen = 0.03 * scale;
+    const tailW = 0.018 * scale;
+    const tailGeo = new THREE.BoxGeometry(tailW, 0.002 * scale, tailLen);
+    tailGeo.translate(0, tH + capH * 0.5, -(rTop + tailLen * 0.5 + 0.004 * scale));
+    parts.push({ geo: tailGeo, color: COL_TAIL });
+    const tailPost = new THREE.BoxGeometry(0.003 * scale, 0.012 * scale, 0.003 * scale);
+    tailPost.translate(0, tH + capH * 0.5 - 0.005 * scale, -(rTop + 0.004 * scale));
+    parts.push({ geo: tailPost, color: COL_TAIL });
+
+    const hubY = tH + capH * 0.35;
+    const hubZ = rTop + 0.006 * scale;
+    const bladeLen = 0.10 * scale;
+
+    const hubGeo = new THREE.CylinderGeometry(0.006 * scale, 0.006 * scale, 0.008 * scale, 8);
+    hubGeo.rotateX(Math.PI / 2);
+    bladeParts.push({ geo: hubGeo, color: COL_CAP });
+
+    for (let b = 0; b < 4; b++) {
+      const angle = (b / 4) * Math.PI * 2;
+      const armGeo = new THREE.BoxGeometry(0.003 * scale, bladeLen, 0.003 * scale);
+      armGeo.translate(0, bladeLen / 2 + 0.005 * scale, 0);
+      armGeo.rotateZ(angle);
+      bladeParts.push({ geo: armGeo, color: COL_BLADE_ARM });
+
+      for (let c = 0; c < 3; c++) {
+        const ct = (c + 1) / 4;
+        const cy = bladeLen * ct + 0.005 * scale;
+        const crossGeo = new THREE.BoxGeometry(0.002 * scale, 0.002 * scale, 0.016 * scale);
+        crossGeo.translate(0.002 * scale, cy, 0);
+        crossGeo.rotateZ(angle);
+        bladeParts.push({ geo: crossGeo, color: COL_BLADE_ARM });
+      }
+
+      const sailH = bladeLen * 0.75;
+      const sailW = 0.016 * scale;
+      const sailGeo = new THREE.BoxGeometry(0.001 * scale, sailH, sailW);
+      sailGeo.translate(sailW * 0.3, bladeLen * 0.5 + 0.005 * scale, 0);
+      sailGeo.rotateZ(angle);
+      bladeParts.push({ geo: sailGeo, color: COL_BLADE_SAIL });
+    }
+
+    return { parts, bladeParts, hubY, hubZ };
+  }
+
+  // -----------------------------------------------------------------
+  // Lifecycle
+  // -----------------------------------------------------------------
+
+  let game;
+
+  this.init = function (_game) {
+    game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._buildVisuals(this.gameObject._internal.three);
+    this._registerParticleSystemsWithBatchedRenderer();
+    this._log("init");
+  };
+
+  this.onEditorAdded = function () {
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._buildVisuals(this.gameObject._internal.three);
+  };
+
+  this.onEditorAttributesUpdated = function () {
+    this._teardownVisuals();
+    this._buildVisuals(this.gameObject._internal.three);
+  };
+
+  this.onEditorDispose = function () {
+    this._teardownVisuals();
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    this._teardownVisuals();
+  };
+
+  this.update = function (deltaTime) {
+    if (!this._root) return;
+    const dt = Math.min(deltaTime, 0.1);
+    // Lighthouse beam rotation — source `lighthouseBeamTime * 0.8`
+    if (this._lighthouseBeams && this._lighthouseBeams.length > 0) {
+      this._lighthouseBeamTime = (this._lighthouseBeamTime || 0) + dt;
+      const angle = this._lighthouseBeamTime * 0.8;
+      for (const beam of this._lighthouseBeams) beam.rotation.y = angle;
+    }
+    // Windmill blade rotation — source `pivot.rotation.z += dt * speed`
+    if (this._windmillBlades) {
+      for (const w of this._windmillBlades) w.pivot.rotation.z += dt * w.speed;
+    }
+  };
+
+  // -----------------------------------------------------------------
+  // Builders — order mirrors source Game.ts: villages → lighthouses → windmills
+  // so cross-system de-conflict checks see the centers populated by the
+  // earlier passes.
+  // -----------------------------------------------------------------
+
+  this._buildVisuals = function (parent) {
+    const radius = this.getAttribute("radius");
+    const seed = this.getAttribute("terrainSeed");
+    const terrainType = this.getAttribute("terrainType");
+
+    const root = new THREE.Group();
+    root.name = "tinyskiesGlobeStructures";
+    root.userData.isRuntimeOnly = true;
+
+    this._villageCenters = [];
+    this._lighthouseCenters = [];
+    this._windmillCenters = [];
+    this._lighthouseBeams = [];
+    this._windmillBlades = [];
+
+    this._buildVillages(root, radius, seed, terrainType, this.getAttribute("villageCount"));
+    this._buildLighthouses(root, radius, seed, terrainType, this.getAttribute("lighthouseCount"));
+    this._buildWindmills(root, radius, seed, terrainType, this.getAttribute("windmillClusterCount"));
+
+    parent.add(root);
+    this._root = root;
+  };
+
+  // Source Globe.ts:1474 createVillages — 20 cluster centers, 8-16 houses
+  // each (4 types), 2-4 garden trees per house.
+  this._buildVillages = function (root, radius, seed, terrainType, villageCount) {
+    const rand = S.seededRandom(200 + seed);
+    const propSink = T.getPropTerrainSink();
+    const REF_UP = new THREE.Vector3(0, 1, 0);
+    const MIN_ELEVATION = 0.08;
+
+    const villageCenters = [];
+    let attempts = 0;
+    while (villageCenters.length < villageCount && attempts < villageCount * 30) {
+      attempts++;
+      const theta = rand() * Math.PI * 2;
+      const phi = Math.acos(2 * rand() - 1);
+      const nx = Math.sin(phi) * Math.cos(theta);
+      const ny = Math.sin(phi) * Math.sin(theta);
+      const nz = Math.cos(phi);
+      const sample = T.sampleTerrain(seed, terrainType, nx, ny, nz);
+      if (!sample.isLand) continue;
+      if (sample.elevation < MIN_ELEVATION || sample.elevation > 0.35) continue;
+      const tooClose = villageCenters.some((v) => v.x * nx + v.y * ny + v.z * nz > 0.95);
+      if (tooClose) continue;
+      villageCenters.push(new THREE.Vector3(nx, ny, nz));
+    }
+
+    const HOUSE_TYPES = 4;
+    const houseGeos = Array.from({ length: HOUSE_TYPES }, (_, i) => createHouseGeo(i));
+    const transformsByType = Array.from({ length: HOUSE_TYPES }, () => []);
+    const gardenTreeTransforms = [];
+    const dummy = new THREE.Object3D();
+
+    for (const center of villageCenters) {
+      const houseCount = HOUSES_PER_VILLAGE[Math.floor(rand() * HOUSES_PER_VILLAGE.length)];
+      this._villageCenters.push({ normal: center.clone(), houseCount });
+
+      for (let h = 0; h < houseCount; h++) {
+        const angle = rand() * Math.PI * 2;
+        const dist = 0.02 + rand() * 0.048;
+
+        let tang = new THREE.Vector3(-center.y, center.x, 0);
+        if (tang.lengthSq() < 0.01) tang.set(0, 0, 1).cross(center).normalize();
+        else tang.normalize();
+        const bitang = new THREE.Vector3().crossVectors(center, tang).normalize();
+
+        const houseNormal = center.clone()
+          .addScaledVector(tang, Math.cos(angle) * dist)
+          .addScaledVector(bitang, Math.sin(angle) * dist)
+          .normalize();
+
+        const sample = T.sampleTerrain(seed, terrainType, houseNormal.x, houseNormal.y, houseNormal.z);
+        if (!sample.isLand) continue;
+        if (sample.elevation < MIN_ELEVATION * 0.5) continue;
+
+        const disp = T.surfaceDisplacementAt(seed, terrainType, houseNormal.x, houseNormal.y, houseNormal.z);
+        const surfaceR = radius + disp - propSink;
+        const sinkAmount = 0.004;
+        const pos = houseNormal.clone().multiplyScalar(surfaceR - sinkAmount);
+        const scale = THREE.MathUtils.lerp(0.065, 0.10, rand());
+        const houseType = Math.floor(rand() * HOUSE_TYPES);
+
+        dummy.position.copy(pos);
+        dummy.quaternion.setFromUnitVectors(REF_UP, houseNormal);
+        dummy.rotateY(rand() * Math.PI * 2);
+        dummy.scale.set(scale, scale * 0.7, scale);
+        dummy.updateMatrix();
+        transformsByType[houseType].push(dummy.matrix.clone());
+
+        // 2-4 garden trees per house
+        const treesAround = 2 + Math.floor(rand() * 3);
+        for (let tr = 0; tr < treesAround; tr++) {
+          const tAngle = rand() * Math.PI * 2;
+          const tDist = 0.016 + rand() * 0.02;
+          let tTang = new THREE.Vector3(-houseNormal.y, houseNormal.x, 0);
+          if (tTang.lengthSq() < 0.01) tTang.set(0, 0, 1).cross(houseNormal).normalize();
+          else tTang.normalize();
+          const tBitang = new THREE.Vector3().crossVectors(houseNormal, tTang).normalize();
+          const treeNormal = houseNormal.clone()
+            .addScaledVector(tTang, Math.cos(tAngle) * tDist)
+            .addScaledVector(tBitang, Math.sin(tAngle) * tDist)
+            .normalize();
+
+          const ts = T.sampleTerrain(seed, terrainType, treeNormal.x, treeNormal.y, treeNormal.z);
+          if (!ts.isLand) continue;
+          const tDisp = T.surfaceDisplacementAt(seed, terrainType, treeNormal.x, treeNormal.y, treeNormal.z);
+          const tSurfR = radius + tDisp - propSink;
+          const treeScale = THREE.MathUtils.lerp(0.022, 0.04, rand());
+          const treeH = treeScale * 2.5;
+          dummy.position.copy(treeNormal.clone().multiplyScalar(tSurfR).addScaledVector(treeNormal, -treeH * 0.05));
+          dummy.quaternion.setFromUnitVectors(REF_UP, treeNormal);
+          dummy.scale.set(treeScale * 0.7, treeH, treeScale * 0.7);
+          dummy.updateMatrix();
+          gardenTreeTransforms.push(dummy.matrix.clone());
+        }
+      }
+    }
+
+    // Garden trees — three shades, each its own InstancedMesh
+    if (gardenTreeTransforms.length > 0) {
+      const gardenGeo = createTeardropGeo();
+      const gardenShades = [0x3a8a2a, 0x45953a, 0x509a40];
+      for (let s = 0; s < gardenShades.length; s++) {
+        const count = Math.ceil(gardenTreeTransforms.length / gardenShades.length);
+        const start = s * count;
+        const end = Math.min(start + count, gardenTreeTransforms.length);
+        const slice = gardenTreeTransforms.slice(start, end);
+        if (slice.length === 0) continue;
+        const mat = new THREE.MeshStandardNodeMaterial({
+          color: gardenShades[s],
+          vertexColors: true,
+          flatShading: true,
+          roughness: 0.85,
+          metalness: 0.0,
+        });
+        applyRimLight(mat, 0xffeeaa, 0.7, 3.0);
+        const inst = new THREE.InstancedMesh(gardenGeo, mat, slice.length);
+        inst.castShadow = true;
+        inst.receiveShadow = false;
+        inst.userData.isRuntimeOnly = true;
+        for (let i = 0; i < slice.length; i++) inst.setMatrixAt(i, slice[i]);
+        inst.instanceMatrix.needsUpdate = true;
+        root.add(inst);
+      }
+    }
+
+    // House InstancedMesh per type — TSL emissive lights up vIsWindow=1.0
+    // vertices the same way the source GLSL onBeforeCompile patch did.
+    for (let t = 0; t < HOUSE_TYPES; t++) {
+      const tforms = transformsByType[t];
+      if (tforms.length === 0) continue;
+      const TSL = THREE.TSL;
+      const mat = new THREE.MeshStandardNodeMaterial({
+        vertexColors: true,
+        flatShading: true,
+        roughness: 0.6,
+        metalness: 0.0,
+      });
+      // Window-glow emissive: warm orange where uv.x > 0.5 (the isWindow flag),
+      // PLUS the standard rim Fresnel.
+      const isWindow = TSL.uv().x.greaterThan(TSL.float(0.5)).toFloat();
+      const winColor = TSL.vec3(1.0, 0.75, 0.2).mul(TSL.float(2.5)).mul(isWindow);
+      const viewDir = TSL.normalize(TSL.cameraPosition.sub(TSL.positionWorld));
+      // dFdx/dFdy-derived normal — see applyRimLight comment above for rationale.
+      const nW = TSL.normalize(TSL.cross(TSL.dFdx(TSL.positionWorld), TSL.dFdy(TSL.positionWorld)));
+      const fresnel = TSL.float(1.0).sub(TSL.dot(viewDir, nW).abs());
+      const rimC = new THREE.Color(0xffeebb);
+      const rim = TSL.vec3(rimC.r, rimC.g, rimC.b).mul(TSL.float(0.6)).mul(TSL.pow(fresnel, TSL.float(3.0)));
+      mat.emissiveNode = winColor.add(rim);
+      mat.needsUpdate = true;
+
+      const inst = new THREE.InstancedMesh(houseGeos[t], mat, tforms.length);
+      inst.castShadow = true;
+      inst.receiveShadow = true;
+      inst.userData.isRuntimeOnly = true;
+      for (let i = 0; i < tforms.length; i++) inst.setMatrixAt(i, tforms[i]);
+      inst.instanceMatrix.needsUpdate = true;
+      root.add(inst);
+    }
+    this._log("villages placed", villageCenters.length, "(" + transformsByType.reduce((s, a) => s + a.length, 0) + " houses)");
+  };
+
+  // Source Globe.ts:5368 createLighthouses — 3 coastal lighthouses with
+  // tower + lantern + rotating beam. Glow billboard simplified per FDR-006.
+  this._buildLighthouses = function (root, radius, seed, terrainType, lighthouseCount) {
+    const rand = S.seededRandom(777 + seed);
+    const propSink = T.getPropTerrainSink();
+    const REF_UP = new THREE.Vector3(0, 1, 0);
+    const WATER_CHECKS = 12;
+    const CHECK_DIST = 0.06;
+    const MIN_WATER_RATIO = 0.55;
+    const MIN_SEPARATION_DOT = 0.92;
+
+    const candidates = [];
+    let attempts = 0;
+    while (attempts < 2000 && candidates.length < 60) {
+      attempts++;
+      const theta = rand() * Math.PI * 2;
+      const phi = Math.acos(2 * rand() - 1);
+      const nx = Math.sin(phi) * Math.cos(theta);
+      const ny = Math.cos(phi);
+      const nz = Math.sin(phi) * Math.sin(theta);
+
+      const sample = T.sampleTerrain(seed, terrainType, nx, ny, nz);
+      if (!sample.isLand) continue;
+      if (sample.elevation > 0.15) continue;
+
+      const waterRatio = T.waterRatioAround(seed, terrainType, nx, ny, nz, CHECK_DIST, WATER_CHECKS);
+      if (waterRatio < MIN_WATER_RATIO) continue;
+
+      const centerNormal = new THREE.Vector3(nx, ny, nz);
+      let tooCloseToVillage = false;
+      for (const v of this._villageCenters) {
+        if (centerNormal.dot(v.normal) > 0.98) { tooCloseToVillage = true; break; }
+      }
+      if (tooCloseToVillage) continue;
+      candidates.push({ normal: centerNormal, waterRatio });
+    }
+    candidates.sort((a, b) => b.waterRatio - a.waterRatio);
+
+    const chosen = [];
+    for (const c of candidates) {
+      if (chosen.length >= lighthouseCount) break;
+      let tooClose = false;
+      for (const v of chosen) {
+        if (c.normal.dot(v) > MIN_SEPARATION_DOT) { tooClose = true; break; }
+      }
+      if (!tooClose) chosen.push(c.normal);
+    }
+    if (chosen.length === 0) return;
+
+    for (const normal of chosen) {
+      this._lighthouseCenters.push({ normal: normal.clone() });
+      const disp = T.surfaceDisplacementAt(seed, terrainType, normal.x, normal.y, normal.z);
+      const surfaceR = radius + disp - propSink;
+      const lighthouse = new THREE.Group();
+      lighthouse.userData.isRuntimeOnly = true;
+
+      const towerH = 0.18;
+      const towerRBot = 0.021;
+      const towerRTop = 0.015;
+      const baseH = 0.015;
+      const baseR = towerRBot + 0.01;
+
+      const stoneMat = new THREE.MeshStandardNodeMaterial({ color: 0x8e8984, flatShading: true, roughness: 0.85, metalness: 0 });
+      applyRimLight(stoneMat, 0xe8e0d8, 0.36, 2.75);
+      const towerMat = new THREE.MeshStandardNodeMaterial({ color: 0xf5f0e8, flatShading: true, roughness: 0.6, metalness: 0 });
+      applyRimLight(towerMat, 0xffffff, 0.4, 2.5);
+      const stripeMat = new THREE.MeshStandardNodeMaterial({ color: 0xcc3333, flatShading: true, roughness: 0.5, metalness: 0 });
+      applyRimLight(stripeMat, 0xff8866, 0.4, 2.5);
+      const doorMat = new THREE.MeshStandardNodeMaterial({ color: 0x5a4030, flatShading: true });
+      const winMat = new THREE.MeshStandardNodeMaterial({ color: 0x1a2530, flatShading: true });
+      const metalMat = new THREE.MeshStandardNodeMaterial({ color: 0x333333, flatShading: true, roughness: 0.4, metalness: 0.7 });
+      const railMat = new THREE.MeshStandardNodeMaterial({ color: 0x222222, wireframe: true });
+      // Lantern: bright warm emissive (always on; in source the day/night cycle modulates it).
+      const lanternMat = new THREE.MeshStandardNodeMaterial({
+        color: 0xfff8dd,
+        roughness: 0.2,
+        metalness: 0.0,
+        transparent: true,
+        opacity: 0.9,
+      });
+      lanternMat.emissiveNode = THREE.TSL.vec3(1.0, 0.85, 0.4).mul(THREE.TSL.float(1.5));
+      const roofMat = new THREE.MeshStandardNodeMaterial({ color: 0xcc3333, flatShading: true, roughness: 0.5, metalness: 0 });
+      applyRimLight(roofMat, 0xff8866, 0.4, 2.5);
+
+      const baseGeo = new THREE.CylinderGeometry(baseR, baseR + 0.005, baseH, 12);
+      baseGeo.translate(0, baseH / 2, 0);
+      const baseMesh = new THREE.Mesh(baseGeo, stoneMat);
+      baseMesh.userData.isRuntimeOnly = true;
+      lighthouse.add(baseMesh);
+
+      const towerGeo = new THREE.CylinderGeometry(towerRTop, towerRBot, towerH, 16);
+      towerGeo.translate(0, towerH / 2, 0);
+      const towerMesh = new THREE.Mesh(towerGeo, towerMat);
+      towerMesh.userData.isRuntimeOnly = true;
+      lighthouse.add(towerMesh);
+
+      const doorW = 0.012, doorH = 0.018;
+      const doorGeo = new THREE.BoxGeometry(doorW, doorH, 0.005);
+      doorGeo.translate(0, doorH / 2 + baseH, towerRBot);
+      const doorMesh = new THREE.Mesh(doorGeo, doorMat);
+      doorMesh.userData.isRuntimeOnly = true;
+      lighthouse.add(doorMesh);
+
+      const winSize = 0.006;
+      const winGeo = new THREE.BoxGeometry(winSize, winSize * 1.5, 0.005);
+      for (let i = 1; i <= 3; i++) {
+        const wy = baseH + (towerH / 4) * i;
+        const wr = THREE.MathUtils.lerp(towerRBot, towerRTop, wy / towerH);
+        const win = new THREE.Mesh(winGeo, winMat);
+        win.position.set(0, wy, wr);
+        win.userData.isRuntimeOnly = true;
+        lighthouse.add(win);
+      }
+
+      const stripeH = 0.025;
+      const stripeY = towerH * 0.55;
+      const stripeR = THREE.MathUtils.lerp(towerRBot, towerRTop, 0.55) + 0.001;
+      const stripeGeo = new THREE.CylinderGeometry(stripeR, stripeR + 0.001, stripeH, 16);
+      stripeGeo.translate(0, stripeY, 0);
+      const stripeMesh = new THREE.Mesh(stripeGeo, stripeMat);
+      stripeMesh.userData.isRuntimeOnly = true;
+      lighthouse.add(stripeMesh);
+
+      const stripe2Y = towerH * 0.3;
+      const stripe2R = THREE.MathUtils.lerp(towerRBot, towerRTop, 0.3) + 0.001;
+      const stripe2Geo = new THREE.CylinderGeometry(stripe2R, stripe2R + 0.001, stripeH, 16);
+      stripe2Geo.translate(0, stripe2Y, 0);
+      const stripe2Mesh = new THREE.Mesh(stripe2Geo, stripeMat);
+      stripe2Mesh.userData.isRuntimeOnly = true;
+      lighthouse.add(stripe2Mesh);
+
+      const lanternY = towerH;
+      const lanternR = towerRTop + 0.006;
+      const lanternH = 0.025;
+
+      const deckGeo = new THREE.CylinderGeometry(lanternR + 0.004, lanternR + 0.002, 0.004, 16);
+      deckGeo.translate(0, lanternY, 0);
+      const deckMesh = new THREE.Mesh(deckGeo, metalMat);
+      deckMesh.userData.isRuntimeOnly = true;
+      lighthouse.add(deckMesh);
+
+      const railGeo = new THREE.CylinderGeometry(lanternR + 0.003, lanternR + 0.003, 0.008, 16, 1, true);
+      railGeo.translate(0, lanternY + 0.004, 0);
+      const railMesh = new THREE.Mesh(railGeo, railMat);
+      railMesh.userData.isRuntimeOnly = true;
+      lighthouse.add(railMesh);
+
+      const lanternGeo = new THREE.CylinderGeometry(lanternR, lanternR, lanternH, 12);
+      lanternGeo.translate(0, lanternY + lanternH / 2, 0);
+      const lanternMesh = new THREE.Mesh(lanternGeo, lanternMat);
+      lanternMesh.userData.isRuntimeOnly = true;
+      lighthouse.add(lanternMesh);
+
+      const strutGeo = new THREE.CylinderGeometry(0.001, 0.001, lanternH, 4);
+      for (let i = 0; i < 8; i++) {
+        const angle = (i / 8) * Math.PI * 2;
+        const strut = new THREE.Mesh(strutGeo, metalMat);
+        strut.position.set(Math.cos(angle) * lanternR, lanternY + lanternH / 2, Math.sin(angle) * lanternR);
+        strut.userData.isRuntimeOnly = true;
+        lighthouse.add(strut);
+      }
+
+      const roofGeo = new THREE.CylinderGeometry(0.002, lanternR + 0.003, 0.016, 16);
+      roofGeo.translate(0, lanternY + lanternH + 0.008, 0);
+      const roofMesh = new THREE.Mesh(roofGeo, roofMat);
+      roofMesh.userData.isRuntimeOnly = true;
+      lighthouse.add(roofMesh);
+
+      const ballGeo = new THREE.SphereGeometry(0.004, 8, 8);
+      ballGeo.translate(0, lanternY + lanternH + 0.018, 0);
+      const ballMesh = new THREE.Mesh(ballGeo, metalMat);
+      ballMesh.userData.isRuntimeOnly = true;
+      lighthouse.add(ballMesh);
+
+      // Rotating warm beam — replaces source's ShaderMaterial-based fade with a
+      // simple horizontal CylinderGeometry on a TSL additive emissive material.
+      // Length-fade comes from positionLocal.y normalized to beam length.
+      const TSL = THREE.TSL;
+      const beamLen = 0.8;
+      const beamSpread = 0.1;
+      const beamGeo = new THREE.CylinderGeometry(beamSpread, 0.002, beamLen, 12, 1, true);
+      beamGeo.rotateZ(-Math.PI / 2);
+      beamGeo.translate(beamLen / 2, 0, 0);
+      const beamMat = new THREE.MeshBasicNodeMaterial({
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        side: THREE.DoubleSide,
+      });
+      // Length-fade from base→tip (uv.y is 0→1 along the cylinder).
+      const lenFade = TSL.float(1.0).sub(TSL.uv().y.mul(TSL.uv().y));
+      const beamColor = TSL.vec3(1.0, 0.85, 0.25);
+      beamMat.colorNode = beamColor;
+      beamMat.opacityNode = lenFade.mul(TSL.float(0.4));
+      const beam = new THREE.Mesh(beamGeo, beamMat);
+      beam.userData.isRuntimeOnly = true;
+      beam.position.y = lanternY + lanternH / 2;
+      lighthouse.add(beam);
+      this._lighthouseBeams.push(beam);
+
+      // Lantern glow halo — source Globe.ts:5510-5538 used a raw ShaderMaterial
+      // billboard. Replaced with a slow-drift three.quarks ParticleSystem
+      // around the lantern housing — a small puff of warm-orange particles
+      // that simulates the soft halo.
+      const haloEmitter = this._addLanternGlow(lanternY + lanternH / 2, lanternR);
+      if (haloEmitter) lighthouse.add(haloEmitter);
+
+      lighthouse.position.copy(normal.clone().multiplyScalar(surfaceR));
+      lighthouse.quaternion.setFromUnitVectors(REF_UP, normal);
+      lighthouse.castShadow = true;
+      root.add(lighthouse);
+    }
+    this._log("lighthouses placed", chosen.length);
+  };
+
+  // Source Globe.ts:1823 createWindmills — 4 cluster centers (2-3 mills each).
+  // De-conflict: stay > 0.97 dot away from villages and lighthouses. Water
+  // ratio in [0.2, 0.5] (i.e. coastal pasture).
+  this._buildWindmills = function (root, radius, seed, terrainType, clusterCount) {
+    const rand = S.seededRandom(555 + seed);
+    const propSink = T.getPropTerrainSink();
+    const REF_UP = new THREE.Vector3(0, 1, 0);
+    const WATER_CHECKS = 10;
+    const CHECK_DIST = 0.05;
+    const MIN_WATER_RATIO = 0.2;
+    const MAX_WATER_RATIO = 0.5;
+    const MIN_SEP_DOT = 0.94;
+
+    const candidates = [];
+    let attempts = 0;
+    while (attempts < 2000 && candidates.length < 40) {
+      attempts++;
+      const theta = rand() * Math.PI * 2;
+      const phi = Math.acos(2 * rand() - 1);
+      const nx = Math.sin(phi) * Math.cos(theta);
+      const ny = Math.cos(phi);
+      const nz = Math.sin(phi) * Math.sin(theta);
+
+      const sample = T.sampleTerrain(seed, terrainType, nx, ny, nz);
+      if (!sample.isLand) continue;
+      if (sample.elevation < 0.05 || sample.elevation > 0.2) continue;
+
+      const cn = new THREE.Vector3(nx, ny, nz);
+      let tooCloseV = false;
+      for (const v of this._villageCenters) { if (cn.dot(v.normal) > 0.97) { tooCloseV = true; break; } }
+      if (tooCloseV) continue;
+      let tooCloseL = false;
+      for (const v of this._lighthouseCenters) { if (cn.dot(v.normal) > 0.97) { tooCloseL = true; break; } }
+      if (tooCloseL) continue;
+
+      const waterRatio = T.waterRatioAround(seed, terrainType, nx, ny, nz, CHECK_DIST, WATER_CHECKS);
+      if (waterRatio < MIN_WATER_RATIO || waterRatio > MAX_WATER_RATIO) continue;
+      candidates.push({ normal: cn, score: 1 - sample.elevation });
+    }
+    candidates.sort((a, b) => b.score - a.score);
+
+    const clusterCenters = [];
+    for (const c of candidates) {
+      if (clusterCenters.length >= clusterCount) break;
+      let tooClose = false;
+      for (const v of clusterCenters) { if (c.normal.dot(v) > MIN_SEP_DOT) { tooClose = true; break; } }
+      if (!tooClose) clusterCenters.push(c.normal);
+    }
+    if (clusterCenters.length === 0) return;
+
+    let placedMills = 0;
+    for (const center of clusterCenters) {
+      const count = 2 + Math.floor(rand() * 2);
+      let tang = new THREE.Vector3(-center.y, center.x, 0);
+      if (tang.lengthSq() < 0.001) tang.set(0, -center.z, center.y);
+      tang.normalize();
+      const bitang = new THREE.Vector3().crossVectors(center, tang).normalize();
+
+      for (let m = 0; m < count; m++) {
+        let normal;
+        if (m === 0) {
+          normal = center.clone();
+        } else {
+          const a = rand() * Math.PI * 2;
+          const d = 0.03 + rand() * 0.02;
+          normal = center.clone()
+            .addScaledVector(tang, Math.cos(a) * d)
+            .addScaledVector(bitang, Math.sin(a) * d)
+            .normalize();
+          if (!T.sampleTerrain(seed, terrainType, normal.x, normal.y, normal.z).isLand) continue;
+        }
+        this._windmillCenters.push({ normal: normal.clone() });
+
+        const disp = T.surfaceDisplacementAt(seed, terrainType, normal.x, normal.y, normal.z);
+        const surfaceR = radius + disp - propSink;
+        const scale = THREE.MathUtils.lerp(0.85, 1.15, rand());
+        const { parts: bodyParts, bladeParts, hubY, hubZ } = buildWindmillGeometry(scale);
+
+        const windmill = new THREE.Group();
+        windmill.userData.isRuntimeOnly = true;
+
+        const mergedBody = mergeColoredParts(bodyParts);
+        const bodyMat = new THREE.MeshStandardNodeMaterial({
+          vertexColors: true,
+          flatShading: true,
+          roughness: 0.7,
+          metalness: 0.05,
+        });
+        applyRimLight(bodyMat, 0xffeedd, 0.3, 3.0);
+        const bodyMesh = new THREE.Mesh(mergedBody, bodyMat);
+        bodyMesh.castShadow = true;
+        bodyMesh.userData.isRuntimeOnly = true;
+        windmill.add(bodyMesh);
+
+        const mergedBlades = mergeColoredParts(bladeParts);
+        const bladeMat = new THREE.MeshStandardNodeMaterial({
+          vertexColors: true,
+          flatShading: true,
+          roughness: 0.6,
+          metalness: 0.05,
+        });
+        const bladeMesh = new THREE.Mesh(mergedBlades, bladeMat);
+        bladeMesh.userData.isRuntimeOnly = true;
+        const bladePivot = new THREE.Group();
+        bladePivot.userData.isRuntimeOnly = true;
+        bladePivot.position.set(0, hubY, hubZ);
+        bladePivot.add(bladeMesh);
+        windmill.add(bladePivot);
+        this._windmillBlades.push({ pivot: bladePivot, speed: 0.4 + rand() * 0.4 });
+
+        windmill.position.copy(normal.clone().multiplyScalar(surfaceR));
+        windmill.quaternion.setFromUnitVectors(REF_UP, normal);
+        windmill.rotateY(rand() * Math.PI * 2);
+        root.add(windmill);
+        placedMills++;
+      }
+    }
+    this._log("windmills placed", placedMills, "in", clusterCenters.length, "clusters");
+  };
+
+  // -----------------------------------------------------------------
+  // Teardown
+  // -----------------------------------------------------------------
+
+  this._addLanternGlow = function (yOffset, lanternR) {
+    if (typeof ParticleSystem === "undefined") return null;
+    if (!this._spriteTexture) this._spriteTexture = buildSoftSpriteTexture();
+    if (!this._spriteTexture) return null;
+    if (!this._particleEmitters) this._particleEmitters = [];
+
+    const mat = new THREE.MeshBasicNodeMaterial({
+      map: this._spriteTexture,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    });
+    const ps = new ParticleSystem({
+      duration: 4,
+      looping: true,
+      startLife: new Quarks.IntervalValue(1.0, 1.8),
+      startSpeed: new Quarks.IntervalValue(0.0, 0.02),
+      startSize: new Quarks.IntervalValue(lanternR * 8, lanternR * 14),
+      // Source halo color: vec3(1.0, 0.7, 0.2)
+      startColor: new Quarks.RandomColor(
+        new THREE.Vector4(1.0, 0.72, 0.22, 0.55),
+        new THREE.Vector4(1.0, 0.65, 0.18, 0.50),
+      ),
+      emissionOverTime: new Quarks.ConstantValue(6),
+      shape: new SphereEmitter({ radius: lanternR * 0.4 }),
+      material: mat,
+      renderMode: Quarks.RenderMode.BillBoard,
+      worldSpace: false,
+    });
+    const emitter = new ParticleEmitter(ps);
+    emitter.userData.isRuntimeOnly = true;
+    emitter.position.set(0, yOffset, 0);
+    this._particleEmitters.push(emitter);
+    return emitter;
+  };
+
+  this._registerParticleSystemsWithBatchedRenderer = function () {
+    if (!this._particleEmitters || this._particleEmitters.length === 0) return;
+    const br = game?.scene?.getObjectByProperty?.("type", "BatchedRenderer");
+    if (!br) {
+      this._log("BatchedRenderer not found — particles will not render this frame");
+      return;
+    }
+    for (const e of this._particleEmitters) {
+      if (e && e.system) br.addSystem(e.system);
+    }
+    this._batchedRenderer = br;
+  };
+
+  this._teardownVisuals = function () {
+    if (!this._root) return;
+    if (this._batchedRenderer && this._particleEmitters) {
+      for (const e of this._particleEmitters) {
+        if (e && e.system) {
+          try { this._batchedRenderer.deleteSystem(e.system); } catch (_) {}
+        }
+      }
+    }
+    if (this._particleEmitters) {
+      for (const e of this._particleEmitters) {
+        if (e && e.system && typeof e.system.dispose === "function") {
+          try { e.system.dispose(); } catch (_) {}
+        }
+      }
+    }
+    if (this._spriteTexture) {
+      try { this._spriteTexture.dispose(); } catch (_) {}
+      this._spriteTexture = null;
+    }
+    this._root.traverse((child) => {
+      if (child.geometry && typeof child.geometry.dispose === "function") child.geometry.dispose();
+      if (child.material) {
+        if (Array.isArray(child.material)) {
+          for (const m of child.material) if (m && typeof m.dispose === "function") m.dispose();
+        } else if (typeof child.material.dispose === "function") {
+          child.material.dispose();
+        }
+      }
+    });
+    if (this._root.parent) this._root.parent.remove(this._root);
+    this._root = null;
+    this._lighthouseBeams = null;
+    this._windmillBlades = null;
+    this._lighthouseBeamTime = 0;
+    this._particleEmitters = null;
+    this._batchedRenderer = null;
+  };

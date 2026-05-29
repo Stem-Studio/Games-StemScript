@@ -1,0 +1,98 @@
+# Black Hole cupola behavior
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+config:
+  name: "BH Cupola"
+  id: "bh.cupola"
+  author: "conversion"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  priority: 0
+  description: "Optional cupola cockpit framing the view (mirrors upstream
+    Cupola.js + Spaceship.js group setup). Disabled by default in the
+    stemscript because upstream's World.js leaves the spaceship commented
+    out — uncomment one line to enable."
+  tags: [decoration, cockpit]
+  attributes:
+    cupolaTemplate:
+      name: "Cupola Model Template"
+      type: "modelAsset"
+    cupolaScale:
+      name: "Scale"
+      type: "number"
+      default: 0.1
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+  throttleConfig:
+    throttlePriority: "MEDIUM"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: false
+  documentation: Mounts cupola.glb as a cockpit frame parented to game.camera.
+code: |
+  let game;
+  const LOG_TAG = "[bh.cupola]";
+
+  this.init = function (_game) {
+    game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) {
+        console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+      }
+    };
+    this._scale = this.getAttribute("cupolaScale") ?? 0.1;
+    this._cupola = null;
+  };
+
+  this.onStart = function () {
+    const cam = game?.camera;
+    if (!cam) return;
+    const tplName = this.getAttribute("cupolaTemplate");
+    if (!tplName || !game?.scene) return;
+    const tpl = game.scene.getObjectByName(tplName);
+    if (!tpl) {
+      this._log("template not found", tplName);
+      return;
+    }
+    const clone = tpl.clone(true);
+    if (!clone) return;
+    clone.userData = clone.userData || {};
+    clone.userData.isRuntimeOnly = true;
+    clone.traverse((c) => {
+      if (c) {
+        c.userData = c.userData || {};
+        c.userData.isRuntimeOnly = true;
+        if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; }
+      }
+    });
+    clone.position.set(0, 0, 0);
+    clone.scale.set(this._scale, this._scale, this._scale);
+    cam.add(clone);
+    this._cupola = clone;
+    this._log("cupola mounted");
+  };
+
+  this.dispose = function () {
+    if (this._cupola) {
+      this._cupola.traverse((node) => {
+        if (node.geometry?.dispose) node.geometry.dispose();
+        if (node.material) {
+          const mats = Array.isArray(node.material) ? node.material : [node.material];
+          for (const m of mats) {
+            if (m.map?.dispose) m.map.dispose();
+            if (m.dispose) m.dispose();
+          }
+        }
+      });
+      if (this._cupola.parent) this._cupola.parent.remove(this._cupola);
+      this._cupola = null;
+    }
+  };
+
+  this.onEditorAdded = function (_editor) { /* viewmodel only renders in play */ };
+  this.onEditorDispose = function () { /* nothing to release */ };

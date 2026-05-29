@@ -1,0 +1,434 @@
+# StemStudio Export File
+# Do not edit manually unless you know what you're doing
+
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+  exportedAt: 2026-04-30T17:38:43.480Z
+config:
+  id: 69eb331a5b53803168c09d84
+  name: Chess Title Screen
+  description: ""
+  version: 1.0.0
+  isScript: true
+  attributes:
+    gameTitle:
+      id: 611f0e31-776b-4d1b-890f-270d1c07e15f
+      key: gameTitle
+      name: Game Title
+      type: string
+      array: false
+      default: A Stem Studio Game
+      invisible: false
+      userVisible: true
+      order: 0
+  author: ""
+  main: ""
+  tags: []
+  dependencies: {}
+  objectSettings: {}
+  documentation: "Displays UI to create and join a room. "
+code: |-
+  let game;
+  let ownerObject;
+  let multiplayerState;
+
+  let gameTitle;
+
+  const titleScreen = {
+    root: undefined,
+    main: undefined,
+    statusText: undefined,
+    roomBtnContainer: undefined,
+    joinUiContainer: undefined,
+    createRoomBtn: undefined,
+    joinRoomBtn: undefined,
+    codeInput: undefined,
+    joinByCodeBtn: undefined,
+    backBtn: undefined
+  }
+
+  const TEXT_COLOR = {
+    ERROR: 0xf34639,
+    NORMAL: 0xffffff,
+  }
+
+  let isCreatingRoom = false;
+  let isJoiningRoom = false;
+  this.init = function (_game) {
+    game = _game;
+    multiplayerState = _game.multiplayerState;
+
+    UIKitPointerEvents.initialize(game);
+    game.renderer.localClippingEnabled = true;
+    game.renderer.setTransparentSort(UIKit.reversePainterSortStable);
+
+    titleScreen.root = new UIKit.Fullscreen(game.renderer, {
+      flexDirection: 'column',
+      alignItems: 'flex-start',
+      justifyContent: 'flex-start',
+      pointerEvents: 'none',
+    });
+    game.uiCamera.add(titleScreen.root);
+    UIKitPointerEvents.registerRoot(titleScreen.root);
+
+    gameTitle = this.attributes.gameTitle;
+  }
+
+  this.onStart = function () {
+    ownerObject = this.target;
+    buildUI();
+    showLoginPopup();
+
+    this._detachLogin = this.erth.events.on("game.loginSuccess", onLoginSuccess);
+  }
+
+  this.update = function (deltaTime) {
+    if (!titleScreen.root) return;
+    UIKitPointerEvents.update(deltaTime);
+  }
+
+  function buildUI() {
+    if (!titleScreen.root || typeof UIKit === 'undefined') return;
+    const isLandscape = window.innerWidth > window.innerHeight;
+    const scale = isLandscape ? window.innerWidth / 1920 : window.innerWidth / 767;
+
+    const bg = new UIKit.Container({
+      positionType: 'absolute',
+      backgroundColor: 0x011701,
+      opacity: 0.25,
+      height: '100%',
+      width: '100%',
+    });
+    titleScreen.root.add(bg);
+
+    titleScreen.main = new UIKit.Container({
+      flexDirection: 'column',
+      alignItems: 'center',
+      gap: 16,
+      height: '100%',
+      width: '100%',
+    });
+    titleScreen.root.add(titleScreen.main);
+
+    titleScreen.main.add(new UIKit.Text({
+      text: gameTitle ?? "A Stem Studio Game",
+      fontSize: 128 * scale,
+      fontWeight: 'bold',
+      color: 0xFFFFFF,
+      textAlign: 'center',
+      width: '100%',
+      positionTop: '40%',
+    }));
+
+    titleScreen.statusText = new UIKit.Text({
+      positionType: 'absolute',
+      text: '',
+      fontSize: 16 * scale,
+      color: 0xFFFFFF,
+      textAlign: 'center',
+      width: '50%',
+      positionTop: '62%',
+    });
+
+    titleScreen.main.add(titleScreen.statusText);
+  }
+
+  function buildRoomButtons() {
+    if (!titleScreen.main) {
+      console.error("Main titlescreen not found/was not loaded properly.");
+      return;
+    }
+    const isLandscape = window.innerWidth > window.innerHeight;
+    const scale = isLandscape ? window.innerWidth / 1920 : window.innerWidth / 767;
+
+    if (titleScreen.roomBtnContainer) {
+      updateStatusText('', TEXT_COLOR.NORMAL);
+      titleScreen.main.add(titleScreen.roomBtnContainer);
+      if (titleScreen.joinUiContainer) titleScreen.main.remove(titleScreen.joinUiContainer);
+      return;
+    }
+
+    titleScreen.roomBtnContainer = new UIKit.Container({
+      positionType: 'absolute',
+      flexDirection: 'column',
+      gap: 16,
+      width: 300 * scale,
+      height: 180 * scale,
+      positionTop: '65%',
+      zIndex: 10,
+    });
+
+    titleScreen.createRoomBtn = addButton('Create Room', titleScreen.roomBtnContainer, scale, createRoom);
+    titleScreen.joinRoomBtn = addButton('Join Room', titleScreen.roomBtnContainer, scale, buildJoinRoomUi);
+
+    titleScreen.main.add(titleScreen.roomBtnContainer);
+  }
+
+  function addButton(text, mainContainer, scale, onClick = () => { }) {
+    const _button = new UIKit.Container({
+      backgroundColor: 0xffffff,
+      backgroundOpacity: 1,
+      padding: 8,
+      cursor: 'pointer',
+      pointerEvents: 'all',
+      width: '100%',
+      height: '45%',
+      borderRadius: 16,
+      borderWidth: 2,
+      borderColor: 0xc1cae0,
+      onClick: onClick,
+    });
+
+    const _text = new UIKit.Text({
+      text: text,
+      textAlign: 'center',
+      fontSize: 24 * scale,
+      fontWeight: 'bold',
+      color: 0x101010,
+      width: '100%',
+    });
+
+    _button.add(_text);
+
+    _button.addEventListener('pointerenter', () => {
+      if (isJoiningRoom || isCreatingRoom) return;
+      _button.setProperties({ backgroundColor: 0x2f3342, borderColor: 0x697185 });
+    });
+
+    _button.addEventListener('pointerleave', () => {
+      if (isJoiningRoom || isCreatingRoom) return;
+      _button.setProperties({ backgroundColor: 0xffffff, borderColor: 0xc1cae0 });
+    });
+
+    mainContainer.add(_button);
+    return _button;
+  }
+
+  function buildJoinRoomUi() {
+    if (!titleScreen.main) {
+      console.error("Main titlescreen not found/was not loaded properly.");
+      return;
+    }
+    const isLandscape = window.innerWidth > window.innerHeight;
+    const scale = isLandscape ? window.innerWidth / 1920 : window.innerWidth / 767;
+
+    titleScreen.main.remove(titleScreen.roomBtnContainer);
+    if (titleScreen.joinUiContainer) {
+      titleScreen.main.add(titleScreen.joinUiContainer);
+      return;
+    }
+
+    titleScreen.joinUiContainer = new UIKit.Container({
+      positionType: 'absolute',
+      flexDirection: 'column',
+      gap: 16,
+      width: 300 * scale,
+      height: 180 * scale,
+      positionTop: '65%',
+      zIndex: 10,
+    });
+
+    titleScreen.codeInput = new UIKit.Input({
+      width: '100%',
+      height: 64 * scale,
+      placeholder: 'Room code...',
+      placeholderColor: "#808080",
+      defaultValue: '',
+      fontSize: 32 * scale,
+      color: 'white',
+      backgroundColor: 0x2D2D2D,
+      borderRadius: 8,
+      borderWidth: 1,
+      borderColor: 0xE0E0E0,
+      paddingX: 24,
+      textAlign: 'center',
+      pointerEvents: 'all',
+      onValueChange: onInputValueChange,
+    });
+
+    titleScreen.joinUiContainer.add(titleScreen.codeInput);
+    titleScreen.joinByCodeBtn = addButton('Join By Code', titleScreen.joinUiContainer, scale, joinByCode);
+    titleScreen.backBtn = addButton('Back', titleScreen.joinUiContainer, scale, buildRoomButtons);
+    titleScreen.main.add(titleScreen.joinUiContainer);
+  }
+
+  let lastJoinCodeValue = '';
+  function onInputValueChange(value) {
+    lastJoinCodeValue = value || '';
+  }
+
+  function showLoginPopup() {
+    game.showLoginPopup();
+  }
+
+  let playerName = '';
+  function onLoginSuccess(event, data) {
+    // provider = guest | email | google | apple
+    // token = has value if you choose Google / Apple login, else it is null
+    const { isGuest, email, username, provider, token } = data;
+    playerName = username;
+    buildRoomButtons();
+    //onPlayGame();
+  }
+
+  function onPlayGame() {
+    game.behaviorManager.sendEventToObjectBehaviors(ownerObject, "enterLobby", { playerDisplayName: playerName });
+    isJoiningRoom = false;
+    isCreatingRoom = false;
+
+    if (titleScreen && titleScreen.root) {
+      removeTitleScreen();
+    }
+  }
+
+  function updateStatusText(text, textColor = 0xffffff) {
+    titleScreen.statusText.setProperties({ text: text, color: textColor });
+  }
+
+  function removeTitleScreen() {
+    if (titleScreen.root) {
+      UIKitPointerEvents.unregisterRoot(titleScreen.root);
+      if (titleScreen.root.parent) {
+        titleScreen.root.parent.remove(titleScreen.root);
+      }
+      titleScreen.root.dispose();
+      titleScreen.root = null;
+    }
+    UIKitPointerEvents.deinitialize();
+  }
+
+  this.dispose = function () {
+    if (this._detachLogin) this._detachLogin();
+    this._detachLogin = null;
+    removeTitleScreen();
+  }
+
+  this.onStop = function () {
+    if (this._detachLogin) this._detachLogin();
+    this._detachLogin = null;
+    removeTitleScreen();
+  }
+
+  //#region CREATE / JOIN ROOM
+  function createRoom() {
+    if (!multiplayerState) {
+      onPlayGame();
+      return;
+    }
+
+    updateStatusText('Creating Room...', TEXT_COLOR.NORMAL);
+    disableButton(titleScreen.createRoomBtn);
+    disableButton(titleScreen.joinRoomBtn);
+    isCreatingRoom = true;
+
+    (function run() {
+      // Delete any existing private rooms for this client so every game gets a new room.
+      multiplayerState.getPrivateRooms().then(function (rooms) {
+        if (rooms && rooms.length > 0) {
+          return Promise.all(rooms.map(function (r) {
+            return r.inviteCode ? multiplayerState.deletePrivateRoom(r.inviteCode) : Promise.resolve();
+          }));
+        }
+        return Promise.resolve();
+      }).then(function () {
+        return multiplayerState.createPrivateRoom('3DChess');
+      }).then(function (roomInfo) {
+        if (roomInfo && roomInfo.inviteCode) {
+          return multiplayerState.reconnect(roomInfo.inviteCode, false);
+        }
+        return Promise.reject(new Error('Failed to create room'));
+      }).then(function () {
+        onPlayGame();
+      }).catch(function (err) {
+        var msg = (err && err.message) ? err.message : 'Failed to create room. Please try again.';
+        if (String(msg).toLowerCase().indexOf('full') >= 0) msg = 'Room is full.';
+        updateStatusText(msg, TEXT_COLOR.ERROR);
+        console.error('[TITLE SCREEN]:', msg);
+        enableButton(titleScreen.createRoomBtn);
+        enableButton(titleScreen.joinRoomBtn);
+        isCreatingRoom = false;
+      });
+    })();
+  }
+
+  function joinByCode(self) {
+    if (!multiplayerState) {
+      updateStatusText('Multiplayer is offline', TEXT_COLOR.ERROR);
+      console.error('[TITLE SCREEN]:', 'Multiplayer is offline');
+      return;
+    }
+
+    const code = String(lastJoinCodeValue || '').trim();
+    if (!code || code.length <= 0) {
+      updateStatusText('Room code is required', TEXT_COLOR.ERROR);
+      console.error('[TITLE SCREEN]:', 'Room code is required');
+      return;
+    }
+
+    updateStatusText('Joining room...', TEXT_COLOR.NORMAL);
+    disableButton(titleScreen.joinByCodeBtn);
+    disableButton(titleScreen.backBtn);
+    disableInput(titleScreen.codeInput);
+    isJoiningRoom = true;
+
+    multiplayerState.getRoomInfo(code).then(function (roomInfo) {
+      // NOTE: roomInfo.isRunning indicates the room exists/active on the MP server,
+      // not whether the match has started. Match-start gate is enforced after connect
+      // using the shared BrawlInGame playerData (handled in lobby-controller).
+      return multiplayerState.reconnect(code, false);
+    }).then(function () {
+      onPlayGame();
+    }).catch(function (err) {
+      //hideMpLoading(self);
+      var msg = 'Failed to join room.';
+      if (err && err.message) {
+        var m = String(err.message);
+        if (m.toLowerCase().indexOf('full') >= 0 || m.indexOf('max') >= 0) msg = 'Room is full.';
+        else if (m.toLowerCase().indexOf('not found') >= 0 || m.toLowerCase().indexOf('invalid') >= 0) msg = 'Invalid or expired code.';
+      }
+      updateStatusText(msg, TEXT_COLOR.ERROR);
+      console.error('[TITLE SCREEN]:', msg);
+      enableButton(titleScreen.joinByCodeBtn);
+      enableButton(titleScreen.backBtn);
+      enableInput(titleScreen.codeInput);
+      isJoiningRoom = false;
+    });
+  }
+  //#endregion
+
+  //#region TOGGLE UI Interactables
+  function enableButton(button) {
+    button.setProperties({
+      pointerEvents: 'all',
+      backgroundColor: 0xffffff,
+      borderColor: 0xc1cae0,
+    });
+  }
+
+  function disableButton(button) {
+    button.setProperties({
+      pointerEvents: 'none',
+      backgroundColor: 0x2f3342,
+      borderColor: 0x697185,
+    });
+  }
+
+  function enableInput(input) {
+    input.setProperties({
+      pointerEvents: 'all',
+      backgroundColor: 0x2D2D2D,
+      borderColor: 0xE0E0E0,
+    });
+  }
+
+  function disableInput(input) {
+    input.setProperties({
+      pointerEvents: 'all',
+      backgroundColor: 0x1d1b27,
+      borderColor: 0x303030,
+    });
+  }
+
+  //#endregion

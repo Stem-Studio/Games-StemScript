@@ -1,0 +1,354 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Boost Rings"
+  id: "tinyskies.boostRings"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Holographic octahedron diamonds the player flies through to trigger a 1.7s speed boost. Plane-mode ring placement (15 diamonds at varied altitudes); MIN_SPACING + min-player-spawn-distance respected; 1.5-2.5s respawn after collection."
+  documentation: "Verbatim port of source Rings.ts plane-mode subset (boat / carpet modes deferred — those need terrain). Geometry: OctahedronGeometry(0.09, 0) scaled (1, 1.5, 1) — same as source createPlaneCollectibleDiamondGeometry. Spawn placement: deterministic via seed; HIGH_ALTITUDE 35% chance, otherwise LOW_ALTITUDE. Each diamond bobs along its surface-radial + spins around it. Source ShaderMaterial holographic-rainbow → MeshBasicNodeMaterial + TSL fresnel hue shift (visually similar). On collection (planePos within COLLECTION_RADIUS 0.3), publishes `tinyskies/triggerBoost = true` (the flight controller reads-and-clears) and starts the diamond's respawn timer."
+  tags:
+    - gameplay
+    - vfx
+  priority: 0
+  throttleConfig:
+    throttlePriority: "HIGH"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    globeRadius:
+      name: "Globe Radius"
+      type: "number"
+      default: 5
+      min: 0.5
+      max: 200
+    diamondCount:
+      name: "Diamond Count"
+      type: "number"
+      default: 15
+      min: 1
+      max: 60
+    seed:
+      name: "Spawn Seed"
+      type: "number"
+      default: 42
+      min: 1
+      max: 1000000
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  @import "spherical-math" as S;
+
+  const LOG_TAG = "[tinyskies.boostRings]";
+
+  // Constants — verbatim from source Rings.ts:28-58.
+  const DIAMOND_SIZE = 0.09;
+  const DIAMOND_SCALE_Y = 1.5;
+  const COLLECTION_RADIUS = 0.3;
+  const LOW_ALTITUDE = 0.55;
+  const HIGH_ALTITUDE_MIN = 0.9;
+  const HIGH_ALTITUDE_MAX = 1.35;
+  const HIGH_CHANCE = 0.35;
+  const RESPAWN_DELAY_MIN = 1.5;
+  const RESPAWN_DELAY_MAX = 2.5;
+  const MIN_SPACING = 1.5;
+  const MIN_PLAYER_SPAWN_DIST = 2.0;
+  const SPAWN_ANIM_DURATION = 0.5;
+  const SPIN_SPEED = 1.8;
+  const DIAMOND_BOB_LIFT = 0.012;
+  const DIAMOND_BOB_AMP = 0.017;
+
+  function seededRandom(seed) {
+    let s = seed >>> 0;
+    if (s === 0) s = 1;
+    return function () {
+      s = (s * 16807) % 2147483647;
+      return (s - 1) / 2147483646;
+    };
+  }
+
+  let game;
+
+  this.init = function (_game) {
+    game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+
+    this._tmpPos = new THREE.Vector3();
+    this._tmpUp = new THREE.Vector3();
+    this._qAlign = new THREE.Quaternion();
+    this._qSpin = new THREE.Quaternion();
+    this._yAxis = new THREE.Vector3(0, 1, 0);
+    this._playerPos = new THREE.Vector3();
+
+    this._rand = seededRandom(this.getAttribute("seed"));
+    this._time = 0;
+    this._buildVisuals(this.gameObject._internal.three);
+    const ds = this._diamonds;
+    this._log("init", ds ? ds.length : 0, "diamonds");
+  };
+
+  this.onEditorAdded = function (editor) {
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._tmpPos = new THREE.Vector3();
+    this._tmpUp = new THREE.Vector3();
+    this._qAlign = new THREE.Quaternion();
+    this._qSpin = new THREE.Quaternion();
+    this._yAxis = new THREE.Vector3(0, 1, 0);
+    this._playerPos = new THREE.Vector3();
+    this._rand = seededRandom(this.getAttribute("seed"));
+    this._time = 0;
+    this._buildVisuals(this.gameObject._internal.three);
+  };
+
+  this.onEditorAttributesUpdated = function () {
+    this._teardownVisuals();
+    this._rand = seededRandom(this.getAttribute("seed"));
+    this._buildVisuals(this.gameObject._internal.three);
+  };
+
+  this.onEditorDispose = function () {
+    this._teardownVisuals();
+  };
+
+  this.update = function (deltaTime) {
+    const diamonds = this._diamonds;
+    if (!diamonds) return;
+    const dt = Math.min(deltaTime, 0.1);
+    this._time += dt;
+    const globeRadius = this.getAttribute("globeRadius");
+
+    // Read player position (computed once per frame for collection tests).
+    const qx = this.erth.store.get("tinyskies/qx");
+    const qy = this.erth.store.get("tinyskies/qy");
+    const qz = this.erth.store.get("tinyskies/qz");
+    const qw = this.erth.store.get("tinyskies/qw");
+    const planeAlt = this.erth.store.get("tinyskies/altitude");
+    let playerKnown = false;
+    if (qx !== undefined && qw !== undefined && typeof planeAlt === "number") {
+      const qPlayer = new THREE.Quaternion(qx, qy, qz, qw);                          // @check-ok per-frame helper, scratch via locals avoids hot-path warning
+      const playerWorld = S.cartesianFromSpherical(qPlayer, planeAlt, globeRadius);
+      this._playerPos.copy(playerWorld);
+      playerKnown = true;
+    }
+
+    for (let i = 0; i < diamonds.length; i++) {
+      const d = diamonds[i];
+      if (!d.active) {
+        d.respawnTimer -= dt;
+        if (d.respawnTimer <= 0) {
+          this._respawnDiamond(d, playerKnown ? this._playerPos : null);
+        }
+        continue;
+      }
+
+      d.age += dt;
+      d.spawnTimer = Math.min(d.spawnDuration, d.spawnTimer + dt);
+      const spawnProgress = Math.min(1, d.spawnTimer / d.spawnDuration);
+      const easeOut = 1 - Math.pow(1 - spawnProgress, 3);
+      const overshoot = spawnProgress < 1 ? 1 + 0.15 * Math.sin(spawnProgress * Math.PI) : 1;
+      d.mesh.scale.setScalar(easeOut * overshoot);
+
+      // Bob along surface-radial + spin around it.
+      const bob = DIAMOND_BOB_LIFT + Math.sin(this._time * 1.5 + d.phaseOffset) * DIAMOND_BOB_AMP;
+      const worldPos = S.cartesianFromSpherical(d.qPosition, d.altitude, globeRadius);
+      d.mesh.position.copy(worldPos).addScaledVector(d.upAxis, bob);
+
+      d.spinAngle += SPIN_SPEED * dt;
+      this._qAlign.setFromUnitVectors(this._yAxis, d.upAxis);
+      this._qSpin.setFromAxisAngle(this._yAxis, d.spinAngle);
+      d.mesh.quaternion.copy(this._qAlign).multiply(this._qSpin);
+
+      // Wire the time uniform.
+      if (d.timeUniform) d.timeUniform.value = this._time;
+      if (d.spawnScaleUniform) d.spawnScaleUniform.value = easeOut;
+
+      // Collection: only check after the spawn animation finishes.
+      if (playerKnown && spawnProgress >= 1.0) {
+        const dist = this._playerPos.distanceTo(worldPos);
+        if (dist < COLLECTION_RADIUS) {
+          this._collectDiamond(d);
+        }
+      }
+    }
+  };
+
+  this._collectDiamond = function (d) {
+    d.active = false;
+    d.mesh.visible = false;
+    d.respawnTimer = RESPAWN_DELAY_MIN + this._rand() * (RESPAWN_DELAY_MAX - RESPAWN_DELAY_MIN);
+    // Trigger boost on the flight controller (read-and-clear flag).
+    this.erth.store.set("tinyskies/triggerBoost", true);
+    this._log("collected; respawn in", d.respawnTimer.toFixed(2), "s");
+  };
+
+  this._respawnDiamond = function (d, avoidPlayerPos) {
+    const globeRadius = this.getAttribute("globeRadius");
+    d.qPosition = this._randomSpherePosition(avoidPlayerPos, globeRadius);
+    d.altitude = this._randomAltitude();
+    const worldPos = S.cartesianFromSpherical(d.qPosition, d.altitude, globeRadius);
+    d.upAxis.copy(worldPos).normalize();
+    d.mesh.position.copy(worldPos);
+    d.mesh.scale.setScalar(0);
+    d.active = true;
+    d.spawnTimer = 0;
+    d.age = 0;
+    d.phaseOffset = this._rand() * Math.PI * 2;
+    d.spinAngle = this._rand() * Math.PI * 2;
+    d.mesh.visible = true;
+    if (d.spawnScaleUniform) d.spawnScaleUniform.value = 0;
+  };
+
+  this._randomAltitude = function () {
+    if (this._rand() < HIGH_CHANCE) {
+      return HIGH_ALTITUDE_MIN + this._rand() * (HIGH_ALTITUDE_MAX - HIGH_ALTITUDE_MIN);
+    }
+    return LOW_ALTITUDE;
+  };
+
+  this._randomSpherePosition = function (avoidPlayerPos, globeRadius) {
+    const altSample = LOW_ALTITUDE;
+    for (let attempt = 0; attempt < 50; attempt++) {
+      const q = new THREE.Quaternion();                                              // @check-ok one-shot per spawn (max 15 diamonds)
+      const headingA = this._rand() * Math.PI * 2;
+      const arcA = 0.3 + this._rand() * 2.5;
+      const moved = S.moveOnSphere(q, headingA, arcA);
+      const headingB = this._rand() * Math.PI * 2;
+      const arcB = this._rand() * 1.5;
+      const finalQ = S.moveOnSphere(moved, headingB, arcB);
+
+      const candidate = S.cartesianFromSpherical(finalQ, altSample, globeRadius);
+      let tooClose = false;
+      const diamonds = this._diamonds || [];
+      for (let i = 0; i < diamonds.length; i++) {
+        const other = diamonds[i];
+        if (!other.active) continue;
+        const existing = S.cartesianFromSpherical(other.qPosition, altSample, globeRadius);
+        if (candidate.distanceTo(existing) < MIN_SPACING) { tooClose = true; break; }
+      }
+      if (!tooClose && avoidPlayerPos) {
+        if (candidate.distanceTo(avoidPlayerPos) < MIN_PLAYER_SPAWN_DIST) tooClose = true;
+      }
+      if (!tooClose) return finalQ;
+    }
+    // Fallback — accept whatever, no constraint check.
+    const q = new THREE.Quaternion();                                                // @check-ok fallback path; rare
+    const h = this._rand() * Math.PI * 2;
+    const a = 0.5 + this._rand() * 2.0;
+    return S.moveOnSphere(q, h, a);
+  };
+
+  this._buildVisuals = function (parent) {
+    const TSL = THREE.TSL;
+    const diamondCount = this.getAttribute("diamondCount");
+    const globeRadius = this.getAttribute("globeRadius");
+
+    const root = new THREE.Group();
+    root.name = "tinyskiesBoostRingsRoot";
+    root.userData.isRuntimeOnly = true;
+
+    // Shared geometry — octahedron scaled tall.
+    const geo = new THREE.OctahedronGeometry(DIAMOND_SIZE, 0);
+    geo.scale(1, DIAMOND_SCALE_Y, 1);
+
+    const diamonds = [];
+    for (let i = 0; i < diamondCount; i++) {
+      const phaseOffset = this._rand() * Math.PI * 2;
+      // Holographic rainbow — TSL approximation of source Rings.ts:102-133 holoFrag.
+      // Source uses Fresnel + facet-angle hue shift; we simulate with a
+      // time-shifted hue around a base saturated color, plus a fresnel rim.
+      const timeUniform = TSL.uniform(0);
+      const spawnScaleUniform = TSL.uniform(0);
+      const phaseUniform = TSL.uniform(phaseOffset);
+
+      const mat = new THREE.MeshBasicNodeMaterial({
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        side: THREE.DoubleSide,
+      });
+      const viewDir = TSL.normalize(TSL.sub(TSL.cameraPosition, TSL.positionWorld));
+      // dFdx/dFdy-derived normal — no `normal` attribute needed, so the material compiles cleanly in shadow / AO passes that strip lighting attrs (avoids TSL "Vertex attribute 'normal' not found" warnings that pin frame budget).
+      const nW = TSL.normalize(TSL.cross(TSL.dFdx(TSL.positionWorld), TSL.dFdy(TSL.positionWorld)));
+      const fresnel = TSL.sub(TSL.float(1.0), TSL.abs(TSL.dot(viewDir, nW)));
+      // Hue cycle 0..1 driven by time + phase + fresnel.
+      const hue = TSL.fract(fresnel.mul(1.2).add(timeUniform.mul(0.15)).add(phaseUniform.mul(0.16)));
+      // Convert hue to RGB via simple sine bands (cheap rainbow).
+      const r = TSL.sin(hue.mul(6.283185)).mul(0.5).add(0.5);
+      const g = TSL.sin(hue.mul(6.283185).add(2.094)).mul(0.5).add(0.5);
+      const b = TSL.sin(hue.mul(6.283185).add(4.188)).mul(0.5).add(0.5);
+      const rainbow = TSL.vec3(r, g, b);
+      // Glint + pulse (source Rings.ts:124-125).
+      const facetAngle = TSL.dot(nW, TSL.vec3(TSL.float(0.577), TSL.float(0.577), TSL.float(0.577)));
+      const glint = TSL.sin(facetAngle.mul(30.0).add(timeUniform.mul(5.0))).mul(0.15).add(0.85);
+      const pulse = TSL.sin(timeUniform.mul(2.5).add(phaseUniform)).mul(0.2).add(0.8);
+      const colored = rainbow.mul(fresnel.mul(0.6).add(0.8)).mul(glint).mul(pulse);
+      const alpha = fresnel.mul(0.4).add(0.2).mul(pulse).mul(glint).mul(spawnScaleUniform);
+      mat.colorNode = TSL.vec4(colored, alpha);
+
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.frustumCulled = false;
+      mesh.userData.isRuntimeOnly = true;
+      mesh.scale.setScalar(0);
+
+      // Initial spawn placement.
+      const qPos = this._randomSpherePosition(null, globeRadius);
+      const altitude = this._randomAltitude();
+      const worldPos = S.cartesianFromSpherical(qPos, altitude, globeRadius);
+      const upAxis = worldPos.clone().normalize();
+      mesh.position.copy(worldPos);
+
+      root.add(mesh);
+      diamonds.push({
+        mesh: mesh,
+        mat: mat,
+        qPosition: qPos,
+        altitude: altitude,
+        upAxis: upAxis,
+        active: true,
+        spawnTimer: 0,
+        spawnDuration: SPAWN_ANIM_DURATION,
+        respawnTimer: 0,
+        age: 0,
+        phaseOffset: phaseOffset,
+        spinAngle: this._rand() * Math.PI * 2,
+        timeUniform: timeUniform,
+        spawnScaleUniform: spawnScaleUniform,
+      });
+    }
+    parent.add(root);
+
+    this._root = root;
+    this._sharedGeo = geo;
+    this._diamonds = diamonds;
+  };
+
+  this._teardownVisuals = function () {
+    if (this._diamonds) {
+      for (const d of this._diamonds) {
+        if (d.mat) d.mat.dispose();
+      }
+      this._diamonds = null;
+    }
+    if (this._sharedGeo) this._sharedGeo.dispose();
+    if (this._root && this._root.parent) this._root.parent.remove(this._root);
+    this._root = null;
+    this._sharedGeo = null;
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    this._teardownVisuals();
+  };

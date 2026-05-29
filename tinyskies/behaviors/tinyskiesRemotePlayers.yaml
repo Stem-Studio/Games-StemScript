@@ -1,0 +1,209 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Remote Players"
+  id: "tinyskies.remotePlayers"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "State-sync skeleton (capped Batch G — no flag mode, no paintball relay, no name labels). Each remote player gets a phantom biplane that mirrors their published spherical state."
+  documentation: "Source ships full multiplayer with paintball relay + hot-potato flag + remote-player name labels + carry-flag visibility + custom hull color sync. The capped MVP ships only state sync: the local flightController publishes our spherical pose at 10 Hz via `game.multiplayerState.setPlayerData('ts/p', json)`; on the receiving side, this behavior listens for player join/leave/data-change events and renders a phantom biplane (different color) for each remote player. Snap-to-latest pose update (no interp). Requires `game settings isMultiplayer=true` in the stemscript."
+  tags:
+    - multiplayer
+  priority: 0
+  throttleConfig:
+    throttlePriority: "HIGH"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    publishHz:
+      name: "State Publish Rate (Hz)"
+      type: "number"
+      default: 10
+      min: 1
+      max: 60
+    remoteHullColor:
+      name: "Remote Plane Hull Color"
+      type: "color"
+      default: "#3388ff"
+    globeRadius:
+      name: "Globe Radius (match flightController)"
+      type: "number"
+      default: 5
+      min: 0.5
+      max: 200
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  @import "spherical-math" as S;
+  @import "biplane-mesh" as B;
+
+  const LOG_TAG = "[tinyskies.remotePlayers]";
+  const STATE_KEY = "ts/p";  // short key — keep payloads small
+
+  let game;
+
+  this.init = function (_game) {
+    game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+
+    this._mp = game.multiplayerState || null;
+    if (!this._mp) {
+      this._log("init — single-player mode (no multiplayerState available); behavior idle");
+      return;
+    }
+
+    this._remotes = new Map(); // sessionId → { group, mesh, qPos }
+    this._tmpQ = new THREE.Quaternion();
+    this._publishTimer = 0;
+
+    // Player join.
+    this._addedToken = this._mp.addOnPlayerAddedListener((player) => {
+      this._handlePlayerAdded(player);
+    });
+    // Player leave.
+    this._removedToken = this._mp.addOnPlayerRemovedListener((player) => {
+      this._handlePlayerRemoved(player);
+    });
+    // Player data change (state arrives here).
+    this._dataToken = this._mp.addOnPlayerDataChangedListener((player, key) => {
+      if (key !== STATE_KEY) return;
+      const remote = this._remotes.get(player.sessionId);
+      if (!remote) return;
+      const json = player.data.get(STATE_KEY);
+      if (!json) return;
+      try {
+        const state = JSON.parse(json);
+        this._applyRemoteState(remote, state);
+      } catch (e) {
+        // Silent — malformed payload is a remote bug, not ours.
+      }
+    });
+
+    // Seed: any players already in the room.
+    const existing = this._mp.getPlayers();
+    if (existing && typeof existing.forEach === "function") {
+      existing.forEach((p) => {
+        if (p.sessionId === this._mp.getSlot?.()) return; // skip self if API exposes slot
+        this._handlePlayerAdded(p);
+      });
+    }
+
+    this._log("init — multiplayer ready");
+  };
+
+  this.update = function (deltaTime) {
+    if (!this._mp) return;
+    const dt = Math.min(deltaTime, 0.1);
+    const period = 1.0 / Math.max(1, this.getAttribute("publishHz"));
+    this._publishTimer += dt;
+    if (this._publishTimer < period) return;
+    this._publishTimer = 0;
+
+    // Serialize the local player's spherical state.
+    const store = this.erth.store;
+    const qx = store.get("tinyskies/qx");
+    const qw = store.get("tinyskies/qw");
+    if (qx === undefined || qw === undefined) return;
+    const payload = {
+      qx: qx,
+      qy: store.get("tinyskies/qy") || 0,
+      qz: store.get("tinyskies/qz") || 0,
+      qw: qw,
+      h: store.get("tinyskies/heading") || 0,
+      p: store.get("tinyskies/pitch") || 0,
+      a: store.get("tinyskies/altitude") || 0,
+    };
+    this._mp.setPlayerData(STATE_KEY, JSON.stringify(payload));
+  };
+
+  this._handlePlayerAdded = function (player) {
+    if (!player || !player.sessionId) return;
+    if (this._remotes.has(player.sessionId)) return;
+    const colorAttr = this.getAttribute("remoteHullColor");
+    const colorHex = (typeof colorAttr === "string")
+      ? new THREE.Color(colorAttr).getHex()
+      : colorAttr;
+    // No editor preview by design — remote phantom planes only exist when MP
+    // session is active. Per CLAUDE.md memory feedback_no_empty_editor_stubs.md.
+    const mesh = B.createBiplane(colorHex);                                          // @check-ok runtime-only remote player visual
+    mesh.name = "RemotePlane_" + player.sessionId;
+    mesh.matrixAutoUpdate = false;
+    mesh.userData.isRuntimeOnly = true;
+    mesh.traverse((c) => { c.userData.isRuntimeOnly = true; });
+    // Parent to behavior's own gameObject (sits at scene origin) — visual-only
+    // children pattern from CLAUDE.md.
+    this.gameObject._internal.three.add(mesh);
+    this._remotes.set(player.sessionId, { mesh: mesh, qPos: new THREE.Quaternion() });
+    this._log("remote joined:", player.sessionId);
+  };
+
+  this._handlePlayerRemoved = function (player) {
+    if (!player || !player.sessionId) return;
+    const remote = this._remotes.get(player.sessionId);
+    if (!remote) return;
+    if (remote.mesh) {
+      remote.mesh.traverse((c) => {
+        if (c.geometry && c.geometry.dispose) c.geometry.dispose();
+        if (c.material) {
+          if (Array.isArray(c.material)) {
+            for (const m of c.material) if (m && m.dispose) m.dispose();
+          } else if (c.material.dispose) c.material.dispose();
+        }
+      });
+      if (remote.mesh.parent) remote.mesh.parent.remove(remote.mesh);
+    }
+    this._remotes.delete(player.sessionId);
+    this._log("remote left:", player.sessionId);
+  };
+
+  this._applyRemoteState = function (remote, state) {
+    if (!remote || !remote.mesh || !state) return;
+    remote.qPos.set(state.qx, state.qy, state.qz, state.qw);
+    const m = S.buildPlaneMatrix(
+      remote.qPos,
+      state.h || 0,
+      state.p || 0,
+      0,
+      state.a || 0,
+      this.getAttribute("globeRadius"),
+    );
+    remote.mesh.matrix.copy(m);
+    remote.mesh.matrixWorldNeedsUpdate = true;
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    if (this._mp) {
+      if (this._addedToken && this._mp.removeOnPlayerAddedListener) this._mp.removeOnPlayerAddedListener(this._addedToken);
+      if (this._removedToken && this._mp.removeOnPlayerRemovedListener) this._mp.removeOnPlayerRemovedListener(this._removedToken);
+      if (this._dataToken && this._mp.removeOnPlayerDataChangedListener) this._mp.removeOnPlayerDataChangedListener(this._dataToken);
+    }
+    if (this._remotes) {
+      this._remotes.forEach((remote) => {
+        if (remote.mesh) {
+          remote.mesh.traverse((c) => {
+            if (c.geometry && c.geometry.dispose) c.geometry.dispose();
+            if (c.material) {
+              if (Array.isArray(c.material)) {
+                for (const m of c.material) if (m && m.dispose) m.dispose();
+              } else if (c.material.dispose) c.material.dispose();
+            }
+          });
+          if (remote.mesh.parent) remote.mesh.parent.remove(remote.mesh);
+        }
+      });
+      this._remotes.clear();
+    }
+    this._mp = null;
+  };

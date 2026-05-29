@@ -1,0 +1,394 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Flight Controller"
+  id: "tinyskies.flightController"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Quaternion-based plane physics on a globe. Verbatim port of source Plane.ts.update() (REQ-003..REQ-006), MVP-pruned of gremlin/boost/HP fields."
+  documentation: "Reads keyboard (A/D yaw, W forward, S brake, ArrowUp climb, Space paintball) and integrates the source's exact spherical-flight state (qPosition, heading, pitch, bankAngle, speed, altitude). Writes the buildPlaneMatrix(...) result directly to gameObject._internal.three.matrix each frame (matrixAutoUpdate=false set by tinyskiesBiplaneVisual). Spins the propeller surfaced via parent.userData.tinyskiesPropeller. Publishes state to this.erth.store under 'tinyskies/*' keys for the camera rig and paintball system."
+  tags:
+    - gameplay
+    - controller
+  priority: 0
+  throttleConfig:
+    throttlePriority: "CRITICAL"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    spawnSeed:
+      name: "Spawn Seed"
+      type: "number"
+      default: 42
+      min: 1
+      max: 1000000
+    spawnSalt:
+      name: "Spawn Salt"
+      type: "number"
+      default: 1
+      min: 0
+      max: 1000000
+    globeRadius:
+      name: "Globe Radius"
+      type: "number"
+      default: 5
+      min: 0.5
+      max: 200
+    terrainSeed:
+      name: "Terrain Seed (match globeVisual)"
+      type: "number"
+      default: 42
+      min: 1
+      max: 1000000
+    terrainType:
+      name: "Terrain Type (match globeVisual)"
+      type: "string"
+      default: "default"
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  @import "spherical-math" as S;
+  @import "terrain" as T;
+
+  const LOG_TAG = "[tinyskies.flightController]";
+
+  // Tuning constants — verbatim from source Plane.ts:22-63 (REQ-003..REQ-006).
+  const BRAKE_DECEL = 3.0;
+  const ACCEL = 2.5;
+  const MIN_SPEED = 0.3;
+  const MAX_SPEED = 0.8;
+  const BOOST_SPEED = 1.3;
+  const ABSOLUTE_MAX_SPEED = 2.0;
+  const ALTITUDE = 0.55;
+  const HIGH_ALTITUDE = 1.35;
+  const LOW_HOVER_HEIGHT = 0.08;
+  const ALTITUDE_SPEED = 0.75;
+  const MAX_BANK = Math.PI / 4;
+  const BANK_RESPONSIVENESS = 4;
+  const TURN_INPUT_SMOOTH = 8;
+  const ELEVATE_INPUT_SMOOTH = 6;
+  const CRUISE_SPEED_RATIO_MAX = 0.167;
+  const TURN_SPEED = 1.2;              // FlightControls.ts:1
+
+  // Batch B — boost / slow / wobble (source Plane.ts:29-37, 106-114, 322-331).
+  const BOOST_DURATION_SEC = 1.7;
+  const BOOST_BARREL_ROLL_TURNS = 1.0;
+  const GREMLIN_SLOW_DURATION_SEC = 1.35;
+  const GREMLIN_SLOW_MULT = 0.58;
+  const PAINTBALL_WOBBLE_INITIAL = 0.42;
+  const PAINTBALL_WOBBLE_FREQ = 19;
+  const PAINTBALL_WOBBLE_DECAY = 4.2;
+  const PLAYER_HP_MAX = 14;            // Plane.ts:40 (max-HP scale 1.0)
+
+  let game;
+
+  this.init = function (_game) {
+    game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+
+    // Pre-allocated per CLAUDE.md hot-path rule (no allocations in update()).
+    this._qPosition = new THREE.Quaternion();
+    this._planeMatrix = new THREE.Matrix4();
+    this._tmpUp = new THREE.Vector3();
+
+    // Plane state (mirrors source Plane.ts fields).
+    this._heading = 0;
+    this._pitch = 0;
+    this._bankAngle = 0;
+    this._speed = 0;
+    this._altitude = ALTITUDE;
+    this._prevAltitude = ALTITUDE;
+    this._turnInputSmoothed = 0;
+    this._elevateBlend = 0;
+
+    // Batch B — boost + slow + wobble + HP state.
+    this._boostTimer = 0;
+    this._rollAngle = 0;
+    this._gremlinSlowTimer = 0;
+    this._wobbleAmp = 0;
+    this._wobblePhase = 0;
+    this._wobbleBank = 0;
+    this._playerHp = PLAYER_HP_MAX;
+
+    // Spawn — REQ-016. Mirrors source Plane.ts:127-137 + randomSpawnQuaternionAndHeading().
+    const seed = this.getAttribute("spawnSeed") + this.getAttribute("spawnSalt");
+    const spawn = S.randomSpawnQuaternionAndHeading(seed);
+    this._qPosition.copy(spawn.qPosition);
+    this._heading = spawn.heading;
+
+    // Input — InputManager defaults; key remap documented in
+    // tinyskies-fidelity-decision-record.md FDR-002.
+    //   yaw    = -motion("lateral") * TURN_SPEED   (A=+TURN_SPEED, D=−TURN_SPEED to match source)
+    //   thrust = motion("forward") > 0
+    //   brake  = motion("forward") < 0
+    //   climb  = action("run")     (Shift)         (was ArrowUp in source)
+    //   descend= action("crouch")  (Ctrl)          (new — source had no descend key)
+    //   fire   = action("jump") edge-detected      (Space)
+    this._im = game.inputManager || null;
+    this._fireHeldPrev = false;
+    this._paintballQueued = false;
+
+    // Apply the spawn matrix immediately so the editor preview / first frame
+    // sees the plane at the spawn pose, not at origin.
+    this._applyPlaneMatrix();
+    // Publish initial state so dependents (camera rig, paintball) see the spawn
+    // pose on their first update() instead of zero-defaults.
+    this._publishState(false);
+    this._log("init heading=", this._heading.toFixed(3), "alt=", this._altitude.toFixed(3));
+  };
+
+  this.update = function (deltaTime) {
+    const dt = Math.min(deltaTime, 0.1);
+    const globeRadius = this.getAttribute("globeRadius");
+
+    // ── Read input via InputManager (FDR-002) ──
+    const im = this._im;
+    const lateral = im ? im.getMotion("lateral") : 0;     // A=−1, D=+1
+    const fwdAxis = im ? im.getMotion("forward") : 0;     // W=+1, S=−1
+    const climbHeld = im ? !!im.getAction("run") : false;
+    const descendHeld = im ? !!im.getAction("crouch") : false;
+    const fireHeld = im ? !!im.getAction("jump") : false;
+
+    if (fireHeld && !this._fireHeldPrev) this._paintballQueued = true;
+    this._fireHeldPrev = fireHeld;
+    const paintballPressed = this._paintballQueued;
+    this._paintballQueued = false;
+
+    // Mirror source FlightControls.ts semantics: A → +TURN_SPEED (left), D → −TURN_SPEED (right).
+    const turnRate = -lateral * TURN_SPEED;
+    const forward = fwdAxis > 0.5;
+    const brake = fwdAxis < -0.5;
+    const elevate = climbHeld;
+    const descend = descendHeld;
+
+    // ── Drain Batch B store-signaled events (one-shots; read-and-clear) ──
+    const store = this.erth.store;
+
+    // Teleport — consumed once. Snaps player quaternion / heading /
+    // altitude / speed in a single frame. Used by carpet portal system.
+    const teleportTo = store.get("tinyskies/teleportTo");
+    if (teleportTo && typeof teleportTo === "object") {
+      store.set("tinyskies/teleportTo", null);
+      if (typeof teleportTo.qx === "number") this._qPosition.set(teleportTo.qx, teleportTo.qy, teleportTo.qz, teleportTo.qw);
+      if (typeof teleportTo.heading === "number") this._heading = teleportTo.heading;
+      if (typeof teleportTo.altitude === "number") {
+        this._altitude = teleportTo.altitude;
+        this._prevAltitude = teleportTo.altitude;
+      }
+      if (typeof teleportTo.speed === "number") this._speed = teleportTo.speed;
+    }
+
+    if (store.get("tinyskies/triggerBoost") === true) {
+      store.set("tinyskies/triggerBoost", false);
+      this._boostTimer = BOOST_DURATION_SEC;
+      this._speed = BOOST_SPEED;
+      this._rollAngle = 0;
+    }
+    if (store.get("tinyskies/applyGremlinSlow") === true) {
+      store.set("tinyskies/applyGremlinSlow", false);
+      this._gremlinSlowTimer = GREMLIN_SLOW_DURATION_SEC;
+      this._speed = Math.max(MIN_SPEED, this._speed * GREMLIN_SLOW_MULT);
+    }
+    const damage = store.get("tinyskies/applyGremlinDamage");
+    if (typeof damage === "number" && damage > 0) {
+      store.set("tinyskies/applyGremlinDamage", 0);
+      this._playerHp = Math.max(0, this._playerHp - damage);
+    }
+    const heal = store.get("tinyskies/applyHeartHeal");
+    if (typeof heal === "number" && heal > 0) {
+      store.set("tinyskies/applyHeartHeal", 0);
+      this._playerHp = Math.min(PLAYER_HP_MAX, this._playerHp + heal);
+    }
+    if (store.get("tinyskies/applyPaintballWobble") === true) {
+      store.set("tinyskies/applyPaintballWobble", false);
+      this._wobbleAmp = PAINTBALL_WOBBLE_INITIAL;
+      this._wobblePhase = 0;
+    }
+
+    // Decrement the timers.
+    if (this._boostTimer > 0) this._boostTimer = Math.max(0, this._boostTimer - dt);
+    if (this._gremlinSlowTimer > 0) this._gremlinSlowTimer = Math.max(0, this._gremlinSlowTimer - dt);
+    const slowMult = this._gremlinSlowTimer > 0 ? GREMLIN_SLOW_MULT : 1;
+
+    // ── Speed envelope (Plane.ts:240-261) — boost overrides during boostTimer ──
+    if (this._boostTimer > 0) {
+      this._speed = BOOST_SPEED;
+      this._rollAngle += ((Math.PI * 2 * BOOST_BARREL_ROLL_TURNS) / Math.max(BOOST_DURATION_SEC, 0.08)) * dt;
+    } else {
+      this._rollAngle = 0;
+      const effMaxSpeed = MAX_SPEED * slowMult;
+      const effAccel = ACCEL * slowMult;
+      const effBrakeDecel = BRAKE_DECEL;
+      if (forward) {
+        if (this._speed < effMaxSpeed) {
+          this._speed = Math.min(effMaxSpeed, this._speed + effAccel * dt);
+        } else {
+          this._speed = Math.max(effMaxSpeed, this._speed - 0.13 * dt);
+        }
+      } else if (brake) {
+        this._speed = Math.max(MIN_SPEED, this._speed - effBrakeDecel * dt);
+      } else {
+        this._speed = Math.max(MIN_SPEED, this._speed - 0.3 * dt);
+      }
+    }
+
+    // ── Smoothed yaw input (Plane.ts:253) ──
+    this._turnInputSmoothed +=
+      (turnRate - this._turnInputSmoothed) * (1 - Math.exp(-TURN_INPUT_SMOOTH * dt));
+
+    // Turn-drag (Plane.ts:255-261).
+    const turnStrength = Math.abs(this._turnInputSmoothed);
+    if (turnStrength > 0.1) {
+      this._speed = Math.max(MIN_SPEED, this._speed - turnStrength * 0.8 * dt);
+    }
+
+    // ── Heading integration (Plane.ts:263-264) ──
+    this._heading += this._turnInputSmoothed * dt;
+    const TWO_PI = Math.PI * 2;
+    this._heading = ((this._heading % TWO_PI) + TWO_PI) % TWO_PI;
+
+    // ── Altitude blend (Plane.ts:266-282), per-vehicle (Batch D) ──
+    // plane: full ALTITUDE / HIGH_ALTITUDE envelope.
+    // boat:  surface-locked at LOW_HOVER_HEIGHT above water; climb input ignored.
+    // carpet: like plane but lower max altitude.
+    const vehicleType = store.get("tinyskies/vehicleType") || "plane";
+    const isBoat = vehicleType === "boat";
+    const isCarpet = vehicleType === "carpet";
+    const cruiseAlt = isBoat ? 0.05 : ALTITUDE;
+    const climbAlt = isBoat ? 0.05 : (isCarpet ? 1.0 : HIGH_ALTITUDE);
+
+    const elevateTarget = isBoat ? 0 : (elevate ? 1 : descend ? -1 : 0);
+    this._elevateBlend +=
+      (elevateTarget - this._elevateBlend) * (1 - Math.exp(-ELEVATE_INPUT_SMOOTH * dt));
+
+    // Terrain-aware hover floor — sample terrain at the player's current
+    // surface-radial direction. Mountains push the plane up; ocean stays at 0.
+    // Compute up vector from quaternion: up = Y rotated by qPosition.
+    this._tmpUp.set(0, 1, 0).applyQuaternion(this._qPosition).normalize();
+    const surfaceAlt = T.surfaceAltitudeAt(
+      this.getAttribute("terrainSeed"),
+      this.getAttribute("terrainType"),
+      this._tmpUp.x, this._tmpUp.y, this._tmpUp.z,
+    );
+    const lowAlt = surfaceAlt + LOW_HOVER_HEIGHT;
+    let targetAlt;
+    if (this._elevateBlend > 0) {
+      targetAlt = cruiseAlt + (climbAlt - cruiseAlt) * this._elevateBlend;
+    } else {
+      targetAlt = cruiseAlt + (cruiseAlt - lowAlt) * this._elevateBlend;
+    }
+    this._altitude += (targetAlt - this._altitude) * Math.min(1, ALTITUDE_SPEED * dt);
+    const hardFloor = surfaceAlt + LOW_HOVER_HEIGHT;
+    if (this._altitude < hardFloor) this._altitude = hardFloor;
+
+    // ── Pitch from climb rate (Plane.ts:284-288) ──
+    const altDelta = (this._altitude - this._prevAltitude) / Math.max(dt, 1e-4);
+    this._prevAltitude = this._altitude;
+    const climbRate = Math.max(-1, Math.min(1, altDelta * 2.5));
+    const targetPitch = -0.3 * climbRate;
+    this._pitch += (targetPitch - this._pitch) * Math.min(1, 3.0 * dt);
+
+    // ── Great-circle motion (Plane.ts:290-291) ──
+    const arcAngle = (this._speed * dt) / globeRadius;
+    this._qPosition = S.moveOnSphere(this._qPosition, this._heading, arcAngle);
+
+    // ── Bank toward turn (Plane.ts:293-294) ──
+    const targetBank = Math.max(
+      -MAX_BANK,
+      Math.min(MAX_BANK, -this._turnInputSmoothed * MAX_BANK * 0.5),
+    );
+    this._bankAngle +=
+      (targetBank - this._bankAngle) * Math.min(1, BANK_RESPONSIVENESS * dt);
+
+    // ── Propeller spin (Plane.ts:296-298) ──
+    const parent = this.gameObject?._internal?.three;
+    const propeller = parent?.userData?.tinyskiesPropeller;
+    if (propeller) {
+      propeller.rotation.z -= (this._speed * 15 + 10) * dt;
+    }
+
+    // ── Hard speed ceiling (Plane.ts:301) ──
+    this._speed = Math.min(this._speed, ABSOLUTE_MAX_SPEED);
+
+    // ── Paintball-hit wobble (damped sin; Plane.ts:303-311) ──
+    if (this._wobbleAmp > 0.002) {
+      this._wobblePhase += dt * PAINTBALL_WOBBLE_FREQ;
+      this._wobbleBank = Math.sin(this._wobblePhase) * this._wobbleAmp;
+      this._wobbleAmp *= Math.exp(-PAINTBALL_WOBBLE_DECAY * dt);
+    } else {
+      this._wobbleAmp = 0;
+      this._wobbleBank = 0;
+    }
+
+    this._applyPlaneMatrix();
+    this._publishState(paintballPressed);
+  };
+
+  this._publishState = function (paintballPressed) {
+    const store = this.erth.store;
+    store.set("tinyskies/qx", this._qPosition.x);
+    store.set("tinyskies/qy", this._qPosition.y);
+    store.set("tinyskies/qz", this._qPosition.z);
+    store.set("tinyskies/qw", this._qPosition.w);
+    store.set("tinyskies/playerHp", this._playerHp / PLAYER_HP_MAX);
+    store.set("tinyskies/heading", this._heading);
+    store.set("tinyskies/pitch", this._pitch);
+    store.set("tinyskies/altitude", this._altitude);
+    store.set("tinyskies/turnRate", this._turnInputSmoothed);
+    store.set("tinyskies/speedRatio", this._computeSpeedRatio());
+    if (paintballPressed) {
+      // Single-shot signal — paintball system reads-and-clears.
+      store.set("tinyskies/firePaintball", true);
+    }
+  };
+
+  this._applyPlaneMatrix = function () {
+    const parent = this.gameObject?._internal?.three;
+    if (!parent) return;
+    // Total bank = banking-from-turn + paintball wobble + barrel-roll spin from
+    // active boost (matches source Plane.ts:395 buildPlaneMatrix args).
+    const totalBank = this._bankAngle + this._wobbleBank + this._rollAngle;
+    const m = S.buildPlaneMatrix(
+      this._qPosition,
+      this._heading,
+      this._pitch,
+      totalBank,
+      this._altitude,
+      this.getAttribute("globeRadius"),
+    );
+    parent.matrix.copy(m);
+    parent.matrixWorldNeedsUpdate = true;
+  };
+
+  // Source Plane.ts:403-413 — preserved here even though no boost/upgrades exist
+  // in MVP, so the camera rig's FOV/zoom curves match the original.
+  this._computeSpeedRatio = function () {
+    const ms = MAX_SPEED;
+    const bs = Math.min(BOOST_SPEED, ABSOLUTE_MAX_SPEED);
+    if (this._speed <= MIN_SPEED) return 0;
+    if (this._speed <= ms) {
+      return CRUISE_SPEED_RATIO_MAX * ((this._speed - MIN_SPEED) / (ms - MIN_SPEED));
+    }
+    const t = Math.min(1, (this._speed - ms) / (bs - ms));
+    const eased = t * (2 - t);
+    return CRUISE_SPEED_RATIO_MAX + (1.0 - CRUISE_SPEED_RATIO_MAX) * eased;
+  };
+
+  // No editor preview — this behavior runs gameplay state machinery only;
+  // the visible plane comes from tinyskiesBiplaneVisual.
+
+  this.dispose = function () {
+    this._log("dispose");
+    this._im = null;
+  };

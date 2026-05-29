@@ -1,0 +1,1573 @@
+meta:
+  tool: "StemStudio"
+  type: "behavior"
+  exportVersion: 1
+
+config:
+  name: "Drop7 Game"
+  id: "drop7.game"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  priority: 0
+  version: "1.0.0"
+  description: "Classic-style Drop7 puzzle rendered with UIKit."
+  tags:
+    - gameplay
+    - puzzle
+    - ui
+  attributes:
+    roundLength:
+      name: "Turns Per Rise"
+      type: "number"
+      default: 5
+      min: 3
+      max: 10
+    solidDiscChance:
+      name: "Solid Disc Chance"
+      type: "number"
+      default: 0.18
+      min: 0
+      max: 0.5
+    clearBaseScore:
+      name: "Base Clear Score"
+      type: "number"
+      default: 7
+      min: 1
+      max: 100
+    clearBoardBonus:
+      name: "Clear Board Bonus"
+      type: "number"
+      default: 70000
+      min: 0
+      max: 200000
+  inputs:
+    drop7_Left:
+      action: true
+      bindings:
+        - keyboard: ArrowLeft
+        - keyboard: KeyA
+    drop7_Right:
+      action: true
+      bindings:
+        - keyboard: ArrowRight
+        - keyboard: KeyD
+    drop7_Drop:
+      action: true
+      bindings:
+        - keyboard: Space
+        - keyboard: Enter
+        - keyboard: ArrowDown
+    drop7_Restart:
+      action: true
+      bindings:
+        - keyboard: KeyR
+  throttleConfig:
+    throttlePriority: "CRITICAL"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+    updateHz: 30
+  documentation: "Self-contained Drop7 gameplay behavior with UIKit rendering, keyboard input, click/tap column selection, combo resolution, solid-disc cracking, and row-rise pressure. Layout rescales for narrow (phone) viewports; tap works through UIKit pointer events."
+
+code: |-
+  @import "uikit-dual-mode" as uikit;
+
+  // Dual-mode UIKit helper lives in `imports/uikit-dual-mode.yaml`.
+
+  // Factory accepts a dual-mode `ctx` (from `uikit.createPlayContext` or
+  // `uikit.createEditorContext`). The editor preview shares the same UIKit
+  // tree as play; the editor doesn't call `update()` so game logic / audio
+  // stays dormant there.
+  function createDrop7Api(behavior, ctx) {
+    const game = ctx.gameLike;
+    const BOARD_SIZE = 7;
+    // Drop timing: a short baseline plus per-row time so deeper chips feel
+    // weightier. After the fall, the chip rests briefly at its landing slot
+    // before the next preview chip appears.
+    const DROP_DURATION_BASE = 0.12;
+    const DROP_DURATION_PER_ROW = 0.04;
+    const DROP_REST = 0.15;
+    // Tap feedback: brief column highlight after dropInColumn() fires.
+    const FLASH_DURATION = 0.25;
+
+    // Layout sizes — baselines set here; applyScale() rescales them at startup
+    // so the board also fits narrow phone viewports without clipping.
+    let CELL_SIZE = 58;
+    let CELL_GAP = 8;
+    let GRID_PAD = 12;
+    let PREVIEW_LANE = 72;
+    let DISC_SIZE = CELL_SIZE - 10;
+    let GRID_TOTAL = BOARD_SIZE * CELL_SIZE + (BOARD_SIZE - 1) * CELL_GAP + GRID_PAD * 2;
+    let ROOT_PAD = 20;
+    let COLUMN_BUTTON_H = 48;
+
+    // Font size baselines — also rescaled by applyScale().
+    let FS_TITLE = 34;
+    let FS_SUBTITLE = 14;
+    let FS_STAT_VALUE = 20;
+    let FS_STAT_LABEL = 11;
+    let FS_CURRENT_LABEL = 12;
+    let FS_CURRENT_DISC = 18;
+    let FS_STATUS = 14;
+    let FS_HINT = 12;
+    let FS_COLUMN_LABEL = 14;
+    let FS_CELL_LABEL = 18;
+    let FS_OVERLAY_TITLE = 40;
+    let FS_OVERLAY_BODY = 16;
+    let FS_OVERLAY_BUTTON = 16;
+
+    const COLOR_BG = 0x101821;
+    const COLOR_PANEL = 0x182634;
+    const COLOR_PANEL_ALT = 0x213346;
+    const COLOR_TEXT = 0xf4f3ee;
+    const COLOR_MUTED = 0x93a8bb;
+    const COLOR_SLOT = 0x2a3c4b;
+    const COLOR_SLOT_RING = 0x30495d;
+    const COLOR_BUTTON = 0x274056;
+    const COLOR_BUTTON_ACTIVE = 0xffa552;
+    const COLOR_BUTTON_DISABLED = 0x3a4956;
+    const COLOR_OVERLAY = 0x0b1118;
+    const COLOR_GLOW_ORANGE = 0xff8a5b;
+    const COLOR_GLOW_TEAL = 0x33c7b6;
+    const COLOR_GLOW_GOLD = 0xffd166;
+    const COLOR_GLOW_SKY = 0x58a6ff;
+
+    const DISC_COLORS = {
+      1: { bg: 0xf4f1de, fg: 0x22313f },
+      2: { bg: 0xe07a5f, fg: 0xffffff },
+      3: { bg: 0x81b29a, fg: 0x122029 },
+      4: { bg: 0xf2cc8f, fg: 0x332313 },
+      5: { bg: 0x669bbc, fg: 0xffffff },
+      6: { bg: 0xc8553d, fg: 0xffffff },
+      7: { bg: 0x9d4edd, fg: 0xffffff }
+    };
+
+    const SOLID_COLORS = {
+      hidden: { bg: 0x59636f, fg: 0xe8ecef },
+      cracked: { bg: 0x98a4af, fg: 0x1b242c }
+    };
+
+    const NEIGHBORS = [
+      [-1, 0],
+      [1, 0],
+      [0, -1],
+      [0, 1]
+    ];
+
+    let board = [];
+    let selectedColumn = 3;
+    let currentDisc = null;
+    let roundLength = 5;
+    let solidDiscChance = 0.18;
+    let clearBaseScore = 7;
+    let clearBoardBonus = 70000;
+    let score = 0;
+    let bestScore = 0;
+    let level = 1;
+    let turnsTaken = 0;
+    let statusTextValue = "Tap a column or press Space to drop.";
+    let gameOver = false;
+    let dirty = true;
+
+    // "intro" before the player hits Start, "playing" during a run,
+    // "over" after a game ends. Drop/input paths only fire when "playing".
+    // The overlay is shown for intro and over, hidden while playing.
+    let gameState = "intro";
+    let overlayHandler = function () {};
+
+    let root = null;
+    let rootParented = false;
+    let scoreValue = null;
+    let bestValue = null;
+    let levelValue = null;
+    let riseValue = null;
+    let columnValue = null;
+    let statusText = null;
+    let currentDiscView = null;
+    let currentDiscLabel = null;
+    let floatingDiscView = null;
+    let floatingDiscLabel = null;
+    let overlay = null;
+    let overlayTitle = null;
+    let overlayBody = null;
+    let overlayButtonLabel = null;
+    let activeDrop = null;
+
+    const columnButtons = [];
+    const columnLabels = [];
+    const cellDiscs = [];
+    const cellLabels = [];
+    const columnFlashTimers = new Array(BOARD_SIZE).fill(0);
+    let inputPrev = { left: false, right: false, drop: false, restart: false };
+
+    // Audio — non-positional SFX played via a single THREE.AudioListener
+    // attached to game.camera. Buffers load lazily from import-asset names;
+    // playSound() silently no-ops for any name whose buffer isn't ready yet,
+    // so the game remains playable even if audio files fail to load.
+    let audioListener = null;
+    const audioBuffers = {};
+    const audioInstances = {};
+    const audioNames = ["DropSfx", "LandSfx", "ClearSfx", "ChainSfx", "OverSfx"];
+
+    function randomNumberDisc() {
+      return { kind: "number", value: 1 + Math.floor(Math.random() * BOARD_SIZE) };
+    }
+
+    function solidDisc() {
+      return { kind: "hidden", value: null };
+    }
+
+    function copyDisc(disc) {
+      return disc ? { kind: disc.kind, value: disc.value } : null;
+    }
+
+    function cellKey(row, col) {
+      return row + "," + col;
+    }
+
+    // onClick factory — captures `col` as a function parameter so each
+    // handler has its own bound value. Using an inline closure inside a
+    // `for (let col ...)` loop was producing handlers that all fired the
+    // same column at runtime; this version is bulletproof regardless of
+    // how the script is parsed or re-scoped.
+    function tapHandlerFor(col) {
+      return function() { dropInColumn(col); };
+    }
+
+    function loadAudioAsset(name) {
+      const erth = behavior && behavior.erth;
+      if (!erth || !erth.asset || !erth.asset.audio) return;
+      erth.asset.audio.findByName(name).then(function(ref) {
+        if (!ref) return;
+        return erth.asset.audio.getUrl(ref);
+      }).then(function(url) {
+        if (!url) return;
+        const loader = new THREE.AudioLoader();
+        loader.load(url, function(buffer) {
+          audioBuffers[name] = buffer;
+        });
+      }).catch(function() {
+        // Silently ignore — playSound() guards for missing buffers.
+      });
+    }
+
+    function playSound(name, volume) {
+      if (!audioListener || !audioBuffers[name]) return;
+      let audio = audioInstances[name];
+      if (!audio) {
+        audio = new THREE.Audio(audioListener);
+        audioInstances[name] = audio;
+      }
+      if (!audio.buffer) audio.setBuffer(audioBuffers[name]);
+      audio.setVolume(typeof volume === "number" ? Math.max(0, Math.min(1, volume)) : 0.6);
+      audio.setLoop(false);
+      if (audio.isPlaying) audio.stop();
+      audio.play();
+    }
+
+    // Overlay helpers — single overlay widget reused for both the intro
+    // "Start" screen and the game-over "Play again" screen.
+    function showOverlay(title, body, buttonLabel, handler) {
+      if (!overlay) return;
+      overlayHandler = typeof handler === "function" ? handler : function () {};
+      if (overlayTitle) overlayTitle.setProperties({ text: title });
+      if (overlayBody) overlayBody.setProperties({ text: body });
+      if (overlayButtonLabel) overlayButtonLabel.setProperties({ text: buttonLabel });
+      overlay.setProperties({ visibility: "visible" });
+    }
+
+    function hideOverlay() {
+      if (overlay) overlay.setProperties({ visibility: "hidden" });
+    }
+
+    // Start and Play-again both route here: reset state, unblock input,
+    // dismiss the overlay.
+    function beginGame() {
+      newGame();
+      gameState = "playing";
+      hideOverlay();
+    }
+
+    // RGB lerp between two 0xRRGGBB colors, used to pulse the column
+    // button toward white briefly on tap.
+    function lerpHex(a, b, t) {
+      const ar = (a >> 16) & 0xff;
+      const ag = (a >> 8) & 0xff;
+      const ab = a & 0xff;
+      const br = (b >> 16) & 0xff;
+      const bg = (b >> 8) & 0xff;
+      const bb = b & 0xff;
+      const r = Math.round(ar + (br - ar) * t);
+      const g = Math.round(ag + (bg - ag) * t);
+      const bl = Math.round(ab + (bb - ab) * t);
+      return (r << 16) | (g << 8) | bl;
+    }
+
+    function buildStatBox(parent, label, value) {
+      const box = new UIKit.Container({
+        backgroundColor: COLOR_PANEL,
+        borderRadius: 12,
+        paddingTop: 10,
+        paddingBottom: 10,
+        paddingLeft: 14,
+        paddingRight: 14,
+        alignItems: "center",
+        gap: 2,
+        visibility: "visible"
+      });
+
+      box.add(new UIKit.Text({
+        text: label,
+        fontSize: FS_STAT_LABEL,
+        color: COLOR_MUTED,
+        visibility: "visible"
+      }));
+
+      const valueText = new UIKit.Text({
+        text: value,
+        fontSize: FS_STAT_VALUE,
+        fontWeight: "bold",
+        color: COLOR_TEXT,
+        visibility: "visible"
+      });
+
+      box.add(valueText);
+      parent.add(box);
+      return valueText;
+    }
+
+    function buildOverlay(parent) {
+      // Horizontal padding keeps the title/body/button off the overlay
+      // edges so the button never visually clips against the rounded
+      // corner of the board frame.
+      const nextOverlay = new UIKit.Container({
+        positionType: "absolute",
+        positionTop: 0,
+        positionLeft: 0,
+        positionRight: 0,
+        positionBottom: 0,
+        borderRadius: 16,
+        backgroundColor: COLOR_OVERLAY,
+        backgroundOpacity: 0.86,
+        flexDirection: "column",
+        justifyContent: "center",
+        alignItems: "center",
+        gap: 12,
+        paddingLeft: 24,
+        paddingRight: 24,
+        pointerEvents: "auto",
+        // Must outrank floatingDiscView's zIndexOffset (100) so the Start
+        // / Play-again button is always tappable while the overlay is up.
+        zIndexOffset: 200,
+        visibility: "visible"
+      });
+      nextOverlay.setProperties({ visibility: "hidden" });
+
+      overlayTitle = new UIKit.Text({
+        text: "Game Over",
+        fontSize: FS_OVERLAY_TITLE,
+        fontWeight: "bold",
+        color: COLOR_TEXT,
+        visibility: "visible"
+      });
+      nextOverlay.add(overlayTitle);
+
+      // maxWidth keeps long body copy from stretching the overlay's
+      // flex layout past the parent's edge, which was shifting the
+      // centered button off-screen on narrow viewports.
+      overlayBody = new UIKit.Text({
+        text: "",
+        fontSize: FS_OVERLAY_BODY,
+        color: COLOR_MUTED,
+        textAlign: "center",
+        maxWidth: Math.max(200, GRID_TOTAL - 48),
+        visibility: "visible"
+      });
+      nextOverlay.add(overlayBody);
+
+      // minWidth gives a stable, generous tap target regardless of
+      // whether the label is "Start" (5 chars) or "Play again" (10).
+      const restartButton = new UIKit.Container({
+        minWidth: 160,
+        backgroundColor: COLOR_BUTTON_ACTIVE,
+        borderRadius: 10,
+        paddingTop: 12,
+        paddingBottom: 12,
+        paddingLeft: 24,
+        paddingRight: 24,
+        flexDirection: "row",
+        justifyContent: "center",
+        alignItems: "center",
+        cursor: "pointer",
+        pointerEvents: "auto",
+        hover: { backgroundOpacity: 0.85 },
+        // Handler is routed through overlayHandler so showOverlay() can
+        // swap behavior between "Start" (intro) and "Play again" (over).
+        onClick: function() { if (overlayHandler) overlayHandler(); },
+        visibility: "visible"
+      });
+      // pointerEvents:none on the label ensures the Container's onClick
+      // fires anywhere on the button — including dead center over the text
+      // — instead of the label silently absorbing the hit.
+      overlayButtonLabel = new UIKit.Text({
+        text: "Play again",
+        fontSize: FS_OVERLAY_BUTTON,
+        fontWeight: "bold",
+        color: 0x1d1d1d,
+        pointerEvents: "none",
+        visibility: "visible"
+      });
+      restartButton.add(overlayButtonLabel);
+      nextOverlay.add(restartButton);
+
+      parent.add(nextOverlay);
+      return nextOverlay;
+    }
+
+    // Records the last viewport reading so we can see in the console which
+    // signal actually fed applyScale() — invaluable when the phone layout
+    // disagrees with what stemstudio thinks the viewport size is.
+    let lastViewportDebug = null;
+
+    function measureViewportWidth() {
+      // Fallback chain, most-trusted first:
+      //  1. canvas clientWidth (what the user actually sees in CSS px)
+      //  2. renderer.getSize().x (renderer's internal size — may be DPR-scaled)
+      //  3. window.innerWidth (CSS viewport — works even if canvas hasn't
+      //     laid out yet at init() time, which is the suspected phone bug)
+      //  4. documentElement.clientWidth (last-resort DOM fallback)
+      //  5. 375 (iPhone default — better phone default than 540)
+      const debug = {
+        clientWidth: 0,
+        clientHeight: 0,
+        rendererWidth: 0,
+        rendererHeight: 0,
+        innerWidth: 0,
+        innerHeight: 0,
+        documentClientWidth: 0,
+        devicePixelRatio: 0,
+        source: "default",
+        value: 375
+      };
+
+      if (game && game.renderer) {
+        const el = game.renderer.domElement;
+        if (el) {
+          debug.clientWidth = el.clientWidth || 0;
+          debug.clientHeight = el.clientHeight || 0;
+        }
+        const size = new THREE.Vector2();
+        game.renderer.getSize(size);
+        debug.rendererWidth = size.x || 0;
+        debug.rendererHeight = size.y || 0;
+      }
+
+      // window.innerWidth is the CSS layout viewport, distinct from canvas
+      // client size — we need it specifically because on phones the canvas
+      // may not have laid out by the time init() runs. Canvas-based helpers
+      // won't substitute here.
+      if (typeof window !== "undefined") {
+        debug.innerWidth = window.innerWidth || 0; // @check-ok
+        debug.innerHeight = window.innerHeight || 0; // @check-ok
+        debug.devicePixelRatio = window.devicePixelRatio || 0; // @check-ok
+        if (window.document && window.document.documentElement) { // @check-ok
+          debug.documentClientWidth = window.document.documentElement.clientWidth || 0; // @check-ok
+        }
+      }
+
+      if (debug.clientWidth > 0) {
+        debug.source = "canvas.clientWidth";
+        debug.value = debug.clientWidth;
+      } else if (debug.rendererWidth > 0) {
+        debug.source = "renderer.getSize";
+        debug.value = debug.rendererWidth;
+      } else if (debug.innerWidth > 0) {
+        debug.source = "window.innerWidth";
+        debug.value = debug.innerWidth;
+      } else if (debug.documentClientWidth > 0) {
+        debug.source = "documentElement.clientWidth";
+        debug.value = debug.documentClientWidth;
+      }
+
+      lastViewportDebug = debug;
+      return debug.value;
+    }
+
+    function applyScale() {
+      const availableWidth = Math.max(280, measureViewportWidth());
+      const baseline = 540;
+      const uiScale = Math.min(1, Math.max(0.45, (availableWidth - 24) / baseline));
+
+      CELL_SIZE = Math.floor(58 * uiScale);
+      CELL_GAP = Math.max(4, Math.floor(8 * uiScale));
+      GRID_PAD = Math.max(8, Math.floor(12 * uiScale));
+      PREVIEW_LANE = Math.floor(72 * uiScale);
+      DISC_SIZE = CELL_SIZE - Math.max(6, Math.floor(10 * uiScale));
+      GRID_TOTAL = BOARD_SIZE * CELL_SIZE + (BOARD_SIZE - 1) * CELL_GAP + GRID_PAD * 2;
+      ROOT_PAD = Math.max(10, Math.floor(20 * uiScale));
+      COLUMN_BUTTON_H = Math.max(44, Math.floor(48 * uiScale));
+
+      FS_TITLE = Math.max(22, Math.floor(34 * uiScale));
+      FS_SUBTITLE = Math.max(11, Math.floor(14 * uiScale));
+      FS_STAT_VALUE = Math.max(14, Math.floor(20 * uiScale));
+      FS_STAT_LABEL = Math.max(9, Math.floor(11 * uiScale));
+      FS_CURRENT_LABEL = Math.max(10, Math.floor(12 * uiScale));
+      FS_CURRENT_DISC = Math.max(14, Math.floor(18 * uiScale));
+      FS_STATUS = Math.max(11, Math.floor(14 * uiScale));
+      FS_HINT = Math.max(10, Math.floor(12 * uiScale));
+      FS_COLUMN_LABEL = Math.max(11, Math.floor(14 * uiScale));
+      FS_CELL_LABEL = Math.max(14, Math.floor(18 * uiScale));
+      FS_OVERLAY_TITLE = Math.max(24, Math.floor(40 * uiScale));
+      FS_OVERLAY_BODY = Math.max(12, Math.floor(16 * uiScale));
+      FS_OVERLAY_BUTTON = Math.max(12, Math.floor(16 * uiScale));
+
+      // One-shot diagnostic so we can debug phone-overflow by opening devtools
+      // on the device and reading the numbers off the console. If the UI is
+      // overflowing, compare GRID_TOTAL + frame/root padding against
+      // innerWidth — that reveals whether it's a measurement bug or a layout bug.
+      console.log("[Drop7 layout]", {
+        viewport: lastViewportDebug,
+        availableWidth: availableWidth,
+        uiScale: uiScale,
+        CELL_SIZE: CELL_SIZE,
+        CELL_GAP: CELL_GAP,
+        GRID_TOTAL: GRID_TOTAL,
+        ROOT_PAD: ROOT_PAD
+      });
+    }
+
+    function parentRootToCamera() {
+      if (rootParented || !root) return;
+      behavior._uiRoot = root;
+      if (uikit.attach(behavior, ctx)) {
+        // Attach the audio listener on the same deferred path — uiCamera is
+        // ready, and its transform is close enough to the scene for
+        // non-positional SFX (listener position doesn't affect THREE.Audio).
+        const uiCamera = ctx.getUICamera();
+        if (audioListener && uiCamera && audioListener.parent !== uiCamera) {
+          uiCamera.add(audioListener);
+        }
+        rootParented = true;
+      }
+    }
+
+    function loadConfig() {
+      const configuredRoundLength = Math.floor(behavior.getAttribute("roundLength") || 5);
+      const configuredSolidDiscChance = behavior.getAttribute("solidDiscChance");
+      const configuredBaseScore = Math.floor(behavior.getAttribute("clearBaseScore") || 7);
+      const configuredBoardBonus = Math.floor(behavior.getAttribute("clearBoardBonus") || 70000);
+
+      roundLength = Math.max(3, configuredRoundLength);
+      solidDiscChance = typeof configuredSolidDiscChance === "number"
+        ? Math.max(0, Math.min(0.5, configuredSolidDiscChance))
+        : 0.18;
+      clearBaseScore = Math.max(1, configuredBaseScore);
+      clearBoardBonus = Math.max(0, configuredBoardBonus);
+    }
+
+    function rollDisc() {
+      if (Math.random() < solidDiscChance) return solidDisc();
+      return randomNumberDisc();
+    }
+
+    function discView(disc) {
+      if (!disc) {
+        return { bg: COLOR_SLOT, fg: COLOR_TEXT, text: "", opacity: 0.15 };
+      }
+      if (disc.kind === "number") {
+        const colors = DISC_COLORS[disc.value] || DISC_COLORS[7];
+        return { bg: colors.bg, fg: colors.fg, text: "" + disc.value, opacity: 1 };
+      }
+      if (disc.kind === "cracked") {
+        return { bg: SOLID_COLORS.cracked.bg, fg: SOLID_COLORS.cracked.fg, text: "?", opacity: 1 };
+      }
+      return { bg: SOLID_COLORS.hidden.bg, fg: SOLID_COLORS.hidden.fg, text: "", opacity: 1 };
+    }
+
+    function columnDiscLeft(col) {
+      return GRID_PAD + col * (CELL_SIZE + CELL_GAP) + 5;
+    }
+
+    function idleDiscTop() {
+      return 10;
+    }
+
+    function landingDiscTop(row) {
+      return PREVIEW_LANE + GRID_PAD + row * (CELL_SIZE + CELL_GAP) + 5;
+    }
+
+    function nextRiseIn() {
+      return roundLength - turnsTaken;
+    }
+
+    function canDropInColumn(col) {
+      return board[0][col] === null;
+    }
+
+    function hasOpenColumn() {
+      for (let col = 0; col < BOARD_SIZE; col++) {
+        if (canDropInColumn(col)) return true;
+      }
+      return false;
+    }
+
+    function findLandingRow(col) {
+      for (let row = BOARD_SIZE - 1; row >= 0; row--) {
+        if (board[row][col] === null) return row;
+      }
+      return -1;
+    }
+
+    function pushBottomRow() {
+      for (let col = 0; col < BOARD_SIZE; col++) {
+        if (board[0][col] !== null) {
+          endGame("The stack reached the top.");
+          return false;
+        }
+      }
+
+      for (let row = 0; row < BOARD_SIZE - 1; row++) {
+        for (let col = 0; col < BOARD_SIZE; col++) {
+          board[row][col] = board[row + 1][col];
+        }
+      }
+
+      for (let col = 0; col < BOARD_SIZE; col++) {
+        board[BOARD_SIZE - 1][col] = solidDisc();
+      }
+
+      return true;
+    }
+
+    function findMatches() {
+      const marked = {};
+      const matches = [];
+
+      function addMatch(row, col) {
+        const key = cellKey(row, col);
+        if (marked[key]) return;
+        marked[key] = true;
+        matches.push({ row: row, col: col });
+      }
+
+      for (let row = 0; row < BOARD_SIZE; row++) {
+        let col = 0;
+        while (col < BOARD_SIZE) {
+          while (col < BOARD_SIZE && board[row][col] === null) col += 1;
+          if (col >= BOARD_SIZE) break;
+
+          let end = col;
+          while (end + 1 < BOARD_SIZE && board[row][end + 1] !== null) end += 1;
+          const length = end - col + 1;
+
+          for (let cursor = col; cursor <= end; cursor++) {
+            const disc = board[row][cursor];
+            if (disc && disc.kind === "number" && disc.value === length) {
+              addMatch(row, cursor);
+            }
+          }
+
+          col = end + 1;
+        }
+      }
+
+      for (let col = 0; col < BOARD_SIZE; col++) {
+        let row = 0;
+        while (row < BOARD_SIZE) {
+          while (row < BOARD_SIZE && board[row][col] === null) row += 1;
+          if (row >= BOARD_SIZE) break;
+
+          let end = row;
+          while (end + 1 < BOARD_SIZE && board[end + 1][col] !== null) end += 1;
+          const length = end - row + 1;
+
+          for (let cursor = row; cursor <= end; cursor++) {
+            const disc = board[cursor][col];
+            if (disc && disc.kind === "number" && disc.value === length) {
+              addMatch(cursor, col);
+            }
+          }
+
+          row = end + 1;
+        }
+      }
+
+      return matches;
+    }
+
+    function applyHits(row, col, count) {
+      const disc = board[row][col];
+      if (!disc) return;
+
+      let remaining = count;
+      while (remaining > 0 && disc.kind !== "number") {
+        if (disc.kind === "hidden") {
+          disc.kind = "cracked";
+        } else if (disc.kind === "cracked") {
+          disc.kind = "number";
+          disc.value = 1 + Math.floor(Math.random() * BOARD_SIZE);
+        }
+        remaining -= 1;
+      }
+    }
+
+    function applyGravity() {
+      for (let col = 0; col < BOARD_SIZE; col++) {
+        const discs = [];
+        for (let row = BOARD_SIZE - 1; row >= 0; row--) {
+          if (board[row][col] !== null) discs.push(board[row][col]);
+        }
+
+        let discIndex = 0;
+        for (let row = BOARD_SIZE - 1; row >= 0; row--) {
+          if (discIndex < discs.length) {
+            board[row][col] = discs[discIndex];
+            discIndex += 1;
+          } else {
+            board[row][col] = null;
+          }
+        }
+      }
+    }
+
+    function isBoardEmpty() {
+      for (let row = 0; row < BOARD_SIZE; row++) {
+        for (let col = 0; col < BOARD_SIZE; col++) {
+          if (board[row][col] !== null) return false;
+        }
+      }
+      return true;
+    }
+
+    function resolveBoard() {
+      let chainDepth = 0;
+      let totalCleared = 0;
+
+      while (true) {
+        const matches = findMatches();
+        if (matches.length === 0) break;
+
+        chainDepth += 1;
+        totalCleared += matches.length;
+        score += matches.length * clearBaseScore * chainDepth;
+
+        const hits = {};
+
+        for (let i = 0; i < matches.length; i++) {
+          board[matches[i].row][matches[i].col] = null;
+        }
+
+        for (let i = 0; i < matches.length; i++) {
+          const match = matches[i];
+          for (let n = 0; n < NEIGHBORS.length; n++) {
+            const nextRow = match.row + NEIGHBORS[n][0];
+            const nextCol = match.col + NEIGHBORS[n][1];
+            if (nextRow < 0 || nextRow >= BOARD_SIZE || nextCol < 0 || nextCol >= BOARD_SIZE) continue;
+            const disc = board[nextRow][nextCol];
+            if (!disc || disc.kind === "number") continue;
+            const key = cellKey(nextRow, nextCol);
+            hits[key] = (hits[key] || 0) + 1;
+          }
+        }
+
+        const hitKeys = Object.keys(hits);
+        for (let i = 0; i < hitKeys.length; i++) {
+          const parts = hitKeys[i].split(",");
+          applyHits(parseInt(parts[0], 10), parseInt(parts[1], 10), hits[hitKeys[i]]);
+        }
+
+        applyGravity();
+      }
+
+      let boardBonus = false;
+      if (totalCleared > 0 && isBoardEmpty()) {
+        score += clearBoardBonus;
+        boardBonus = true;
+      }
+
+      if (score > bestScore) bestScore = score;
+      return { chainDepth: chainDepth, totalCleared: totalCleared, boardBonus: boardBonus };
+    }
+
+    function endGame(reason) {
+      gameOver = true;
+      gameState = "over";
+      if (score > bestScore) bestScore = score;
+      statusTextValue = reason;
+      playSound("OverSfx", 0.7);
+      showOverlay(
+        "Game Over",
+        reason + " Final score: " + score,
+        "Play again",
+        beginGame
+      );
+      dirty = true;
+    }
+
+    function newGame() {
+      loadConfig();
+      board = [];
+      for (let row = 0; row < BOARD_SIZE; row++) {
+        board[row] = [];
+        for (let col = 0; col < BOARD_SIZE; col++) {
+          board[row][col] = null;
+        }
+      }
+
+      selectedColumn = 3;
+      score = 0;
+      level = 1;
+      turnsTaken = 0;
+      gameOver = false;
+      statusTextValue = "Tap a column or press Space to drop.";
+      currentDisc = rollDisc();
+      dirty = true;
+    }
+
+    function commitDrop(drop) {
+      const col = drop.col;
+      board[drop.landingRow][col] = copyDisc(drop.disc);
+      turnsTaken += 1;
+
+      const messages = [];
+      if (drop.disc.kind === "number") {
+        messages.push("Dropped " + drop.disc.value + " in column " + (col + 1) + ".");
+      } else {
+        messages.push("Dropped a solid disc in column " + (col + 1) + ".");
+      }
+
+      const primarySummary = resolveBoard();
+      if (primarySummary.totalCleared > 0) {
+        // ChainSfx for combos (volume scales mildly with depth), ClearSfx
+        // for a single-step clear.
+        if (primarySummary.chainDepth > 1) {
+          playSound("ChainSfx", Math.min(0.95, 0.55 + 0.12 * primarySummary.chainDepth));
+        } else {
+          playSound("ClearSfx", 0.6);
+        }
+        let summary = "Cleared " + primarySummary.totalCleared + " disc";
+        if (primarySummary.totalCleared !== 1) summary += "s";
+        if (primarySummary.chainDepth > 1) summary += " in chain x" + primarySummary.chainDepth;
+        if (primarySummary.boardBonus) summary += " and earned the board-clear bonus";
+        messages.push(summary + ".");
+      }
+
+      if (!gameOver && turnsTaken >= roundLength) {
+        turnsTaken = 0;
+        level += 1;
+        if (pushBottomRow()) {
+          messages.push("A solid row rose from the bottom.");
+          const riseSummary = resolveBoard();
+          if (riseSummary.totalCleared > 0) {
+            if (riseSummary.chainDepth > 1) {
+              playSound("ChainSfx", Math.min(0.95, 0.55 + 0.12 * riseSummary.chainDepth));
+            } else {
+              playSound("ClearSfx", 0.6);
+            }
+            let riseMessage = "Rise clear: " + riseSummary.totalCleared + " disc";
+            if (riseSummary.totalCleared !== 1) riseMessage += "s";
+            if (riseSummary.chainDepth > 1) riseMessage += " in chain x" + riseSummary.chainDepth;
+            if (riseSummary.boardBonus) riseMessage += " and the board-clear bonus";
+            messages.push(riseMessage + ".");
+          }
+        }
+      }
+
+      if (!gameOver && !hasOpenColumn()) {
+        endGame("No legal columns remain.");
+        return;
+      }
+
+      if (!gameOver) {
+        currentDisc = rollDisc();
+        statusTextValue = messages.join(" ");
+        dirty = true;
+      }
+    }
+
+    function dropInColumn(col) {
+      // Ignore all drop requests while the intro or game-over overlay is up.
+      if (gameState !== "playing") return;
+      if (gameOver || activeDrop) return;
+
+      selectedColumn = col;
+      // Flash fires on every tap — including taps on a full column — so the
+      // user always sees their input register even when no drop follows.
+      columnFlashTimers[col] = FLASH_DURATION;
+
+      if (!hasOpenColumn()) {
+        endGame("No legal columns remain.");
+        return;
+      }
+
+      if (!canDropInColumn(col)) {
+        statusTextValue = "Column " + (col + 1) + " is full.";
+        dirty = true;
+        return;
+      }
+
+      const landingRow = findLandingRow(col);
+      if (landingRow === -1) {
+        statusTextValue = "Column " + (col + 1) + " is full.";
+        dirty = true;
+        return;
+      }
+
+      activeDrop = {
+        disc: copyDisc(currentDisc),
+        col: col,
+        landingRow: landingRow,
+        elapsed: 0,
+        fallDuration: DROP_DURATION_BASE + landingRow * DROP_DURATION_PER_ROW,
+        restDuration: DROP_REST,
+        landPlayed: false
+      };
+      playSound("DropSfx", 0.45);
+      statusTextValue = "Dropping into column " + (col + 1) + ".";
+      dirty = true;
+    }
+
+    function pollInput() {
+      if (!game || !game.inputManager) return;
+
+      const im = game.inputManager;
+      const previousColumn = selectedColumn;
+      const lateral = im.getMotion ? im.getMotion("lateral") : 0;
+      // Drop accepts the explicit drop7_Drop binding (Space / Enter /
+      // ArrowDown) and the generic keyboard/gamepad fallbacks jump / use /
+      // drop — but NOT `primary`. `primary` fires on every mouse/touch
+      // click, which was causing every UIKit tap to also trigger an instant
+      // keyboard-style drop at the stale selectedColumn on the same frame,
+      // before the tap handler could set the new column.
+      const cur = {
+        left: !!im.getAction("drop7_Left") || lateral < -0.5,
+        right: !!im.getAction("drop7_Right") || lateral > 0.5,
+        drop: !!im.getAction("drop7_Drop") || !!im.getAction("jump") || !!im.getAction("use") || !!im.getAction("drop"),
+        restart: !!im.getAction("drop7_Restart")
+      };
+      const prev = inputPrev;
+
+      // R restarts only while playing or after game-over, not during intro.
+      if (cur.restart && !prev.restart && gameState !== "intro") beginGame();
+      if (gameState === "playing" && !activeDrop) {
+        if (cur.left && !prev.left) selectedColumn = Math.max(0, selectedColumn - 1);
+        if (cur.right && !prev.right) selectedColumn = Math.min(BOARD_SIZE - 1, selectedColumn + 1);
+        if (cur.drop && !prev.drop) dropInColumn(selectedColumn);
+      }
+
+      inputPrev = cur;
+      if (selectedColumn !== previousColumn) {
+        statusTextValue = "Selected column " + (selectedColumn + 1) + ". Press Space to drop.";
+        dirty = true;
+      }
+    }
+
+    function updateUI() {
+      scoreValue.setProperties({ text: "" + score });
+      bestValue.setProperties({ text: "" + bestScore });
+      levelValue.setProperties({ text: "" + level });
+      riseValue.setProperties({ text: "" + nextRiseIn() });
+      columnValue.setProperties({ text: "" + (selectedColumn + 1) });
+      statusText.setProperties({ text: statusTextValue });
+
+      const preview = discView(currentDisc);
+      currentDiscView.setProperties({
+        backgroundColor: preview.bg,
+        backgroundOpacity: preview.opacity
+      });
+      currentDiscLabel.setProperties({
+        text: preview.text,
+        color: preview.fg
+      });
+
+      if (floatingDiscView) {
+        const floatingDisc = activeDrop ? activeDrop.disc : currentDisc;
+        const floatingView = discView(floatingDisc);
+        let floatingTop = idleDiscTop();
+        let floatingVisibility = gameOver ? "hidden" : "visible";
+        let floatingOpacity = floatingView.opacity;
+
+        // During a drop, always anchor the falling chip to the column the
+        // drop was launched into (activeDrop.col) — not the cursor
+        // (selectedColumn) which could diverge if future input logic updates
+        // the cursor mid-animation. commitDrop() writes the board at
+        // activeDrop.col, so the animation must match.
+        const floatingCol = activeDrop ? activeDrop.col : selectedColumn;
+
+        if (activeDrop) {
+          // Quadratic ease-in (t*t) models gravity — slow start, fast at
+          // impact. Min(...,1) clamps during the rest phase so the chip
+          // sits at its landed position before the next chip appears.
+          const t = Math.min(activeDrop.elapsed / activeDrop.fallDuration, 1);
+          const eased = t * t;
+          floatingTop = idleDiscTop() + (landingDiscTop(activeDrop.landingRow) - idleDiscTop()) * eased;
+        }
+
+        floatingDiscView.setProperties({
+          positionLeft: columnDiscLeft(floatingCol),
+          positionTop: floatingTop,
+          backgroundColor: floatingView.bg,
+          backgroundOpacity: floatingOpacity,
+          visibility: floatingVisibility
+        });
+        floatingDiscLabel.setProperties({
+          text: floatingView.text,
+          color: floatingView.fg,
+          visibility: floatingVisibility
+        });
+      }
+
+      for (let col = 0; col < BOARD_SIZE; col++) {
+        let buttonColor = COLOR_BUTTON;
+        let textColor = COLOR_TEXT;
+        if (!canDropInColumn(col)) {
+          buttonColor = COLOR_BUTTON_DISABLED;
+          textColor = COLOR_MUTED;
+        } else if (col === selectedColumn) {
+          buttonColor = COLOR_BUTTON_ACTIVE;
+          textColor = 0x1d1d1d;
+        }
+
+        // Tap feedback: briefly pulse the column button toward white.
+        const flashT = Math.max(0, columnFlashTimers[col] / FLASH_DURATION);
+        const paintedColor = flashT > 0
+          ? lerpHex(buttonColor, 0xffffff, flashT * 0.6)
+          : buttonColor;
+
+        columnButtons[col].setProperties({ backgroundColor: paintedColor });
+        columnLabels[col].setProperties({ color: textColor });
+      }
+
+      for (let row = 0; row < BOARD_SIZE; row++) {
+        for (let col = 0; col < BOARD_SIZE; col++) {
+          const view = discView(board[row][col]);
+          cellDiscs[row][col].setProperties({
+            backgroundColor: view.bg,
+            backgroundOpacity: view.opacity
+          });
+          cellLabels[row][col].setProperties({
+            text: view.text,
+            color: view.fg
+          });
+        }
+      }
+
+      // Overlay visibility is now driven explicitly by showOverlay/hideOverlay
+      // in the intro/begin/endGame flows — not by a per-frame toggle — so that
+      // the intro screen persists until the player taps Start.
+      dirty = false;
+    }
+
+    function startApi() {
+      applyScale();
+
+      // Audio: create the listener now and kick off parallel loads for
+      // each imported asset. Parenting to game.uiCamera happens in
+      // parentRootToCamera() once uiCamera is ready (same deferred path
+      // used for the UIKit root).
+      audioListener = new THREE.AudioListener();
+      for (let i = 0; i < audioNames.length; i++) loadAudioAsset(audioNames[i]);
+
+      root = new UIKit.Fullscreen(ctx.renderer, {
+        flexDirection: "column",
+        justifyContent: "center",
+        alignItems: "center",
+        gap: 0,
+        paddingTop: ROOT_PAD,
+        paddingBottom: ROOT_PAD,
+        paddingLeft: ROOT_PAD,
+        paddingRight: ROOT_PAD,
+        backgroundColor: COLOR_BG,
+        // Must absorb every touch on the fullscreen UI. With "none" any
+        // tap that doesn't land on an interactive child passes through to
+        // the browser, which on mobile triggers double-tap-zoom and pinch
+        // gestures — making the view appear to "zoom randomly on tap".
+        pointerEvents: "auto",
+        visibility: "visible"
+      });
+      parentRootToCamera();
+
+      // Decorative ambient glow — four corner orbs sit behind the game frame
+      // so they read as soft light rather than overlapping the playfield.
+      const backdropLayer = new UIKit.Container({
+        positionType: "absolute",
+        positionTop: 0,
+        positionLeft: 0,
+        positionRight: 0,
+        positionBottom: 0,
+        pointerEvents: "none",
+        visibility: "visible"
+      });
+      root.add(backdropLayer);
+
+      backdropLayer.add(new UIKit.Container({
+        positionType: "absolute",
+        positionLeft: -80,
+        positionTop: -80,
+        width: 280,
+        height: 280,
+        borderRadius: 140,
+        backgroundColor: COLOR_GLOW_ORANGE,
+        backgroundOpacity: 0.10,
+        visibility: "visible"
+      }));
+      backdropLayer.add(new UIKit.Container({
+        positionType: "absolute",
+        positionRight: -80,
+        positionTop: -80,
+        width: 240,
+        height: 240,
+        borderRadius: 120,
+        backgroundColor: COLOR_GLOW_TEAL,
+        backgroundOpacity: 0.08,
+        visibility: "visible"
+      }));
+      backdropLayer.add(new UIKit.Container({
+        positionType: "absolute",
+        positionLeft: -80,
+        positionBottom: -80,
+        width: 240,
+        height: 240,
+        borderRadius: 120,
+        backgroundColor: COLOR_GLOW_SKY,
+        backgroundOpacity: 0.08,
+        visibility: "visible"
+      }));
+      backdropLayer.add(new UIKit.Container({
+        positionType: "absolute",
+        positionRight: -80,
+        positionBottom: -80,
+        width: 280,
+        height: 280,
+        borderRadius: 140,
+        backgroundColor: COLOR_GLOW_GOLD,
+        backgroundOpacity: 0.09,
+        visibility: "visible"
+      }));
+
+      // Dark opaque frame hosting all interactive UI. Rendered on top of the
+      // backdrop layer so the orbs only bleed at the corners outside this frame.
+      const gameFrame = new UIKit.Container({
+        flexDirection: "column",
+        alignItems: "center",
+        gap: 12,
+        paddingTop: 16,
+        paddingBottom: 16,
+        paddingLeft: 16,
+        paddingRight: 16,
+        backgroundColor: COLOR_PANEL_ALT,
+        borderRadius: 20,
+        visibility: "visible"
+      });
+      root.add(gameFrame);
+
+      const header = new UIKit.Container({
+        width: GRID_TOTAL,
+        flexDirection: "row",
+        justifyContent: "space-between",
+        alignItems: "stretch",
+        gap: 10,
+        visibility: "visible"
+      });
+      gameFrame.add(header);
+
+      const titleBlock = new UIKit.Container({
+        flexGrow: 1,
+        backgroundColor: COLOR_PANEL,
+        borderRadius: 12,
+        paddingTop: 14,
+        paddingBottom: 14,
+        paddingLeft: 16,
+        paddingRight: 16,
+        gap: 4,
+        visibility: "visible"
+      });
+      header.add(titleBlock);
+
+      titleBlock.add(new UIKit.Text({
+        text: "DROP7",
+        fontSize: FS_TITLE,
+        fontWeight: "bold",
+        color: COLOR_TEXT,
+        visibility: "visible"
+      }));
+
+      titleBlock.add(new UIKit.Text({
+        text: "Match the number to the contiguous line length.",
+        fontSize: FS_SUBTITLE,
+        color: COLOR_MUTED,
+        visibility: "visible"
+      }));
+
+      const stats = new UIKit.Container({
+        flexDirection: "row",
+        gap: 8,
+        visibility: "visible"
+      });
+      header.add(stats);
+
+      scoreValue = buildStatBox(stats, "SCORE", "0");
+      bestValue = buildStatBox(stats, "BEST", "0");
+
+      const metaRow = new UIKit.Container({
+        width: GRID_TOTAL,
+        flexDirection: "row",
+        justifyContent: "space-between",
+        alignItems: "stretch",
+        gap: 10,
+        visibility: "visible"
+      });
+      gameFrame.add(metaRow);
+
+      const currentPanel = new UIKit.Container({
+        flexDirection: "row",
+        alignItems: "center",
+        gap: 12,
+        backgroundColor: COLOR_PANEL,
+        borderRadius: 12,
+        paddingTop: 12,
+        paddingBottom: 12,
+        paddingLeft: 14,
+        paddingRight: 14,
+        visibility: "visible"
+      });
+      metaRow.add(currentPanel);
+
+      currentPanel.add(new UIKit.Text({
+        text: "CURRENT",
+        fontSize: FS_CURRENT_LABEL,
+        color: COLOR_MUTED,
+        visibility: "visible"
+      }));
+
+      currentDiscView = new UIKit.Container({
+        width: 52,
+        height: 52,
+        borderRadius: 26,
+        justifyContent: "center",
+        alignItems: "center",
+        backgroundColor: SOLID_COLORS.hidden.bg,
+        visibility: "visible"
+      });
+      currentPanel.add(currentDiscView);
+
+      currentDiscLabel = new UIKit.Text({
+        text: "",
+        fontSize: FS_CURRENT_DISC,
+        fontWeight: "bold",
+        color: COLOR_TEXT,
+        visibility: "visible"
+      });
+      currentDiscView.add(currentDiscLabel);
+
+      const progressPanel = new UIKit.Container({
+        flexDirection: "row",
+        gap: 8,
+        visibility: "visible"
+      });
+      metaRow.add(progressPanel);
+
+      levelValue = buildStatBox(progressPanel, "LEVEL", "1");
+      riseValue = buildStatBox(progressPanel, "RISE IN", "5");
+      columnValue = buildStatBox(progressPanel, "COLUMN", "4");
+
+      const controlsRow = new UIKit.Container({
+        width: GRID_TOTAL,
+        flexDirection: "row",
+        justifyContent: "space-between",
+        alignItems: "center",
+        gap: 10,
+        visibility: "visible"
+      });
+      gameFrame.add(controlsRow);
+
+      statusText = new UIKit.Text({
+        text: statusTextValue,
+        fontSize: FS_STATUS,
+        color: COLOR_TEXT,
+        visibility: "visible"
+      });
+      controlsRow.add(statusText);
+
+      controlsRow.add(new UIKit.Text({
+        text: "Tap a column, or use Left/Right + Space. R restarts.",
+        fontSize: FS_HINT,
+        color: COLOR_MUTED,
+        visibility: "visible"
+      }));
+
+      const columnRow = new UIKit.Container({
+        width: GRID_TOTAL,
+        flexDirection: "row",
+        gap: CELL_GAP,
+        justifyContent: "center",
+        alignItems: "center",
+        pointerEvents: "auto",
+        visibility: "visible"
+      });
+      gameFrame.add(columnRow);
+
+      for (let col = 0; col < BOARD_SIZE; col++) {
+        const button = new UIKit.Container({
+          width: CELL_SIZE,
+          height: COLUMN_BUTTON_H,
+          borderRadius: 8,
+          justifyContent: "center",
+          alignItems: "center",
+          backgroundColor: COLOR_BUTTON,
+          pointerEvents: "auto",
+          hover: { backgroundOpacity: 0.85 },
+          onClick: tapHandlerFor(col),
+          visibility: "visible"
+        });
+        const label = new UIKit.Text({
+          text: "" + (col + 1),
+          fontSize: FS_COLUMN_LABEL,
+          fontWeight: "bold",
+          color: COLOR_TEXT,
+          visibility: "visible"
+        });
+        button.add(label);
+        columnRow.add(button);
+        columnButtons.push(button);
+        columnLabels.push(label);
+      }
+
+      const boardArea = new UIKit.Container({
+        width: GRID_TOTAL,
+        height: GRID_TOTAL + PREVIEW_LANE,
+        visibility: "visible"
+      });
+      gameFrame.add(boardArea);
+
+      const boardFrame = new UIKit.Container({
+        positionType: "absolute",
+        positionTop: PREVIEW_LANE,
+        positionLeft: 0,
+        positionRight: 0,
+        height: GRID_TOTAL,
+        backgroundColor: COLOR_PANEL,
+        borderRadius: 16,
+        paddingTop: GRID_PAD,
+        paddingBottom: GRID_PAD,
+        paddingLeft: GRID_PAD,
+        paddingRight: GRID_PAD,
+        flexDirection: "column",
+        gap: CELL_GAP,
+        justifyContent: "center",
+        alignItems: "center",
+        visibility: "visible"
+      });
+      boardArea.add(boardFrame);
+
+      for (let row = 0; row < BOARD_SIZE; row++) {
+        const rowContainer = new UIKit.Container({
+          flexDirection: "row",
+          gap: CELL_GAP,
+          visibility: "visible"
+        });
+        boardFrame.add(rowContainer);
+        cellDiscs[row] = [];
+        cellLabels[row] = [];
+
+        for (let col = 0; col < BOARD_SIZE; col++) {
+          const slot = new UIKit.Container({
+            width: CELL_SIZE,
+            height: CELL_SIZE,
+            borderRadius: 12,
+            backgroundColor: COLOR_SLOT_RING,
+            justifyContent: "center",
+            alignItems: "center",
+            pointerEvents: "auto",
+            onClick: tapHandlerFor(col),
+            visibility: "visible"
+          });
+
+          const disc = new UIKit.Container({
+            width: CELL_SIZE - 10,
+            height: CELL_SIZE - 10,
+            borderRadius: Math.floor((CELL_SIZE - 10) / 2),
+            backgroundColor: COLOR_SLOT,
+            backgroundOpacity: 0.2,
+            justifyContent: "center",
+            alignItems: "center",
+            visibility: "visible"
+          });
+
+          const label = new UIKit.Text({
+            text: "",
+            fontSize: FS_CELL_LABEL,
+            fontWeight: "bold",
+            color: COLOR_TEXT,
+            visibility: "visible"
+          });
+
+          disc.add(label);
+          slot.add(disc);
+          rowContainer.add(slot);
+
+          cellDiscs[row][col] = disc;
+          cellLabels[row][col] = label;
+        }
+      }
+
+      // floatingDiscView is added AFTER the cell grid so it renders above
+      // the cells in UIKit's insertion-order sibling stacking. `zIndexOffset`
+      // is belt-and-suspenders — cells are nested two levels deeper than this
+      // view, and UIKit's stacking from insertion order alone sometimes loses
+      // to depth-based sort. zIndexOffset forces this view on top of any
+      // descendant of boardFrame.
+      floatingDiscView = new UIKit.Container({
+        positionType: "absolute",
+        positionLeft: columnDiscLeft(selectedColumn),
+        positionTop: idleDiscTop(),
+        width: DISC_SIZE,
+        height: DISC_SIZE,
+        borderRadius: Math.floor(DISC_SIZE / 2),
+        backgroundColor: COLOR_SLOT,
+        justifyContent: "center",
+        alignItems: "center",
+        zIndexOffset: 100,
+        // Decorative only — must not intercept clicks, or the intro
+        // overlay's Start button (and any cell under it) can't be tapped.
+        pointerEvents: "none",
+        visibility: "visible"
+      });
+      boardArea.add(floatingDiscView);
+
+      floatingDiscLabel = new UIKit.Text({
+        text: "",
+        fontSize: FS_CELL_LABEL,
+        fontWeight: "bold",
+        color: COLOR_TEXT,
+        visibility: "visible"
+      });
+      floatingDiscView.add(floatingDiscLabel);
+
+      overlay = buildOverlay(boardArea);
+
+      // Initialise an empty, idle board so the cell grid and stats render
+      // behind the intro overlay without needing to roll a chip yet.
+      board = [];
+      for (let row = 0; row < BOARD_SIZE; row++) {
+        board[row] = [];
+        for (let col = 0; col < BOARD_SIZE; col++) board[row][col] = null;
+      }
+      loadConfig();
+
+      // Intro screen — the game only starts when the player taps Start.
+      gameState = "intro";
+      showOverlay(
+        "DROP7",
+        "Match the number to the length of its row or column.\nTap a column or press Space to drop. R restarts.",
+        "Start",
+        beginGame
+      );
+    }
+
+    function tick(deltaTime) {
+      const dt = Math.min(deltaTime, 0.1);
+      if (!rootParented) parentRootToCamera();
+      pollInput();
+
+      // Decay per-column tap flash timers.
+      for (let c = 0; c < BOARD_SIZE; c++) {
+        if (columnFlashTimers[c] > 0) {
+          columnFlashTimers[c] = Math.max(0, columnFlashTimers[c] - dt);
+          dirty = true;
+        }
+      }
+
+      if (activeDrop) {
+        activeDrop.elapsed += dt;
+        dirty = true;
+        // Land sound: single-fire the moment the fall animation completes,
+        // i.e. elapsed just crossed fallDuration. `landPlayed` ensures the
+        // sound doesn't repeat across every rest-phase frame.
+        if (!activeDrop.landPlayed && activeDrop.elapsed >= activeDrop.fallDuration) {
+          activeDrop.landPlayed = true;
+          playSound("LandSfx", 0.55);
+        }
+        // Commit only after the fall animation AND the rest pause finish —
+        // the rest pause gives the chip a beat to settle before the next
+        // preview chip pops in at the top of the column.
+        if (activeDrop.elapsed >= activeDrop.fallDuration + activeDrop.restDuration) {
+          const finishedDrop = activeDrop;
+          activeDrop = null;
+          commitDrop(finishedDrop);
+        }
+      }
+      if (dirty) updateUI();
+
+      if (rootParented && typeof UIKitPointerEvents !== "undefined" && UIKitPointerEvents.update) {
+        UIKitPointerEvents.update(dt);
+      }
+    }
+
+    function teardown() {
+      uikit.teardown(behavior);
+      root = null;
+      rootParented = false;
+
+      // Audio cleanup — stop any playing sources, disconnect them, and
+      // remove the listener from the camera.
+      const audioKeys = Object.keys(audioInstances);
+      for (let i = 0; i < audioKeys.length; i++) {
+        const a = audioInstances[audioKeys[i]];
+        if (a && a.isPlaying) a.stop();
+        if (a && a.disconnect) a.disconnect();
+      }
+      if (audioListener && audioListener.parent) {
+        audioListener.parent.remove(audioListener);
+      }
+      audioListener = null;
+    }
+
+    return {
+      init: startApi,
+      update: tick,
+      dispose: teardown
+    };
+  }
+
+  let api = null;
+
+  this.init = function(_game) {
+    api = createDrop7Api(this, uikit.createPlayContext(_game));
+    api.init();
+  };
+
+  this.update = function(deltaTime) {
+    if (api) api.update(deltaTime);
+  };
+
+  this.dispose = function() {
+    if (!api) return;
+    // api.dispose() delegates to teardown(), which handles audio
+    // .stop() / .disconnect() + removes the AudioListener from its parent.
+    api.dispose();
+    api = null;
+  };
+
+  // ─── Editor lifecycle (renders the same UIKit tree as play mode) ───────
+
+  this.onEditorAdded = async function(editor) {
+    if (api) return;
+    const ctx = await uikit.createEditorContext(editor);
+    api = createDrop7Api(this, ctx);
+    api.init();
+  };
+
+  this.onEditorAttributesUpdated = function() {
+    if (!api) return;
+    api.dispose();
+    api = null;
+  };
+
+  this.onEditorDispose = function() {
+    if (!api) return;
+    api.dispose();
+    api = null;
+  };
+

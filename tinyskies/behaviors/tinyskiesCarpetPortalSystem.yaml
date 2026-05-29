@@ -1,0 +1,436 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Carpet Portal System"
+  id: "tinyskies.carpetPortalSystem"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Portal-2 style two-portal teleporter for the magic carpet. Pressing the paintball key while on carpet drops a colored portal ahead of the player; the second press drops the paired portal. Flying through one teleports to the other. Source-faithful port of CarpetPortalSystem.ts (576 LOC) — visual + placement + arming + segment-portal hit + heading remap."
+  documentation: "Active only while vehicleType==='carpet'. Listens for `tinyskies/firePaintball` (already published by flightController on Space). On consume: places one of a pair of portals (orange 0xff7700 + cyan 0x00aaff) at PORTAL_PLACE_AHEAD=0.45 ahead of the carpet. Once both portals exist, segment-vs-portal-disc intersection detects fly-through; teleport snaps the player via `tinyskies/teleportTo`. Arming logic: a freshly placed portal is unarmed until the player has moved more than PORTAL_ARM_DISTANCE away (so you don't insta-teleport on placement). Visual: 5-mesh stack (ring torus + glow disc + inner shader-disc + 2 swirl rings) scaled tall-and-narrow (0.65×, 1.25×, 1.0). Spawn animation: easeOutBack scale-in over 0.5s. Inner-disc shader (raw GLSL in source) approximated with MeshBasicNodeMaterial + emissive — same color story (vortex hue) without the swirl frag. Group parented to scene root so portals are world-anchored."
+  tags:
+    - vehicle
+    - vfx
+    - gameplay
+  priority: 0
+  throttleConfig:
+    throttlePriority: "HIGH"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    globeRadius:
+      name: "Globe Radius"
+      type: "number"
+      default: 5
+      min: 0.1
+      max: 200
+    terrainSeed:
+      name: "Terrain Seed"
+      type: "number"
+      default: 42
+    terrainType:
+      name: "Terrain Type"
+      type: "string"
+      default: "default"
+    triggerRadiusMult:
+      name: "Trigger Radius Multiplier"
+      type: "number"
+      default: 1
+      min: 0.5
+      max: 3
+      description: "Source 'Wide Portal' upgrade hook."
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  @import "spherical-math" as S;
+  @import "terrain" as T;
+
+  const LOG_TAG = "[tinyskies.carpetPortalSystem]";
+
+  // Source CarpetPortalSystem.ts:18-26 — verbatim.
+  const PORTAL_PLACE_AHEAD = 0.45;
+  const PORTAL_RADIUS = 0.15;
+  const PORTAL_TUBE_RADIUS = 0.022;
+  const PORTAL_TRIGGER_RADIUS = 0.22;
+  const PORTAL_ARM_DISTANCE = 0.38;
+  const PORTAL_EXIT_PUSH = 0.22;
+  const PORTAL_COOLDOWN_SEC = 0.3;
+  const CARPET_HOVER_HEIGHT = 0.12;
+  const PORTAL_COLORS = [0x00aaff, 0xff7700];
+
+  function cartesianFromSphericalInto(qPosition, altitude, globeRadius, out) {
+    return out.set(0, globeRadius + altitude, 0).applyQuaternion(qPosition);
+  }
+
+  function buildPortalVisual(colorHex, phase) {
+    const group = new THREE.Group();
+    group.userData.isRuntimeOnly = true;
+
+    // Source PortalVisual: scaledGroup at (0.65, 1.25, 1.0) — Portal-2 silhouette.
+    const scaled = new THREE.Group();
+    scaled.userData.isRuntimeOnly = true;
+    scaled.scale.set(0.65, 1.25, 1.0);
+    group.add(scaled);
+
+    const ringMat = new THREE.MeshBasicNodeMaterial({
+      color: colorHex, transparent: true, opacity: 0.95,
+      blending: THREE.AdditiveBlending, side: THREE.DoubleSide, depthWrite: false,
+    });
+    const glowMat = new THREE.MeshBasicNodeMaterial({
+      color: colorHex, transparent: true, opacity: 0.35,
+      blending: THREE.AdditiveBlending, side: THREE.DoubleSide, depthWrite: false,
+    });
+    // Source inner uses a raw GLSL vortex shader; we approximate with an
+    // emissive disc + tint for WebGPU compat.
+    const innerMat = new THREE.MeshBasicNodeMaterial({
+      color: 0x000000, transparent: true, opacity: 0.85,
+      side: THREE.DoubleSide, depthWrite: false,
+    });
+    const swirlMat = new THREE.MeshBasicNodeMaterial({
+      color: colorHex, transparent: true, opacity: 0.7,
+      blending: THREE.AdditiveBlending, side: THREE.DoubleSide, depthWrite: false,
+    });
+    const swirl2Mat = new THREE.MeshBasicNodeMaterial({
+      color: colorHex, transparent: true, opacity: 0.6,
+      blending: THREE.AdditiveBlending, side: THREE.DoubleSide, depthWrite: false,
+    });
+
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(PORTAL_RADIUS, PORTAL_TUBE_RADIUS * 0.6, 18, 56), ringMat); // @check-ok no editor preview — portals only spawn during play via paintball key
+    const glow = new THREE.Mesh(new THREE.CircleGeometry(PORTAL_RADIUS * 1.3, 40), glowMat);
+    const inner = new THREE.Mesh(new THREE.CircleGeometry(PORTAL_RADIUS * 0.95, 40), innerMat);
+    const swirl = new THREE.Mesh(new THREE.TorusGeometry(PORTAL_RADIUS * 0.95, PORTAL_TUBE_RADIUS * 0.4, 12, 36), swirlMat);
+    const swirl2 = new THREE.Mesh(new THREE.TorusGeometry(PORTAL_RADIUS * 0.98, PORTAL_TUBE_RADIUS * 0.6, 12, 36), swirl2Mat);
+    [ring, glow, inner, swirl, swirl2].forEach((m) => { m.userData.isRuntimeOnly = true; });
+
+    glow.position.z = -0.012;
+    inner.position.z = -0.004;
+    swirl.position.z = 0.008;
+    swirl2.position.z = 0.012;
+
+    scaled.add(glow);
+    scaled.add(inner);
+    scaled.add(swirl);
+    scaled.add(swirl2);
+    scaled.add(ring);
+
+    return {
+      group, scaled, ring, glow, inner, swirl, swirl2,
+      materials: [ringMat, glowMat, innerMat, swirlMat, swirl2Mat],
+      phase,
+      createdAt: 0,
+    };
+  }
+
+  function disposePortalVisual(visual) {
+    [visual.ring, visual.glow, visual.inner, visual.swirl, visual.swirl2].forEach((m) => {
+      if (m && m.geometry && typeof m.geometry.dispose === "function") m.geometry.dispose();
+    });
+    visual.materials.forEach((mat) => { if (mat && typeof mat.dispose === "function") mat.dispose(); });
+  }
+
+  // Source PortalVisual.applyPose — basis matrix from right/up/forward.
+  const _poseMat = new THREE.Matrix4();
+  function applyPose(visual, worldPos, right, up, forward) {
+    _poseMat.makeBasis(right, up, forward);
+    _poseMat.setPosition(worldPos);
+    visual.group.matrixAutoUpdate = false;
+    visual.group.matrix.copy(_poseMat);
+    visual.group.matrixWorldNeedsUpdate = true;
+  }
+
+  // Source PortalVisual.update — easeOutBack spawn + pulse + swirl spin.
+  function tickPortalVisual(visual, time, age) {
+    const t = Math.min(1.0, age / 0.5);
+    const c1 = 1.70158;
+    const c3 = c1 + 1;
+    const ease = 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
+    const startX = 0.3, endX = 0.65;
+    const startY = 0.3, endY = 1.25;
+    const currentX = startX + (endX - startX) * ease;
+    const currentY = startY + (endY - startY) * ease;
+    visual.scaled.scale.set(currentX, currentY, 1.0 * ease);
+    visual.scaled.rotation.z = (1 - t) * Math.PI;
+
+    const pulse = 1 + Math.sin(time * 8.0 + visual.phase) * 0.02;
+    visual.ring.scale.setScalar(pulse);
+    visual.glow.scale.setScalar(0.95 + Math.sin(time * 4.0 + visual.phase) * 0.05);
+
+    visual.swirl.rotation.z = -time * 3.5 - visual.phase;
+    visual.swirl2.rotation.z = time * 2.8 + visual.phase * 0.5;
+    visual.swirl.scale.setScalar(1 + Math.sin(time * 12.0) * 0.03);
+    visual.swirl2.scale.setScalar(1 + Math.cos(time * 9.0) * 0.04);
+  }
+
+  this.init = function (_game) {
+    this._game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+
+    this._portals = [];
+    this._cooldown = 0;
+    this._time = 0;
+    this._nextPortalId = 0;
+    this._lastPlayerWorldPos = new THREE.Vector3();
+    this._hasLastPlayerWorldPos = false;
+
+    this._tmpQ = new THREE.Quaternion();
+    this._tmpUp = new THREE.Vector3();
+    this._tmpForward = new THREE.Vector3();
+    this._tmpRight = new THREE.Vector3();
+    this._tmpPos = new THREE.Vector3();
+    this._tmpSeg = new THREE.Vector3();
+    this._tmpRel = new THREE.Vector3();
+    this._tmpMappedDir = new THREE.Vector3();
+
+    this._group = new THREE.Group(); // @check-ok no editor preview — portals only spawn via paintball key during play
+    this._group.userData.isRuntimeOnly = true;
+    const sceneParent = this.gameObject._internal.three.parent || this.gameObject._internal.three;
+    sceneParent.add(this._group);
+
+    this._log("init");
+  };
+
+  this._readPlayerState = function () {
+    const store = this.erth.store;
+    const qx = store.get("tinyskies/qx");
+    const qy = store.get("tinyskies/qy");
+    const qz = store.get("tinyskies/qz");
+    const qw = store.get("tinyskies/qw");
+    const altitude = store.get("tinyskies/altitude");
+    const heading = store.get("tinyskies/heading") || 0;
+    const speed = store.get("tinyskies/speedRatio") || 0.4;
+    if (qx === undefined || qy === undefined || qz === undefined || qw === undefined || altitude === undefined) return null;
+    this._tmpQ.set(qx, qy, qz, qw);
+    return { qPosition: this._tmpQ, heading, altitude, speed };
+  };
+
+  this._headingVector = function (qPosition, heading, out) {
+    const frame = S.tangentFrame(qPosition);
+    out.set(0, 0, 0)
+      .addScaledVector(frame.north, Math.cos(heading))
+      .addScaledVector(frame.east, Math.sin(heading))
+      .normalize();
+    return frame;
+  };
+
+  this._placePortal = function (player) {
+    const radius = this.getAttribute("globeRadius");
+    const placeQ = S.moveOnSphere(player.qPosition, player.heading, PORTAL_PLACE_AHEAD / radius);
+    const frame = S.tangentFrame(placeQ);
+
+    const portalHalfHeight = PORTAL_RADIUS * 1.25 + PORTAL_TUBE_RADIUS;
+    const safeClearance = portalHalfHeight + 0.02;
+    const seed = this.getAttribute("terrainSeed") | 0;
+    const terrainType = this.getAttribute("terrainType");
+    const sample = T.sampleTerrain(seed, terrainType, frame.up.x, frame.up.y, frame.up.z);
+    const surfaceAlt = (typeof T.surfaceDisplacementAt === "function")
+      ? radius + T.surfaceDisplacementAt(seed, terrainType, frame.up.x, frame.up.y, frame.up.z)
+      : radius + (sample.elevation || 0);
+    const minAltitude = surfaceAlt + Math.max(CARPET_HOVER_HEIGHT, safeClearance);
+    const altitude = Math.max(player.altitude, minAltitude);
+
+    const worldPos = S.cartesianFromSpherical(placeQ, altitude, radius);
+    const forward = new THREE.Vector3();
+    this._headingVector(placeQ, player.heading, forward);
+    const right = new THREE.Vector3().crossVectors(forward, frame.up).normalize();
+
+    const colorHex = PORTAL_COLORS[this._nextPortalId % PORTAL_COLORS.length];
+    const phase = this._nextPortalId * 0.73;
+    const visual = buildPortalVisual(colorHex, phase); // @check-ok no editor preview
+    visual.createdAt = this._time;
+    applyPose(visual, worldPos, right, frame.up, forward);
+
+    if (this._portals.length === 2) {
+      const oldest = this._portals.shift();
+      this._group.remove(oldest.visual.group);
+      disposePortalVisual(oldest.visual);
+    }
+
+    this._group.add(visual.group);
+    this._portals.push({
+      id: this._nextPortalId++,
+      qPosition: placeQ.clone(),
+      heading: player.heading,
+      altitude,
+      minAltitude,
+      worldPosition: worldPos.clone(),
+      up: frame.up.clone(),
+      forward: forward.clone(),
+      right: right.clone(),
+      visual,
+      armed: false,
+    });
+    tickPortalVisual(visual, this._time, 0);
+    this._log("portal placed", this._portals.length);
+  };
+
+  this._updateArming = function (playerPos) {
+    const armSq = PORTAL_ARM_DISTANCE * PORTAL_ARM_DISTANCE;
+    for (const portal of this._portals) {
+      if (!portal.armed && playerPos.distanceToSquared(portal.worldPosition) > armSq) {
+        portal.armed = true;
+      }
+    }
+  };
+
+  this._segmentPortalIntersection = function (start, end, portal) {
+    this._tmpSeg.copy(end).sub(start);
+    const denom = portal.forward.dot(this._tmpSeg);
+    if (Math.abs(denom) < 1e-5) return null;
+    const startDepth = portal.forward.dot(this._tmpRel.copy(start).sub(portal.worldPosition));
+    const endDepth = portal.forward.dot(this._tmpRel.copy(end).sub(portal.worldPosition));
+    if (startDepth * endDepth > 0) return null;
+    const t = startDepth / (startDepth - endDepth);
+    if (t < 0 || t > 1) return null;
+    // Hit point on plane.
+    this._tmpRel.copy(this._tmpSeg).multiplyScalar(t).add(start).sub(portal.worldPosition);
+    const rightDist = this._tmpRel.dot(portal.right);
+    const upDist = this._tmpRel.dot(portal.up);
+    const radial = Math.sqrt(rightDist * rightDist + upDist * upDist);
+    const triggerR = PORTAL_TRIGGER_RADIUS * this.getAttribute("triggerRadiusMult");
+    if (radial > triggerR) return null;
+    return t;
+  };
+
+  this._findHit = function (start, end) {
+    let bestHit = null;
+    for (let i = 0; i < this._portals.length; i++) {
+      const portal = this._portals[i];
+      if (!portal.armed) continue;
+      const t = this._segmentPortalIntersection(start, end, portal);
+      if (t === null) continue;
+      if (!bestHit || t < bestHit.t) bestHit = { entryIndex: i, t };
+    }
+    return bestHit;
+  };
+
+  this._mapHeading = function (incomingDir, entry, exit) {
+    const m = this._tmpMappedDir;
+    m.copy(exit.forward).multiplyScalar(incomingDir.dot(entry.forward));
+    m.addScaledVector(exit.right, incomingDir.dot(entry.right));
+    m.addScaledVector(exit.up, incomingDir.dot(entry.up));
+    m.addScaledVector(exit.up, -m.dot(exit.up));
+    if (m.lengthSq() < 1e-5) m.copy(exit.forward);
+    else m.normalize();
+    const exitFrame = S.tangentFrame(exit.qPosition);
+    const heading = Math.atan2(m.dot(exitFrame.east), m.dot(exitFrame.north));
+    return ((heading % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
+  };
+
+  this._teleportThrough = function (player, entryIndex) {
+    const entry = this._portals[entryIndex];
+    const exit = this._portals[entryIndex === 0 ? 1 : 0];
+    const radius = this.getAttribute("globeRadius");
+    const incomingDir = new THREE.Vector3();
+    this._headingVector(player.qPosition, player.heading, incomingDir);
+    const exitHeading = this._mapHeading(incomingDir, entry, exit);
+    const exitQPosition = S.moveOnSphere(exit.qPosition, exitHeading, PORTAL_EXIT_PUSH / radius);
+    const exitFrame = S.tangentFrame(exitQPosition);
+    const seed = this.getAttribute("terrainSeed") | 0;
+    const terrainType = this.getAttribute("terrainType");
+    const surfaceAlt = (typeof T.surfaceDisplacementAt === "function")
+      ? radius + T.surfaceDisplacementAt(seed, terrainType, exitFrame.up.x, exitFrame.up.y, exitFrame.up.z)
+      : radius;
+    const safeFloor = surfaceAlt + CARPET_HOVER_HEIGHT;
+    const exitAltitude = Math.max(exit.altitude, exit.minAltitude, safeFloor);
+
+    this.erth.store.set("tinyskies/teleportTo", {
+      qx: exitQPosition.x, qy: exitQPosition.y, qz: exitQPosition.z, qw: exitQPosition.w,
+      heading: exitHeading,
+      altitude: exitAltitude,
+    });
+    this._cooldown = PORTAL_COOLDOWN_SEC;
+    for (const portal of this._portals) portal.armed = false;
+    this._log("teleported through portal", entryIndex);
+  };
+
+  this.update = function (deltaTime) {
+    if (!this._group) return;
+    const dt = Math.min(deltaTime || 0, 0.1);
+    this._time += dt;
+    if (this._cooldown > 0) this._cooldown = Math.max(0, this._cooldown - dt);
+
+    // Animate any existing portals (regardless of vehicle so they keep
+    // rendering during transitions).
+    for (const portal of this._portals) {
+      tickPortalVisual(portal.visual, this._time, this._time - portal.visual.createdAt);
+    }
+
+    const store = this.erth.store;
+    const vt = store.get("tinyskies/vehicleType") || "plane";
+    const isCarpet = (vt === "carpet");
+
+    // If the player switches off carpet, clear portals so they don't sit
+    // around on plane / boat.
+    if (!isCarpet) {
+      this._hasLastPlayerWorldPos = false;
+      if (this._portals.length > 0) {
+        for (const portal of this._portals) {
+          this._group.remove(portal.visual.group);
+          disposePortalVisual(portal.visual);
+        }
+        this._portals.length = 0;
+      }
+      return;
+    }
+
+    const player = this._readPlayerState();
+    if (!player) return;
+    const radius = this.getAttribute("globeRadius");
+    const currentWorldPos = cartesianFromSphericalInto(player.qPosition, player.altitude, radius, this._tmpPos);
+
+    // Place portal on firePaintball (paint key — repurposed for carpet).
+    if (store.get("tinyskies/firePaintball") === true) {
+      store.set("tinyskies/firePaintball", false);
+      this._placePortal(player);
+    }
+
+    if (!this._hasLastPlayerWorldPos) {
+      this._lastPlayerWorldPos.copy(currentWorldPos);
+      this._hasLastPlayerWorldPos = true;
+      this._updateArming(currentWorldPos);
+      return;
+    }
+
+    this._updateArming(currentWorldPos);
+
+    if (this._cooldown > 0 || this._portals.length < 2) {
+      this._lastPlayerWorldPos.copy(currentWorldPos);
+      return;
+    }
+
+    const hit = this._findHit(this._lastPlayerWorldPos, currentWorldPos);
+    if (!hit) {
+      this._lastPlayerWorldPos.copy(currentWorldPos);
+      return;
+    }
+
+    this._teleportThrough(player, hit.entryIndex);
+    // Re-anchor for next-frame hit window after teleport.
+    this._hasLastPlayerWorldPos = false;
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    if (this._portals) {
+      for (const portal of this._portals) {
+        if (portal.visual && portal.visual.group && portal.visual.group.parent) {
+          portal.visual.group.parent.remove(portal.visual.group);
+        }
+        if (portal.visual) disposePortalVisual(portal.visual);
+      }
+      this._portals = [];
+    }
+    if (this._group && this._group.parent) this._group.parent.remove(this._group);
+    this._group = null;
+    this._hasLastPlayerWorldPos = false;
+  };

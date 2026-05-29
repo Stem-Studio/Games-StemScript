@@ -1,0 +1,366 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "Solar Info Panel"
+  id: "sw.solarInfoPanel"
+  author: "scriptwizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Selected planet info card overlay with close/reset action"
+  tags:
+    - ui
+  priority: 20
+  attributes: {}
+  documentation: "Bottom-left selected planet info panel."
+
+code: |
+  /**
+   * Solar System — Selected Planet Info Panel
+   * Standalone bottom-left info overlay fed by store keys.
+   *
+   * Renders identically in editor preview and play mode via the inlined
+   * dual-mode helper (see docs/examples/canonical/uikit_dual_mode_init.js).
+   */
+
+  const uikit = (function () {
+    function createPlayContext(g) {
+      return {
+        kind: "play",
+        renderer: (g.app && g.app.renderer) || g.renderer,
+        getUICamera: function () { return g.uiCamera; },
+        gameLike: g,
+      };
+    }
+    async function createEditorContext(editor) {
+      const uiCamera = await editor.ensureUICamera();
+      const gameLike = {
+        renderer: editor.renderer,
+        uiCamera: uiCamera,
+        scene: editor.scene,
+        app: { renderer: editor.renderer },
+      };
+      return {
+        kind: "editor",
+        renderer: editor.renderer,
+        getUICamera: function () { return uiCamera; },
+        gameLike: gameLike,
+      };
+    }
+    function buildRoot(ctx, properties) {
+      const overrides = properties || {};
+      const root = new UIKit.Fullscreen(ctx.renderer, {
+        pixelSize: overrides.pixelSize !== undefined ? overrides.pixelSize : 0.002,
+        pointerEvents: overrides.pointerEvents || "listener",
+        visibility: overrides.visibility || "visible",
+      });
+      root.userData.isRuntimeOnly = true;
+      return root;
+    }
+    function attach(behavior, ctx) {
+      if (!behavior._uiRoot) return false;
+      if (behavior._uiAttached) return true;
+      const uiCamera = ctx.getUICamera();
+      if (!uiCamera) return false;
+      UIKitPointerEvents.initialize(ctx.gameLike);
+      uiCamera.add(behavior._uiRoot);
+      UIKitPointerEvents.registerRoot(behavior._uiRoot);
+      behavior._uiAttached = true;
+      return true;
+    }
+    function tick(behavior, deltaTime) {
+      if (!behavior._uikitCtx) return;
+      if (!behavior._uiAttached) attach(behavior, behavior._uikitCtx);
+      if (behavior._uiAttached) UIKitPointerEvents.update(deltaTime || 16);
+    }
+    function teardown(behavior) {
+      if (behavior._uiRoot) {
+        try { UIKitPointerEvents.unregisterRoot(behavior._uiRoot); } catch (_e) {}
+        if (behavior._uiRoot.parent) behavior._uiRoot.parent.remove(behavior._uiRoot);
+        if (behavior._uiRoot.dispose) behavior._uiRoot.dispose();
+        behavior._uiRoot = null;
+      }
+      try { UIKitPointerEvents.deinitialize(); } catch (_e) {}
+      behavior._uiAttached = false;
+      behavior._uikitCtx = null;
+    }
+    return {
+      createPlayContext: createPlayContext,
+      createEditorContext: createEditorContext,
+      buildRoot: buildRoot,
+      attach: attach,
+      tick: tick,
+      teardown: teardown,
+    };
+  })();
+
+  let store = null;
+  let panelRef = null;
+  let titleText = null;
+  let closeBtn = null;
+  let closeBtnText = null;
+  let rowTextRefs = [];
+  let factText = null;
+  let separator = null;
+  let lastSelected = "";
+  let lastViewportW = -1;
+  const MOBILE_UI_MAX_WIDTH = 768;
+  const MOBILE_UI_SCALE = 0.8;
+  const INFO_DESKTOP_WIDTH = 18;
+  const INFO_MOBILE_BASE_WIDTH = 23;
+
+  const PLANET_ACCENT = {
+    Mercury: 0xb5b5b5,
+    Venus: 0xe8cda0,
+    Earth: 0x57a6ff,
+    Mars: 0xc1440e,
+    Jupiter: 0xc88b3a,
+    Saturn: 0xe8d191,
+    Uranus: 0x73d5e8,
+    Neptune: 0x3f54ba,
+    Moon: 0xbfc5d6
+  };
+
+  // navigator is not exposed in the SES compartment — rely on window only.
+  function isMobileUi() {
+    if (typeof window === "undefined") return false;
+    const touchCapable = ("ontouchstart" in window);
+    const coarsePointer = !!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches);
+    return window.innerWidth <= MOBILE_UI_MAX_WIDTH || (touchCapable && coarsePointer);
+  }
+
+  function applyResponsiveLayout() {
+    if (!panelRef || !titleText || !factText) return;
+    const mobile = isMobileUi();
+    const s = mobile ? MOBILE_UI_SCALE : 1;
+    const sf = function(n) { return Math.max(1, Math.round(n * s)); };
+    const widthPct = mobile ? INFO_MOBILE_BASE_WIDTH : INFO_DESKTOP_WIDTH;
+    panelRef.setProperties({
+      width: widthPct + "%",
+      positionLeft: "2%",
+      positionTop: "auto",
+      positionBottom: "2%",
+      gap: sf(8),
+      padding: sf(14),
+      borderRadius: sf(18)
+    });
+    titleText.setProperties({ fontSize: sf(16) });
+    if (closeBtn) {
+      closeBtn.setProperties({
+        width: sf(32),
+        height: sf(32),
+        borderRadius: sf(16)
+      });
+    }
+    if (closeBtnText) closeBtnText.setProperties({ fontSize: sf(16) });
+    for (let i = 0; i < rowTextRefs.length; i++) rowTextRefs[i].setProperties({ fontSize: sf(10) });
+    if (separator) separator.setProperties({ height: 1, marginTop: sf(2), marginBottom: sf(2) });
+    factText.setProperties({ fontSize: sf(9) });
+  }
+
+  function buildPanel() {
+    panelRef = new UIKit.Container({
+      positionType: "absolute",
+      positionLeft: "2%",
+      positionBottom: "2%",
+      width: "22%",
+      flexDirection: "column",
+      gap: 8,
+      padding: 14,
+      borderRadius: 18,
+      borderWidth: 1,
+      borderColor: 0x1b2230,
+      backgroundColor: 0x05070d,
+      backgroundOpacity: 0.9,
+      pointerEvents: "auto",
+      zIndex: 100,
+      visibility: "hidden"
+    });
+
+    let header = new UIKit.Container({
+      flexDirection: "row",
+      justifyContent: "space-between",
+      alignItems: "center",
+      width: "100%",
+      gap: 8,
+      visibility: "visible"
+    });
+
+    titleText = new UIKit.Text({
+      text: "",
+      fontSize: 16,
+      fontWeight: "bold",
+      color: 0xffffff,
+      pointerEvents: "none",
+      visibility: "hidden"
+    });
+    closeBtn = new UIKit.Container({
+      width: 32,
+      height: 32,
+      borderRadius: 16,
+      justifyContent: "center",
+      alignItems: "center",
+      backgroundColor: 0x0f1723,
+      backgroundOpacity: 0.8,
+      borderWidth: 1,
+      borderColor: 0x2e3a51,
+      pointerEvents: "auto",
+      cursor: "pointer",
+      visibility: "hidden",
+      onClick: function() {
+        if (!store) return;
+        store.set("solarClearSelection", true);
+      }
+    });
+    closeBtnText = new UIKit.Text({
+      text: "×",
+      fontSize: 16,
+      color: 0xa9b1bf,
+      pointerEvents: "none",
+      visibility: "hidden"
+    });
+    closeBtn.add(closeBtnText);
+    header.add(titleText);
+    header.add(closeBtn);
+    panelRef.add(header);
+
+    rowTextRefs = [];
+    const labels = ["Diameter", "Distance", "Temperature", "Moons", "Day length", "Year length"];
+    for (let i = 0; i < labels.length; i++) {
+      const row = new UIKit.Text({
+        text: "",
+        fontSize: 10,
+        color: 0xf3f5fa,
+        pointerEvents: "none",
+        visibility: "hidden"
+      });
+      rowTextRefs.push(row);
+      panelRef.add(row);
+    }
+
+    separator = new UIKit.Container({
+      width: "100%",
+      height: 1,
+      backgroundColor: 0x242b39,
+      backgroundOpacity: 1,
+      visibility: "hidden",
+      pointerEvents: "none"
+    });
+    panelRef.add(separator);
+
+    factText = new UIKit.Text({
+      text: "",
+      fontSize: 9,
+      color: 0xa7b0bf,
+      pointerEvents: "none",
+      visibility: "hidden"
+    });
+    panelRef.add(factText);
+    return panelRef;
+  }
+
+  function parseInfoParts(info) {
+    const chunks = String(info || "").split("|").map(function(s) { return s.trim(); });
+    while (chunks.length < 7) chunks.push("");
+    return {
+      diameter: chunks[0].replace(/^Diameter:\s*/i, ""),
+      distance: chunks[1].replace(/^(Dist|Distance):\s*/i, ""),
+      temperature: chunks[2].replace(/^(Temp|Temperature):\s*/i, ""),
+      moons: chunks[3].replace(/^Moons:\s*/i, ""),
+      dayLength: chunks[4].replace(/^Day:\s*/i, ""),
+      yearLength: chunks[5].replace(/^Year:\s*/i, ""),
+      funFact: chunks[6]
+    };
+  }
+
+  function refreshInfo() {
+    if (!store || !panelRef || !titleText || !factText) return;
+    const selected = store.get("solarSelectedPlanet") || "";
+    const info = store.get("solarSelectedPlanetInfo") || "";
+    if (!selected) {
+      panelRef.setProperties({ visibility: "hidden" });
+      titleText.setProperties({ text: "", visibility: "hidden" });
+      if (closeBtn) closeBtn.setProperties({ visibility: "hidden" });
+      if (closeBtnText) closeBtnText.setProperties({ visibility: "hidden" });
+      for (let i = 0; i < rowTextRefs.length; i++) rowTextRefs[i].setProperties({ text: "", visibility: "hidden" });
+      if (separator) separator.setProperties({ visibility: "hidden" });
+      factText.setProperties({ text: "", visibility: "hidden" });
+      lastSelected = "";
+      return;
+    }
+    const accent = PLANET_ACCENT[selected] || 0xffffff;
+    const parts = parseInfoParts(info);
+    panelRef.setProperties({ borderColor: accent, visibility: "visible" });
+    titleText.setProperties({ text: selected, color: 0xffffff, visibility: "visible" });
+    if (closeBtn) closeBtn.setProperties({ visibility: "visible" });
+    if (closeBtnText) closeBtnText.setProperties({ visibility: "visible" });
+    const values = [parts.diameter, parts.distance, parts.temperature, parts.moons, parts.dayLength, parts.yearLength];
+    const labels = ["Diameter", "Distance", "Temperature", "Moons", "Day length", "Year length"];
+    for (let i = 0; i < rowTextRefs.length; i++) rowTextRefs[i].setProperties({ text: labels[i] + ": " + values[i], visibility: "visible" });
+    if (separator) separator.setProperties({ visibility: "visible" });
+    factText.setProperties({ text: parts.funFact ? parts.funFact : "", visibility: parts.funFact ? "visible" : "hidden" });
+    lastSelected = selected;
+  }
+
+  function resetUiState() {
+    panelRef = null;
+    titleText = null;
+    closeBtn = null;
+    closeBtnText = null;
+    rowTextRefs = [];
+    factText = null;
+    separator = null;
+    lastSelected = "";
+    lastViewportW = -1;
+  }
+
+  this._buildUIKitContent = function() {
+    if (!this._uiRoot) return;
+    resetUiState();
+    this._uiRoot.add(buildPanel());
+    lastViewportW = typeof window !== "undefined" ? window.innerWidth : -1;
+    applyResponsiveLayout();
+  };
+
+  this.init = function(_game) {
+    store = this.erth ? this.erth.store : null;
+    this._uikitCtx = uikit.createPlayContext(_game);
+    this._uiRoot = uikit.buildRoot(this._uikitCtx);
+    this._buildUIKitContent();
+    uikit.attach(this, this._uikitCtx);
+  };
+
+  this.update = function(deltaTime) {
+    if (!this._uiRoot) return;
+    uikit.tick(this, deltaTime);
+    refreshInfo();
+    if (typeof window !== "undefined" && window.innerWidth !== lastViewportW) {
+      lastViewportW = window.innerWidth;
+      applyResponsiveLayout();
+    }
+  };
+
+  this.dispose = function() {
+    uikit.teardown(this);
+    resetUiState();
+    store = null;
+  };
+
+  this.onEditorAdded = async function(editor) {
+    if (!this._uiRoot) {
+      this._uikitCtx = await uikit.createEditorContext(editor);
+      this._uiRoot = uikit.buildRoot(this._uikitCtx);
+      this._buildUIKitContent();
+    } else if (!this._uiAttached) {
+      this._uikitCtx = await uikit.createEditorContext(editor);
+    }
+    uikit.attach(this, this._uikitCtx);
+  };
+
+  this.onEditorDispose = function() {
+    uikit.teardown(this);
+    resetUiState();
+  };

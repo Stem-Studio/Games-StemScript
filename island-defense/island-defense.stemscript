@@ -1,0 +1,38 @@
+# Island Defense — solve to spawn blue troops; defend the blue castle from waves of red AI
+# Ported from https://github.com/quangrau/island-defense-demo (Phaser 3 + React)
+# Reference patterns from chongdashu/phaserjs-tinyswords (Castle Clash Duel)
+
+project title "Island Defense"
+
+# Scene: ocean blue background — battlefield is rendered via UIKit Fullscreen
+scene background type=Color color=#1e6091
+
+# Lighting: bright ambient for unlit UIKit rendering; remove default directionals
+light "AmbientLight" intensity=3
+delete "HemisphereLight"
+delete "Directional Light"
+
+# Audio imports (Phase 1 ships 4 of 10 SFX — playback wiring is Phase 2)
+import audio name="IDBgLoop"      filepath="assets/sounds/bg_loop.mp3"            comment="Battle BGM (loops during battle)"
+import audio name="IDSwordHit1"   filepath="assets/sounds/sword_impact_hit_1.mp3" comment="Melee impact SFX"
+import audio name="IDFinish"      filepath="assets/sounds/finish.mp3"             comment="Victory jingle"
+import audio name="IDDefeat"      filepath="assets/sounds/defeat.mp3"             comment="Defeat jingle"
+
+# GameAnchor — empty group that owns the game behavior and anchors the editor preview
+add group name="GameAnchor" position=0,0,0
+update GameAnchor tag=Player
+
+# Camera: fixed overhead, no built-in behavior (UIKit handles all visuals in Phase 1)
+camera "DefaultCamera" cameraType=NONE
+update "DefaultCamera" position=0,10,0 rotation=-90,0,0
+
+# Shared script-import asset — UIKit dual-mode helper used by every behavior
+# that builds a UIKit.Fullscreen tree. Replaces the per-behavior inline IIFE.
+import script name="uikit-dual-mode" filepath="imports/uikit-dual-mode.yaml" comment="Dual-mode UIKit lifecycle helper"
+
+# Import and attach the single game behavior
+import behavior name="Island Defense Game" filepath="behaviors/islandDefenseGame.yaml"
+behavior attach "GameAnchor" behaviorId=id.game
+
+# Enable game mode
+game settings enabled=true

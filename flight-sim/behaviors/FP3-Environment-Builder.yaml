@@ -1,0 +1,230 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+config:
+  priority: 0
+  name: "FP3-Environment-Builder"
+  id: "fp3.environmentBuilder"
+  author: "flight-sim"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Builds terrain, buildings, houses, and mountains for the flight-sim world"
+  tags:
+    - gameplay
+  attributes: {}
+  documentation: "Procedurally generates ground terrain, city buildings with windows, residential houses with roofs, and snow-capped mountain ranges."
+code: |
+  const SEA_LEVEL = 0;
+  const GROUND_LEVEL = 10;
+
+  let game;
+  const disposables = [];
+
+  function trackGeo(geo) { disposables.push(geo); return geo; }
+  function trackMat(mat) { disposables.push(mat); return mat; }
+
+  function createBuilding(THREE) {
+    const width = 5 + Math.random() * 10;
+    const height = 10 + Math.random() * 30;
+    const depth = 5 + Math.random() * 10;
+
+    const geometry = trackGeo(new THREE.BoxGeometry(width, height, depth));
+    const colorVal = 0x808080 + Math.floor(Math.random() * 0x404040);
+    const material = trackMat(new THREE.MeshStandardNodeMaterial({ color: colorVal }));
+    const building = new THREE.Mesh(geometry, material);
+    building.position.y = height / 2 + GROUND_LEVEL;
+    building.castShadow = true;
+    building.receiveShadow = true;
+    building.userData.isRuntimeOnly = true;
+
+    // Add windows on two faces
+    const windowGeo = trackGeo(new THREE.BoxGeometry(0.8, 0.8, 0.1));
+    const windowMat = trackMat(new THREE.MeshStandardNodeMaterial({
+      color: 0xFFFF99,
+      emissive: 0xFFFF44,
+      emissiveIntensity: 0.5
+    }));
+
+    const floors = Math.floor(height / 4);
+    const windowsPerFloor = Math.floor(width / 3);
+
+    for (let f = 0; f < floors; f++) {
+      for (let w = 0; w < windowsPerFloor; w++) {
+        // Front face
+        const winFront = new THREE.Mesh(windowGeo, windowMat);
+        winFront.position.set(
+          -width / 2 + 1.5 + w * 3,
+          -height / 2 + 2 + f * 4,
+          depth / 2 + 0.05
+        );
+        winFront.userData.isRuntimeOnly = true;
+        building.add(winFront);
+
+        // Back face
+        const winBack = new THREE.Mesh(windowGeo, windowMat);
+        winBack.position.set(
+          -width / 2 + 1.5 + w * 3,
+          -height / 2 + 2 + f * 4,
+          -depth / 2 - 0.05
+        );
+        winBack.userData.isRuntimeOnly = true;
+        building.add(winBack);
+      }
+    }
+
+    return building;
+  }
+
+  function createHouse(THREE) {
+    const group = new THREE.Group();
+    group.userData.isRuntimeOnly = true;
+
+    const width = 4 + Math.random() * 3;
+    const height = 3 + Math.random() * 2;
+    const depth = 4 + Math.random() * 3;
+
+    // Base
+    const baseGeo = trackGeo(new THREE.BoxGeometry(width, height, depth));
+    const baseColorVal = 0xDEB887 + Math.floor(Math.random() * 0x202020);
+    const baseMat = trackMat(new THREE.MeshStandardNodeMaterial({ color: baseColorVal }));
+    const base = new THREE.Mesh(baseGeo, baseMat);
+    base.position.y = height / 2;
+    base.castShadow = true;
+    base.receiveShadow = true;
+    base.userData.isRuntimeOnly = true;
+    group.add(base);
+
+    // Roof
+    const roofGeo = trackGeo(new THREE.ConeGeometry(width * 0.7, height * 0.5, 4));
+    const roofMat = trackMat(new THREE.MeshStandardNodeMaterial({ color: 0x8B4513 }));
+    const roof = new THREE.Mesh(roofGeo, roofMat);
+    roof.position.y = height + height * 0.25;
+    roof.rotation.y = Math.PI / 4;
+    roof.castShadow = true;
+    roof.userData.isRuntimeOnly = true;
+    group.add(roof);
+
+    group.position.y = GROUND_LEVEL;
+    return group;
+  }
+
+  function createMountain(THREE) {
+    const group = new THREE.Group();
+    group.userData.isRuntimeOnly = true;
+
+    const baseRadius = 40 + Math.random() * 60;
+    const height = 100 + Math.random() * 200;
+
+    // Main peak
+    const peakGeo = trackGeo(new THREE.ConeGeometry(baseRadius, height, 8));
+    const peakMat = trackMat(new THREE.MeshStandardNodeMaterial({
+      color: 0x6B8E23,
+      flatShading: true
+    }));
+    const peak = new THREE.Mesh(peakGeo, peakMat);
+    peak.position.y = height / 2;
+    peak.castShadow = true;
+    peak.receiveShadow = true;
+    peak.userData.isRuntimeOnly = true;
+    group.add(peak);
+
+    // Snow cap
+    const snowRadius = baseRadius * 0.3;
+    const snowHeight = height * 0.25;
+    const snowGeo = trackGeo(new THREE.ConeGeometry(snowRadius, snowHeight, 8));
+    const snowMat = trackMat(new THREE.MeshStandardNodeMaterial({
+      color: 0xFFFFFF,
+      flatShading: true
+    }));
+    const snow = new THREE.Mesh(snowGeo, snowMat);
+    snow.position.y = height - snowHeight / 2;
+    snow.userData.isRuntimeOnly = true;
+    group.add(snow);
+
+    // Secondary smaller peaks around main peak
+    const subPeakCount = 1 + Math.floor(Math.random() * 3);
+    for (let i = 0; i < subPeakCount; i++) {
+      const subRadius = baseRadius * (0.3 + Math.random() * 0.4);
+      const subHeight = height * (0.3 + Math.random() * 0.4);
+      const subGeo = trackGeo(new THREE.ConeGeometry(subRadius, subHeight, 7));
+      const subMat = trackMat(new THREE.MeshStandardNodeMaterial({
+        color: 0x556B2F,
+        flatShading: true
+      }));
+      const subPeak = new THREE.Mesh(subGeo, subMat);
+      const angle = (i / subPeakCount) * Math.PI * 2 + Math.random() * 0.5;
+      subPeak.position.set(
+        Math.cos(angle) * baseRadius * 0.6,
+        subHeight / 2,
+        Math.sin(angle) * baseRadius * 0.6
+      );
+      subPeak.castShadow = true;
+      subPeak.userData.isRuntimeOnly = true;
+      group.add(subPeak);
+    }
+
+    group.position.y = GROUND_LEVEL;
+    return group;
+  }
+
+  this.init = function(_game) {
+    game = _game;
+    const root = this.gameObject._internal.three;
+
+    // === TERRAIN ===
+    const groundGeo = trackGeo(new THREE.BoxGeometry(1000, 35, 4000));
+    const groundMat = trackMat(new THREE.MeshStandardNodeMaterial({
+      color: 0x2D5A27,
+      shininess: 0,
+      flatShading: true
+    }));
+    const ground = new THREE.Mesh(groundGeo, groundMat);
+    ground.position.set(150, GROUND_LEVEL - 17.5, 0);
+    ground.receiveShadow = true;
+    ground.userData.isRuntimeOnly = true;
+    root.add(ground);
+
+    // === BUILDINGS (city area) ===
+    for (let i = 0; i < 30; i++) {
+      const building = createBuilding(THREE);
+      building.position.x = 50 + Math.random() * 250;
+      building.position.z = -300 + Math.random() * 600;
+      root.add(building);
+    }
+
+    // === HOUSES (near runway) ===
+    for (let i = 0; i < 20; i++) {
+      const house = createHouse(THREE);
+      house.position.x = -50 + Math.random() * 100;
+      house.position.z = -400 + Math.random() * 200;
+      root.add(house);
+    }
+
+    // === MOUNTAINS ===
+    const mountainCount = 5 + Math.floor(Math.random() * 4);
+    for (let i = 0; i < mountainCount; i++) {
+      const mountain = createMountain(THREE);
+      mountain.position.x = 200 + Math.random() * 300;
+      mountain.position.z = -500 + Math.random() * 1000;
+      root.add(mountain);
+    }
+  };
+
+  this.dispose = function() {
+    for (const item of disposables) {
+      if (item && typeof item.dispose === 'function') {
+        item.dispose();
+      }
+    }
+    disposables.length = 0;
+  };
+
+  this.onEditorAdded = function() {
+    // No editor preview for runtime-only procedural geometry
+  };
+
+  this.onEditorDispose = function() {
+    // Nothing to clean up in editor
+  };

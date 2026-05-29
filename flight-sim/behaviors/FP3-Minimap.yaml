@@ -1,0 +1,329 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+config:
+  priority: 0
+  name: FP3 Minimap
+  id: fp3.minimap
+  author: flight-sim
+  isScript: true
+  main: script.js
+  version: 1.0.0
+  description: "Circular radar minimap showing player, enemies, and balloons as colored dots. Reads fp3_playerPosition, fp3_remotePlayers, fp3_balloons store keys."
+  tags:
+    - gameplay
+    - ui
+    - minimap
+  attributes: {}
+  documentation: "Renders a circular radar-style minimap in the bottom-right corner using UIKit Containers as colored dots. Player is a fixed green dot at center. Remote players are red dots, balloons are yellow dots, positioned relative to the player. Includes a runway reference line. Desktop: 150x150 bottom-right. Mobile: 100x100 top-right."
+code: |
+  // ============================================================
+  // FP3 Minimap
+  // Circular radar minimap using UIKit Container dots.
+  // Reads fp3_playerPosition, fp3_remotePlayers, fp3_balloons.
+  // ============================================================
+
+  let game;
+  let store;
+  let fullscreen = null;
+  let updateTimer = 0;
+  let UPDATE_INTERVAL = 0.1; // 10Hz — minimap doesn't need fast updates
+
+  // Map config
+  let MAP_SIZE = 150;
+  let MAP_RADIUS = 75;
+  let MAP_WORLD_RANGE = 1000; // world units visible on map
+  let SCALE_FACTOR = MAP_SIZE / (MAP_WORLD_RANGE * 2); // world → px
+  let DOT_SIZE = 6;
+  let SMALL_DOT = 5;
+
+  // UI references
+  let mapContainer = null;
+  let playerDot = null;
+  let headingIndicator = null;
+  let runwayLine = null;
+  let enemyDots = [];
+  let balloonDots = [];
+  let MAX_ENEMY_DOTS = 16;
+  let MAX_BALLOON_DOTS = 30;
+  let isMobile = false;
+  let cameraRetryId = null;
+
+  function createDot(size, color) {
+    return new UIKit.Container({
+      width: size,
+      height: size,
+      backgroundColor: color,
+      borderRadius: size / 2,
+      visibility: 'hidden'
+    });
+  }
+
+  this.init = function(_game) {
+    game = _game;
+    store = this.erth.store;
+
+    // Detect mobile via renderer size
+    if (game.renderer) {
+      let canvas = game.renderer.domElement;
+      if (canvas && canvas.clientWidth < 768) {
+        isMobile = true;
+        MAP_SIZE = 100;
+        MAP_RADIUS = 50;
+        SCALE_FACTOR = MAP_SIZE / (MAP_WORLD_RANGE * 2);
+      }
+    }
+  };
+
+  this.onStart = function() {
+    fullscreen = new UIKit.Fullscreen(game.renderer, { visibility: 'visible' });
+
+    let addToCamera = function() {
+      if (game.uiCamera) {
+        game.uiCamera.add(fullscreen);
+        cameraRetryId = null;
+      } else {
+        cameraRetryId = setTimeout(addToCamera, 100);
+      }
+    };
+    addToCamera();
+
+    // ── Map container (circular) ──
+    mapContainer = new UIKit.Container({
+      width: MAP_SIZE,
+      height: MAP_SIZE,
+      backgroundColor: 'rgba(0,10,20,0.6)',
+      borderRadius: MAP_RADIUS,
+      overflow: 'hidden',
+      visibility: 'visible'
+    });
+    fullscreen.add(mapContainer);
+
+    // Position: bottom-right on desktop, top-right on mobile
+    if (isMobile) {
+      mapContainer.position.set(0.40, 0.38, 0);
+    } else {
+      mapContainer.position.set(0.42, -0.22, 0);
+    }
+
+    // ── Map border ring ──
+    let borderRing = new UIKit.Container({
+      width: MAP_SIZE,
+      height: MAP_SIZE,
+      borderRadius: MAP_RADIUS,
+      borderWidth: 1,
+      borderColor: 'rgba(0,200,255,0.3)',
+      backgroundColor: 'transparent',
+      visibility: 'visible'
+    });
+    mapContainer.add(borderRing);
+    borderRing.position.set(0, 0, 0.001);
+
+    // ── Runway reference line (at world origin, white thin bar) ──
+    runwayLine = new UIKit.Container({
+      width: 2,
+      height: 20,
+      backgroundColor: 'rgba(255,255,255,0.5)',
+      visibility: 'visible'
+    });
+    mapContainer.add(runwayLine);
+    runwayLine.position.set(0, 0, 0.001);
+
+    // ── Crosshair lines (N/S/E/W reference) ──
+    let crossV = new UIKit.Container({
+      width: 1,
+      height: MAP_SIZE,
+      backgroundColor: 'rgba(100,100,100,0.2)',
+      visibility: 'visible'
+    });
+    mapContainer.add(crossV);
+
+    let crossH = new UIKit.Container({
+      width: MAP_SIZE,
+      height: 1,
+      backgroundColor: 'rgba(100,100,100,0.2)',
+      visibility: 'visible'
+    });
+    mapContainer.add(crossH);
+
+    // ── Range rings ──
+    let innerRing = new UIKit.Container({
+      width: MAP_SIZE * 0.5,
+      height: MAP_SIZE * 0.5,
+      borderRadius: MAP_SIZE * 0.25,
+      borderWidth: 1,
+      borderColor: 'rgba(100,100,100,0.15)',
+      backgroundColor: 'transparent',
+      visibility: 'visible'
+    });
+    mapContainer.add(innerRing);
+
+    // ── Pre-allocate enemy dots ──
+    for (let e = 0; e < MAX_ENEMY_DOTS; e++) {
+      let eDot = createDot(DOT_SIZE, '#ff3333');
+      mapContainer.add(eDot);
+      eDot.position.set(0, 0, 0.002);
+      enemyDots.push(eDot);
+    }
+
+    // ── Pre-allocate balloon dots ──
+    for (let b = 0; b < MAX_BALLOON_DOTS; b++) {
+      let bDot = createDot(SMALL_DOT, '#ffcc00');
+      mapContainer.add(bDot);
+      bDot.position.set(0, 0, 0.002);
+      balloonDots.push(bDot);
+    }
+
+    // ── Player dot (always center, on top) ──
+    playerDot = new UIKit.Container({
+      width: 8,
+      height: 8,
+      backgroundColor: '#00ff44',
+      borderRadius: 4,
+      visibility: 'visible'
+    });
+    mapContainer.add(playerDot);
+    playerDot.position.set(0, 0, 0.003);
+
+    // ── Heading indicator (small triangle/line above player dot) ──
+    headingIndicator = new UIKit.Container({
+      width: 2,
+      height: 10,
+      backgroundColor: '#00ff44',
+      visibility: 'visible'
+    });
+    mapContainer.add(headingIndicator);
+    headingIndicator.position.set(0, 0.04, 0.003);
+
+    // ── "N" label at top ──
+    let northLabel = new UIKit.Text({
+      text: 'N',
+      fontSize: 10,
+      color: 'rgba(200,200,200,0.6)',
+      fontFamily: 'monospace',
+      visibility: 'visible'
+    });
+    mapContainer.add(northLabel);
+    // Approximate top of map
+    northLabel.position.set(0, MAP_RADIUS / MAP_SIZE * 0.18, 0.003);
+  };
+
+  this.update = function(deltaTime) {
+    updateTimer += deltaTime;
+    if (updateTimer < UPDATE_INTERVAL) return;
+    updateTimer = 0;
+
+    let playerPos = store.get('fp3_playerPosition');
+    if (!playerPos) return;
+
+    let flightState = store.get('fp3_flightState');
+    let heading = flightState ? ((flightState.heading || 0) * Math.PI / 180) : 0;
+
+    // Helper: convert world position to map-local offset relative to player
+    // Returns { x, y } in normalized map coords (-0.5 to 0.5)
+    // Rotated so map is north-up
+    let px = playerPos.x;
+    let pz = playerPos.z;
+    let cosH = Math.cos(-heading);
+    let sinH = Math.sin(-heading);
+
+    function worldToMap(wx, wz) {
+      let dx = wx - px;
+      let dz = wz - pz;
+
+      // Rotate to align with heading (north-up)
+      let rx = dx * cosH - dz * sinH;
+      let rz = dx * sinH + dz * cosH;
+
+      // Scale to map
+      let mx = rx * SCALE_FACTOR / MAP_SIZE;
+      let my = -rz * SCALE_FACTOR / MAP_SIZE; // flip Z for screen Y
+
+      return { x: mx, y: my };
+    }
+
+    function isInRange(mx, my) {
+      let dist = Math.sqrt(mx * mx + my * my);
+      return dist < 0.45; // slightly inside border
+    }
+
+    // ── Update runway line position ──
+    let rwPos = worldToMap(0, 0); // runway at world origin
+    if (isInRange(rwPos.x, rwPos.y)) {
+      runwayLine.position.set(rwPos.x * 0.18, rwPos.y * 0.18, 0.001);
+      runwayLine.setProperties({ visibility: 'visible' });
+    } else {
+      runwayLine.setProperties({ visibility: 'hidden' });
+    }
+
+    // ── Update heading indicator rotation ──
+    // Heading indicator stays at top of player dot
+    headingIndicator.position.set(0, 0.04, 0.003);
+
+    // ── Update enemy dots ──
+    let remotePlayers = store.get('fp3_remotePlayers') || {};
+    let playerIds = Object.keys(remotePlayers);
+    let eIdx = 0;
+
+    for (let p = 0; p < playerIds.length && eIdx < MAX_ENEMY_DOTS; p++) {
+      let rp = remotePlayers[playerIds[p]];
+      if (!rp || !rp.position) continue;
+
+      let ePos = worldToMap(rp.position.x, rp.position.z);
+      if (isInRange(ePos.x, ePos.y)) {
+        enemyDots[eIdx].position.set(ePos.x * 0.18, ePos.y * 0.18, 0.002);
+        enemyDots[eIdx].setProperties({ visibility: 'visible' });
+      } else {
+        enemyDots[eIdx].setProperties({ visibility: 'hidden' });
+      }
+      eIdx++;
+    }
+
+    // Hide unused enemy dots
+    for (let eu = eIdx; eu < MAX_ENEMY_DOTS; eu++) {
+      enemyDots[eu].setProperties({ visibility: 'hidden' });
+    }
+
+    // ── Update balloon dots ──
+    let balloons = store.get('fp3_balloons') || [];
+    let bIdx = 0;
+
+    for (let bi = 0; bi < balloons.length && bIdx < MAX_BALLOON_DOTS; bi++) {
+      let balloon = balloons[bi];
+      if (!balloon || !balloon.position || balloon.destroyed) continue;
+
+      let bPos = worldToMap(balloon.position.x, balloon.position.z);
+      if (isInRange(bPos.x, bPos.y)) {
+        balloonDots[bIdx].position.set(bPos.x * 0.18, bPos.y * 0.18, 0.002);
+        balloonDots[bIdx].setProperties({ visibility: 'visible' });
+      } else {
+        balloonDots[bIdx].setProperties({ visibility: 'hidden' });
+      }
+      bIdx++;
+    }
+
+    // Hide unused balloon dots
+    for (let bu = bIdx; bu < MAX_BALLOON_DOTS; bu++) {
+      balloonDots[bu].setProperties({ visibility: 'hidden' });
+    }
+  };
+
+  this.dispose = function() {
+    if (cameraRetryId !== null) {
+      clearTimeout(cameraRetryId);
+      cameraRetryId = null;
+    }
+    if (fullscreen && fullscreen.parent) {
+      fullscreen.parent.remove(fullscreen);
+    }
+    fullscreen = null;
+    mapContainer = null;
+    playerDot = null;
+    headingIndicator = null;
+    runwayLine = null;
+    enemyDots = [];
+    balloonDots = [];
+    game = null;
+    store = null;
+  };

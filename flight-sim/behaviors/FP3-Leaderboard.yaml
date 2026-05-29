@@ -1,0 +1,197 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+config:
+  priority: 0
+  name: FP3 Leaderboard
+  id: fp3.leaderboard
+  author: flight-sim
+  isScript: true
+  main: script.js
+  version: 1.0.0
+  description: "TAB-toggle leaderboard showing kills and deaths. Reads fp3_toggleLeaderboard, fp3_remotePlayers, fp3_kills, fp3_deaths, fp3_username."
+  tags:
+    - gameplay
+    - ui
+  attributes: {}
+  documentation: "Leaderboard panel toggled by fp3_toggleLeaderboard store key. Displays up to 10 players sorted by kills descending. Local player row highlighted green. Updates every 1 second from fp3_remotePlayers data and local fp3_kills/fp3_deaths."
+code: |
+  // ============================================================
+  // FP3 Leaderboard
+  // TAB-toggle leaderboard with kills/deaths.
+  // ============================================================
+
+  let game;
+  let store;
+  let fullscreen = null;
+  let rootParented = false;
+  let panel = null;
+  let rowElements = [];
+  let isVisible = false;
+  let updateTimer = 0;
+  let UPDATE_INTERVAL = 1.0;
+  let MAX_ROWS = 10;
+  let lastToggleVal = null;
+
+  function parentToCamera() {
+    if (rootParented || !fullscreen) return;
+    if (game.uiCamera) {
+      game.uiCamera.add(fullscreen);
+      rootParented = true;
+    }
+  }
+
+  this.init = function(_game) {
+    game = _game;
+    store = this.erth.store;
+  };
+
+  this.onStart = function() {
+    fullscreen = new UIKit.Fullscreen(game.renderer, { visibility: 'visible' });
+    parentToCamera();
+
+    // ── Panel container ──
+    panel = new UIKit.Container({
+      width: 320,
+      height: 420,
+      backgroundColor: 'rgba(0,0,0,0.8)',
+      borderRadius: 10,
+      borderWidth: 1,
+      borderColor: 'rgba(255,255,255,0.2)',
+      flexDirection: 'column',
+      alignItems: 'center',
+      padding: 12,
+      gap: 6,
+      positionType: 'absolute',
+      positionLeft: '50%',
+      positionTop: '50%',
+      visibility: 'hidden'
+    });
+    fullscreen.add(panel);
+
+    // ── Title ──
+    let title = new UIKit.Text({
+      text: 'LEADERBOARD',
+      fontSize: 20,
+      fontWeight: 'bold',
+      color: '#ffffff',
+      visibility: 'visible'
+    });
+    panel.add(title);
+
+    // ── Column headers ──
+    let headerRow = new UIKit.Container({
+      width: '100%',
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      padding: 4,
+      borderBottomWidth: 1,
+      borderColor: 'rgba(255,255,255,0.3)',
+      visibility: 'visible'
+    });
+    panel.add(headerRow);
+
+    let colPlayer = new UIKit.Text({ text: 'Player', fontSize: 12, color: 'rgba(255,255,255,0.6)', fontWeight: 'bold', width: 160, visibility: 'visible' });
+    let colKills = new UIKit.Text({ text: 'Kills', fontSize: 12, color: 'rgba(255,255,255,0.6)', fontWeight: 'bold', width: 60, textAlign: 'center', visibility: 'visible' });
+    let colDeaths = new UIKit.Text({ text: 'Deaths', fontSize: 12, color: 'rgba(255,255,255,0.6)', fontWeight: 'bold', width: 60, textAlign: 'center', visibility: 'visible' });
+    headerRow.add(colPlayer);
+    headerRow.add(colKills);
+    headerRow.add(colDeaths);
+
+    // ── Pre-create row slots ──
+    for (let i = 0; i < MAX_ROWS; i++) {
+      let row = new UIKit.Container({
+        width: '100%',
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        padding: 3,
+        borderRadius: 4,
+        visibility: 'hidden'
+      });
+
+      let rName = new UIKit.Text({ text: '', fontSize: 13, color: '#ffffff', width: 160, visibility: 'visible' });
+      let rKills = new UIKit.Text({ text: '0', fontSize: 13, color: '#ffffff', width: 60, textAlign: 'center', visibility: 'visible' });
+      let rDeaths = new UIKit.Text({ text: '0', fontSize: 13, color: '#ffffff', width: 60, textAlign: 'center', visibility: 'visible' });
+
+      row.add(rName);
+      row.add(rKills);
+      row.add(rDeaths);
+      panel.add(row);
+
+      rowElements.push({ row: row, name: rName, kills: rKills, deaths: rDeaths });
+    }
+  };
+
+  this.update = function(deltaTime) {
+    if (!rootParented) parentToCamera();
+
+    // ── Toggle on store key change ──
+    let toggleVal = store.get('fp3_toggleLeaderboard');
+    if (toggleVal !== null && toggleVal !== undefined && toggleVal !== lastToggleVal) {
+      lastToggleVal = toggleVal;
+      isVisible = !isVisible;
+      panel.setProperties({ visibility: isVisible ? 'visible' : 'hidden' });
+    }
+
+    if (!isVisible) return;
+
+    // ── Throttled update ──
+    updateTimer += deltaTime;
+    if (updateTimer < UPDATE_INTERVAL) return;
+    updateTimer = 0;
+
+    // ── Gather player data ──
+    let players = [];
+    let localName = store.get('fp3_username') || 'You';
+    let localKills = store.get('fp3_kills') || 0;
+    let localDeaths = store.get('fp3_deaths') || 0;
+    players.push({ name: localName, kills: localKills, deaths: localDeaths, isLocal: true });
+
+    let remotePlayers = store.get('fp3_remotePlayers');
+    if (remotePlayers && typeof remotePlayers === 'object') {
+      let keys = Object.keys(remotePlayers);
+      for (let k = 0; k < keys.length; k++) {
+        let rp = remotePlayers[keys[k]];
+        if (rp) {
+          players.push({
+            name: rp.username || keys[k],
+            kills: rp.kills || 0,
+            deaths: rp.deaths || 0,
+            isLocal: false
+          });
+        }
+      }
+    }
+
+    // Sort by kills desc
+    players.sort(function(a, b) { return b.kills - a.kills; });
+
+    // ── Update rows ──
+    for (let i = 0; i < MAX_ROWS; i++) {
+      let el = rowElements[i];
+      if (i < players.length) {
+        let p = players[i];
+        el.row.setProperties({
+          visibility: 'visible',
+          backgroundColor: p.isLocal ? 'rgba(0,180,0,0.25)' : 'transparent'
+        });
+        el.name.setProperties({ text: p.name, color: p.isLocal ? '#00ff88' : '#ffffff' });
+        el.kills.setProperties({ text: String(p.kills) });
+        el.deaths.setProperties({ text: String(p.deaths) });
+      } else {
+        el.row.setProperties({ visibility: 'hidden' });
+      }
+    }
+  };
+
+  this.dispose = function() {
+    if (fullscreen && fullscreen.parent) {
+      fullscreen.parent.remove(fullscreen);
+    }
+    fullscreen = null;
+    panel = null;
+    rowElements = [];
+    game = null;
+    store = null;
+  };

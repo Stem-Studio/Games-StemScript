@@ -1,0 +1,249 @@
+# TinySkies — StemStudio conversion
+# Source: tinyskies source project (a.k.a. "GlobeFly" internally).
+#
+# MVP slice: single-player flight on a globe + paintball.
+# Batch A added: day/night cycle + 6 ambient effects (starfield, aurora,
+#                contrails, godrays, floating lanterns, meteor shower).
+#
+# Quests, NPCs, multiplayer, persistence, weather, rings, gremlins, terrain
+# heightmap, secondary vehicles still deferred — see tinyskies-requirements.md.
+# Source-fidelity tradeoffs documented in tinyskies-fidelity-decision-record.md.
+
+project title "TinySkies"
+
+# ── Cover art ─────────────────────────────────────────────────────
+# Sourced from client/public/social-card.png (cropped + downscaled to 1024×1024).
+import image name="ProjectCover" filepath="cover.png"
+# Promote the imported image to the scene's Thumbnail metadata field — must
+# come AFTER the import line so the asset exists in the scene library.
+scene thumbnail name="ProjectCover"
+
+# ── Shared scripts (must precede any behavior that @imports them) ──
+import script name="spherical-math" filepath="imports/spherical-math.js"
+import script name="biplane-mesh" filepath="imports/biplane-mesh.js"
+import script name="terrain" filepath="imports/terrain.js"
+import script name="vehicle-meshes" filepath="imports/vehicle-meshes.js"
+import script name="uikit-dual-mode" filepath="imports/uikit-dual-mode.yaml"
+
+# ── 3D models (FDR-007 — GLB substitutions promoted to source-faithful) ──
+# Copied verbatim from source `client/public/3D/` (CC0). Each model is
+# loaded once at scene init and instanced per-placement by the behavior
+# that owns it. See FDR-006 for the prior procedural-substitute history.
+import model name="PyramidModel"        filepath="models/pyramid.glb"
+import model name="HotspringModel"      filepath="models/hotspring.glb"
+import model name="StatueModel"         filepath="models/statue.glb"
+import model name="MoonstoneLeftModel"  filepath="models/moonstone_left.glb"
+import model name="MoonstoneRightModel" filepath="models/moonstone_right.glb"
+import model name="EternalFlameModel"   filepath="models/eternal_flame.glb"
+import model name="CapybaraModel"        filepath="models/capybara.glb"
+
+# Hide the templates — they're cloned at runtime by the placement behaviors,
+# never visible in their source position.
+update PyramidModel        objectSettings={gameVisibility:false,enableAtStart:false}
+update HotspringModel      objectSettings={gameVisibility:false,enableAtStart:false}
+update StatueModel         objectSettings={gameVisibility:false,enableAtStart:false}
+update MoonstoneLeftModel  objectSettings={gameVisibility:false,enableAtStart:false}
+update MoonstoneRightModel objectSettings={gameVisibility:false,enableAtStart:false}
+update EternalFlameModel   objectSettings={gameVisibility:false,enableAtStart:false}
+update CapybaraModel       objectSettings={gameVisibility:false,enableAtStart:false}
+
+# ── Behaviors ─────────────────────────────────────────────────────
+# Core MVP
+import behavior name="TinySkies Globe Visual" filepath="behaviors/tinyskiesGlobeVisual.yaml"
+import behavior name="TinySkies Globe Vegetation" filepath="behaviors/tinyskiesGlobeVegetation.yaml"
+import behavior name="TinySkies Globe Structures" filepath="behaviors/tinyskiesGlobeStructures.yaml"
+import behavior name="TinySkies Globe Landmarks" filepath="behaviors/tinyskiesGlobeLandmarks.yaml"
+import behavior name="TinySkies Globe Biome Decor" filepath="behaviors/tinyskiesGlobeBiomeDecor.yaml"
+import behavior name="TinySkies Globe Atmospheric" filepath="behaviors/tinyskiesGlobeAtmospheric.yaml"
+import behavior name="TinySkies Globe Monuments" filepath="behaviors/tinyskiesGlobeMonuments.yaml"
+import behavior name="TinySkies Biplane Visual" filepath="behaviors/tinyskiesBiplaneVisual.yaml"
+import behavior name="TinySkies Flight Controller" filepath="behaviors/tinyskiesFlightController.yaml"
+import behavior name="TinySkies Camera Rig" filepath="behaviors/tinyskiesCameraRig.yaml"
+import behavior name="TinySkies Paintball System" filepath="behaviors/tinyskiesPaintballSystem.yaml"
+# Batch A — ambience + day/night
+import behavior name="TinySkies Day/Night Cycle" filepath="behaviors/tinyskiesDayNightCycle.yaml"
+import behavior name="TinySkies Starfield" filepath="behaviors/tinyskiesStarfield.yaml"
+import behavior name="TinySkies Aurora" filepath="behaviors/tinyskiesAurora.yaml"
+import behavior name="TinySkies God Rays" filepath="behaviors/tinyskiesGodRays.yaml"
+import behavior name="TinySkies Floating Lanterns" filepath="behaviors/tinyskiesFloatingLanterns.yaml"
+import behavior name="TinySkies Meteor Shower" filepath="behaviors/tinyskiesMeteorShower.yaml"
+import behavior name="TinySkies Contrails" filepath="behaviors/tinyskiesContrails.yaml"
+# Batch B — gameplay (boost rings + sky gremlins)
+import behavior name="TinySkies Boost Rings" filepath="behaviors/tinyskiesBoostRings.yaml"
+import behavior name="TinySkies Sky Gremlins" filepath="behaviors/tinyskiesSkyGremlins.yaml"
+import behavior name="TinySkies Gremlin Hearts" filepath="behaviors/tinyskiesGremlinHearts.yaml"
+import behavior name="TinySkies Race Quest" filepath="behaviors/tinyskiesRaceQuest.yaml"
+import behavior name="TinySkies Selfie Quest" filepath="behaviors/tinyskiesSelfieQuest.yaml"
+# Batch D — vehicles (boat + carpet, capped)
+import behavior name="TinySkies Boat Visual" filepath="behaviors/tinyskiesBoatVisual.yaml"
+import behavior name="TinySkies Carpet Visual" filepath="behaviors/tinyskiesCarpetVisual.yaml"
+import behavior name="TinySkies Carpet Trail" filepath="behaviors/tinyskiesCarpetTrail.yaml"
+import behavior name="TinySkies Carpet Drift Smoke" filepath="behaviors/tinyskiesCarpetDriftSmoke.yaml"
+import behavior name="TinySkies Carpet Leaves" filepath="behaviors/tinyskiesCarpetLeaves.yaml"
+import behavior name="TinySkies Carpet Portal System" filepath="behaviors/tinyskiesCarpetPortalSystem.yaml"
+import behavior name="TinySkies Void Carpet Trail" filepath="behaviors/tinyskiesVoidCarpetTrail.yaml"
+import behavior name="TinySkies Eternal Flame World" filepath="behaviors/tinyskiesEternalFlameWorld.yaml"
+import behavior name="TinySkies Void Moths" filepath="behaviors/tinyskiesVoidMoths.yaml"
+import behavior name="TinySkies Eternal Flame Beams" filepath="behaviors/tinyskiesEternalFlameBeams.yaml"
+import behavior name="TinySkies Cosmic Portal" filepath="behaviors/tinyskiesCosmicPortal.yaml"
+import behavior name="TinySkies Water Sparkles" filepath="behaviors/tinyskiesWaterSparkles.yaml"
+import behavior name="TinySkies Sky Streaks" filepath="behaviors/tinyskiesSkyStreaks.yaml"
+import behavior name="TinySkies Vehicle Switcher" filepath="behaviors/tinyskiesVehicleSwitcher.yaml"
+# Batch E — persistence (localStorage lifetime stats, capped)
+import behavior name="TinySkies Progression" filepath="behaviors/tinyskiesProgression.yaml"
+# Batch F — quests (single package quest, capped)
+import behavior name="TinySkies Package Quest" filepath="behaviors/tinyskiesPackageQuest.yaml"
+# Batch G — multiplayer (state-sync skeleton, capped)
+import behavior name="TinySkies Remote Players" filepath="behaviors/tinyskiesRemotePlayers.yaml"
+# Controls HUD — UIKit overlay listing key bindings
+import behavior name="TinySkies Controls HUD" filepath="behaviors/tinyskiesControlsHud.yaml"
+
+# ── Scene look ────────────────────────────────────────────────────
+# Initial daytime palette — the day/night cycle behavior mutates these per-frame
+# at runtime. The static values here are the starting state and what the editor
+# preview shows. Linear fog is required so the cycle's fogNear / fogFar take effect
+# (FogExp2 only honors `density`).
+scene background type=Color color=#a8c8e8
+scene fog type=linear color=#cce0f0 near=15 far=40
+scene tonemapping type=ACESFilmicToneMapping exposure=1.1
+scene lighting ambient={color:#ffffff,intensity:1.25} hemisphere={skyColor:#80ccdd,groundColor:#66aa44,intensity:1.75}
+render settings useShadows=false
+
+# Engine provides exactly one configurable Directional Light. Source has three
+# (primary warm sun + secondary sun + atmospheric fill); the secondary + fill are
+# folded into the hemisphere/ambient amounts above. The cycle behavior overwrites
+# intensity + color each frame.
+light "Directional Light" intensity=5.0 color=#fff0d0 castShadow=false
+update "Directional Light" position=10,12,5
+
+# ── Scene graph ───────────────────────────────────────────────────
+# Globe sits at origin. The globeVisual behavior builds the sphere + atmosphere shell
+# as runtime-only children. Surface + atmosphere colors are now live uniforms
+# the day/night cycle drives via the store.
+add group name="Globe" position=0,0,0
+behavior attach "Globe" behaviorId="tinyskies.globeVisual" config={radius:5,segments:128,terrainSeed:42,terrainType:"default",atmosphereGlow:"#cce4ff",atmosphereScale:1.06,debugLogs:false}
+behavior attach "Globe" behaviorId="tinyskies.globeVegetation" config={radius:5,terrainSeed:42,terrainType:"default",treeCount:10000,coconutClusters:270,rockCount:400,mushroomCount:4,debugLogs:false}
+behavior attach "Globe" behaviorId="tinyskies.globeStructures" config={radius:5,terrainSeed:42,terrainType:"default",villageCount:20,lighthouseCount:3,windmillClusterCount:4,debugLogs:false}
+behavior attach "Globe" behaviorId="tinyskies.globeLandmarks" config={radius:5,terrainSeed:42,terrainType:"default",observatoryCount:3,stonehengeCount:4,shrineCount:5,pyramidCount:2,debugLogs:false}
+behavior attach "Globe" behaviorId="tinyskies.globeBiomeDecor" config={radius:5,terrainSeed:42,terrainType:"default",hotspringCount:4,butterflyGardenCount:4,debugLogs:false}
+behavior attach "Globe" behaviorId="tinyskies.globeAtmospheric" config={radius:5,terrainSeed:42,terrainType:"default",cloudCount:30,cloudAltitude:1.0,balloonCount:5,balloonAltitude:0.6,floatingTreeClusters:28,floatingTreesPerCluster:40,raceBannerCount:3,debugLogs:false}
+behavior attach "Globe" behaviorId="tinyskies.globeMonuments" config={radius:5,terrainSeed:42,terrainType:"default",statueEnabled:true,statueAlwaysVisible:true,statueStoreKey:"tinyskies/statueEnabled",moonstoneRuinCount:2,moonstoneCinematicStoreKey:"tinyskies/moonstoneCinematicTrigger",debugLogs:false}
+
+# Player. Position is just an editor-friendly placeholder; flight controller
+# overrides matrix in init().
+add group name="Plane" position=0,5.55,0
+update "Plane" tag=Player
+behavior attach "Plane" behaviorId="tinyskies.biplaneVisual" config={hullColor:"#ff4444",debugLogs:false}
+behavior attach "Plane" behaviorId="tinyskies.boatVisual" config={hullColor:"#b83c2b",debugLogs:false}
+behavior attach "Plane" behaviorId="tinyskies.carpetVisual" config={baseColor:"#6b1d6e",debugLogs:false}
+behavior attach "Plane" behaviorId="tinyskies.carpetTrail" config={debugLogs:false}
+behavior attach "Plane" behaviorId="tinyskies.carpetDriftSmoke" config={globeRadius:5,driftThreshold:0.4,debugLogs:false}
+behavior attach "Plane" behaviorId="tinyskies.carpetLeaves" config={globeRadius:5,terrainSeed:42,terrainType:"default",debugLogs:false}
+behavior attach "Plane" behaviorId="tinyskies.carpetPortalSystem" config={globeRadius:5,terrainSeed:42,terrainType:"default",triggerRadiusMult:1,debugLogs:false}
+behavior attach "Plane" behaviorId="tinyskies.voidCarpetTrail" config={debugLogs:false}
+# Eternal flame world — fixed beacon above globe at (0,8,0). Auto-enters
+# void when carpet altitude exceeds entryAltitudeRatio. Pass 13 will
+# replace the altitude trigger with proper CosmicWorldPortal entry.
+behavior attach "Globe" behaviorId="tinyskies.eternalFlameWorld" config={flameWorldX:0,flameWorldY:8,flameWorldZ:0,flameTargetSize:0.6,entryAltitudeRatio:0.92,debugLogs:false}
+behavior attach "Globe" behaviorId="tinyskies.voidMoths" config={maxConcurrent:8,spawnIntervalMin:1.5,spawnIntervalMax:3.0,capybaraEnabled:true,capybaraCooldownMs:900,debugLogs:false}
+behavior attach "Globe" behaviorId="tinyskies.eternalFlameBeams" config={beamRadius:0.9,beamHeight:4.0,beamWidth:0.08,rotationSpeed:0.3,debugLogs:false}
+# Cosmic portal — fixed beacon on the overworld globe; carpet flythrough
+# enters the void scene. Replaces the Pass 12 altitude-trigger placeholder.
+behavior attach "Globe" behaviorId="tinyskies.cosmicPortal" config={portalWorldX:0,portalWorldY:0,portalWorldZ:5.6,triggerRadius:0.32,debugLogs:false}
+# Water sparkles — instanced bright planes scattered across ocean for
+# sun-glint feel matching source visual fidelity reference.
+behavior attach "Globe" behaviorId="tinyskies.waterSparkles" config={sparkleCount:1500,sparkleSize:0.022,sparkleColor:"#ffffff",radius:5,terrainSeed:42,terrainType:"default",debugLogs:false}
+# Sky streaks — large background skydome with diagonal cloud streaks
+behavior attach "Globe" behaviorId="tinyskies.skyStreaks" config={skyRadius:80,rotationSpeed:0.012,streakCount:32,debugLogs:false}
+behavior attach "Plane" behaviorId="tinyskies.flightController" config={spawnSeed:42,spawnSalt:1,globeRadius:5,terrainSeed:42,terrainType:"default",debugLogs:false}
+behavior attach "Plane" behaviorId="tinyskies.cameraRig" config={globeRadius:5,followDistance:1.2,followHeight:0.7,baseFov:60,fovBoost:20,debugLogs:false}
+
+# Scene-level paintball manager — owns the projectile pool and decal fade list.
+add group name="PaintballManager" position=0,0,0
+behavior attach "PaintballManager" behaviorId="tinyskies.paintballSystem" config={globeRadius:5,cooldownMs:500,paintballSpeed:7,rangeFactor:0.85,splatterLifetimeSec:14,debugLogs:false}
+
+# ── Batch A: Day/night master + ambience ──────────────────────────
+# DayNightCycle is the master — runs at scene origin, drives everything else
+# through the store. Caches engine light refs at init().
+add group name="DayNightCycle" position=0,0,0
+behavior attach "DayNightCycle" behaviorId="tinyskies.dayNightCycle" config={worldSeed:42,cycleSecondsOverride:0,debugLogs:false}
+
+# Starfield — sphere of stars + Milky Way + nebula clouds. Reads nightWeight.
+add group name="Starfield" position=0,0,0
+behavior attach "Starfield" behaviorId="tinyskies.starfield" config={sphereRadius:80,seed:9999,debugLogs:false}
+
+# Aurora — 10 curtains in a ring above the globe. Reads nightWeight.
+add group name="Aurora" position=0,0,0
+behavior attach "Aurora" behaviorId="tinyskies.aurora" config={ringRadius:7,ringHeight:9,debugLogs:false}
+
+# God rays — sun-aligned cone shafts. Reads dayWeight + sunDirection.
+add group name="GodRays" position=0,0,0
+behavior attach "GodRays" behaviorId="tinyskies.godRays" config={distanceFromOrigin:14,coneTopRadius:0.5,coneBottomRadius:8,coneHeight:18,intensityScale:0.18,rayColor:"#fff5d8",debugLogs:false}
+
+# Floating lanterns — 5 clusters of 14 lanterns each on the globe surface.
+add group name="FloatingLanterns" position=0,0,0
+behavior attach "FloatingLanterns" behaviorId="tinyskies.floatingLanterns" config={globeRadius:5,clusterCount:5,lanternsPerCluster:14,seed:42,terrainSeed:42,terrainType:"default",landOnly:true,debugLogs:false}
+
+# Meteor shower — pool of falling streaks; spawns scale with nightWeight.
+add group name="MeteorShower" position=0,0,0
+behavior attach "MeteorShower" behaviorId="tinyskies.meteorShower" config={spawnRadius:30,meteorPool:12,spawnRatePerSec:0.6,meteorSpeed:8,meteorLifetime:2.5,trailLength:1.5,debugLogs:false}
+
+# Contrails — ribbon trails behind the player wingtips. Locates Player by tag.
+add group name="Contrails" position=0,0,0
+behavior attach "Contrails" behaviorId="tinyskies.contrails" config={trailLength:72,trailWidth:0.005,debugLogs:false}
+
+# ── Batch B: Boost rings + sky gremlins ──────────────────────────
+# Boost rings — 15 collectible diamonds; flying through one triggers a 1.7s boost
+# via the flightController's tinyskies/triggerBoost store flag.
+add group name="BoostRings" position=0,0,0
+behavior attach "BoostRings" behaviorId="tinyskies.boostRings" config={globeRadius:5,diamondCount:15,seed:42,debugLogs:false}
+
+# Sky gremlins — 3 enemies that chase + shoot back. Player paintball hits them
+# (paintballSystem reads tinyskies/gremlinPositions, pushes hits to gremlinHits);
+# their shots apply slow + wobble + 1 damage to player via store signals.
+add group name="SkyGremlins" position=0,0,0
+behavior attach "SkyGremlins" behaviorId="tinyskies.skyGremlins" config={globeRadius:5,gremlinCount:3,seed:42,kingEnabled:true,kingKillThreshold:5,debugLogs:false}
+behavior attach "SkyGremlins" behaviorId="tinyskies.gremlinHearts" config={globeRadius:5,heartCount:7,heartFlightAltitude:0.55,healHp:3,seed:42,debugLogs:false}
+
+# Race quest — plane/carpet time trial through 12 weaving checkpoints.
+# Reads race banner data published by globeAtmospheric.
+behavior attach "Globe" behaviorId="tinyskies.raceQuest" config={globeRadius:5,raceXpAmount:200,seed:42,debugLogs:false}
+
+# Selfie quest — carpet-only landmark alignment. Reads landmark normals
+# published by globeBiomeDecor / globeLandmarks / globeVegetation.
+behavior attach "Globe" behaviorId="tinyskies.selfieQuest" config={globeRadius:5,selfieXpAmount:40,debugLogs:false}
+
+# ── Batch D — Vehicle switcher ────────────────────────────────────
+# Press R to cycle plane → boat → carpet. Each vehicle visual on the Plane
+# object reads tinyskies/vehicleType and toggles its mesh visibility; the
+# flightController applies per-vehicle altitude limits.
+add group name="VehicleSwitcher" position=0,0,0
+behavior attach "VehicleSwitcher" behaviorId="tinyskies.vehicleSwitcher" config={initialVehicle:"plane",debugLogs:false}
+
+# ── Batch E — Persistence ─────────────────────────────────────────
+# localStorage-backed lifetime stats: rings collected, gremlin hits, sessions.
+add group name="Progression" position=0,0,0
+behavior attach "Progression" behaviorId="tinyskies.progression" config={storageKey:"tinyskies.progression.v1",saveDebounceSec:2.0,debugLogs:false}
+
+# ── Batch F — Package quest ───────────────────────────────────────
+# Single delivery loop: yellow pickup column → green delivery column → repeat.
+add group name="PackageQuest" position=0,0,0
+behavior attach "PackageQuest" behaviorId="tinyskies.packageQuest" config={globeRadius:5,seed:1337,pickupRadius:0.4,minTargetDistance:4,debugLogs:false}
+
+# ── Batch G — Multiplayer state sync ──────────────────────────────
+# When the engine joins a multiplayer room, broadcasts our spherical pose at
+# 10 Hz and renders phantom biplanes for remote players. Behavior sits idle in
+# single-player mode (game.multiplayerState === null).
+add group name="RemotePlayers" position=0,0,0
+behavior attach "RemotePlayers" behaviorId="tinyskies.remotePlayers" config={publishHz:10,remoteHullColor:"#3388ff",globeRadius:5,debugLogs:false}
+
+# Controls HUD — bottom-left UIKit overlay listing all key bindings.
+add group name="ControlsHud" position=0,0,0
+behavior attach "ControlsHud" behaviorId="tinyskies.controlsHud" config={initiallyVisible:true,debugLogs:false}
+
+# ── Camera + game settings ────────────────────────────────────────
+# Camera near=0.01 to match source PerspectiveCamera(60, aspect, 0.01, 200).
+camera "DefaultCamera" cameraType=NONE fov=60 near=0.01 far=200
+# isMultiplayer turns on Colyseus join when entering Play — the remotePlayers
+# behavior idles when game.multiplayerState is null (single-player).
+game settings enabled=true showHUD=false isMultiplayer=true

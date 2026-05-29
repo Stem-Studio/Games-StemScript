@@ -1,0 +1,94 @@
+{
+  "source": {
+    "title": "Island Defense — KiasuDash Demo",
+    "title_derivation": "<title> tag of github.com/quangrau/island-defense-demo/blob/main/index.html",
+    "url": "https://github.com/quangrau/island-defense-demo",
+    "live_demo": "(none deployed; runs from `python3 -m http.server`)",
+    "stack": "Phaser.js 3 + React 19 + Vite (built-and-committed dist; no source TS in repo)",
+    "build_artifact": "assets/island-defense-vnoha80H.js (1.4 MB minified; no sourcemap committed)",
+    "secondary_source": "https://github.com/chongdashu/phaserjs-tinyswords (cited inspiration; full single-file Phaser source — but it's a different game, 'Castle Clash Duel'). Used only as a code-pattern reference."
+  },
+  "classification": {
+    "dimension": "2D (top-down with screen-space pan/zoom camera)",
+    "genre": "real-time tower-defense / lane-battle hybrid",
+    "single_player": true,
+    "multiplayer": false
+  },
+  "player_object": {
+    "identity": "Blue Castle (the protected base) + Test Panel UI for spawning blue troops",
+    "controlled_via": "UIKit panel buttons (no avatar, no movement)",
+    "tag_to_apply": "Player on the GameAnchor group",
+    "rationale": "Blue castle is the asset to defend; player agency is via the test-panel buttons that spawn blue troops"
+  },
+  "core_loop": [
+    "Round 1 banner displayed",
+    "BGM begins (when Start Battle clicked)",
+    "AI starts spawning red warriors at intervals per difficulty",
+    "Player clicks +1 / +3 / +5 Blue buttons to spawn blue warriors (simulates correct-answer rewards in the KiasuDash quiz integration)",
+    "Units march from their respective castle toward the opposing castle",
+    "Units engage enemy units / castle on contact; sword SFX plays on hit",
+    "Castle HP drops when struck; victory when red HP=0, defeat when blue HP=0",
+    "Round transitions show banner; final result triggers Victory or Defeat banner",
+    "Player can also use Test Panel buttons to manually trigger banners and victory/defeat for testing"
+  ],
+  "ui_screens": [
+    {"name": "test_panel (always visible, side panel)", "controls": ["Difficulty: Easy / Medium / Hard", "Start Battle (begins round 1 + BGM)", "+1 Blue / +3 Blue / +5 Blue (spawn blue warriors)", "Banner 1 / Banner 2 / Banner 3 (preview round banners)", "Victory / Defeat (preview end banners)", "Sound preview buttons (BGM, SFX)"]},
+    {"name": "round_banner (overlay, transient)", "shown_for": "round transitions", "elements": ["Round N", "Fight!"]},
+    {"name": "victory_banner (overlay)", "elements": ["VICTORY!"]},
+    {"name": "defeat_banner (overlay)", "elements": ["DEFEAT!"]},
+    {"name": "hud", "elements": ["Blue Castle HP bar (top-left)", "Red Castle HP bar (top-right)", "Round indicator", "Unit count display"]}
+  ],
+  "input_model": {
+    "primary": "click on Test Panel buttons (UIKit)",
+    "camera": "pinch-zoom (touch) / mouse wheel zoom; drag to pan; +/- keys to zoom",
+    "no_unit_selection": "demo doesn't expose unit-level click control; AI handles all targeting"
+  },
+  "camera_model": {
+    "kind": "screen-space top-down with bounds (world width/height); pan + zoom",
+    "stem_choice": "Phase 1: fixed orthographic top-down. Phase 2: add pan/zoom via custom camera behavior. Documented in FDR-001."
+  },
+  "physics_model": {
+    "engine": "Phaser arcade physics (groups for blue/red/projectiles)",
+    "stem_choice": "no engine physics — manual position tracking + circle-circle distance for unit-vs-unit and unit-vs-castle. Matches math-meteors approach."
+  },
+  "audio": {
+    "bgm": "bg_loop.mp3 (1043 KB)",
+    "sfx": ["sword_impact_hit_1/2/3.mp3", "sword_parry_1/2/3.mp3", "collapsed.mp3", "finish.mp3", "defeat.mp3"],
+    "stem_choice": "import bg_loop + 1 hit SFX + finish + defeat (4 audio assets total). Other SFX deferred to Phase 2."
+  },
+  "vfx": {
+    "in_source": "Phaser particle dust on spawn, projectiles, sprite-sheet animations on units",
+    "stem_choice": "Phase 1: short-lived UIKit text 'spawn' indicator + entity disappearance on death. Particles deferred."
+  },
+  "assets_in_repo": {
+    "buildings": ["blue/castle.png (320x256)", "blue/tower.png (128x256)", "red/castle.png", "red/tower.png"],
+    "units": {
+      "warrior": "192x192 frames; idle 8f, run 6f, attack1 4f (separate PNGs per blue/red, per animation)",
+      "archer": "192x192 frames; idle 6f, run 4f, shoot 8f + arrow.png 64x64",
+      "torch": "192x192 frames in 7-col 5-row sheet (idle/run/attack1/2/3, 7f each)"
+    },
+    "terrain": ["tilemap_color1/2/3.png (576x384)", "shadow.png", "water_background_color.png", "water_foam.png (3072x192, 16 frames)", "trees (1-4) sheet 1536x256, 8 frames", "stumps (1-4) static 192x256", "bushes (1-2) sheet 1024x128, 8 frames", "rocks (1-4) static 64x64", "clouds (1-8) static 576x256", "water_rocks (1-4) sheet 1024x64, 16 frames", "rubber_duck sheet 96x32, 3 frames", "ground/tilemap_flat.png (640x256, 64x64 tiles)"]
+  },
+  "stem_assets_plan": {
+    "audio": ["bg_loop.mp3", "sword_impact_hit_1.mp3", "finish.mp3", "defeat.mp3"],
+    "images": "DEFERRED to Phase 2 — Phase 1 uses UIKit colored containers for all entities. Documented in FDR-002."
+  },
+  "configurable_knobs": [
+    {"name": "difficulty", "default": "Medium", "options": ["Easy", "Medium", "Hard"], "affects": ["AI spawn interval", "AI unit HP"]},
+    {"name": "blueCastleHP", "default": 100},
+    {"name": "redCastleHP", "default": 100, "affected_by": "difficulty"},
+    {"name": "warriorHP", "default": 30, "affected_by": "difficulty"},
+    {"name": "warriorAttack", "default": 5},
+    {"name": "warriorMoveSpeed", "default": 30, "unit": "px per second"},
+    {"name": "aiSpawnIntervalMs", "default": "2500 (Easy: 4000, Medium: 2500, Hard: 1500)"},
+    {"name": "totalRounds", "default": 3}
+  ],
+  "fidelity_risks": [
+    {"area": "pixel-art sprites and per-frame animations", "source": "Phaser sprite-sheet animations (idle/run/attack)", "stem": "UIKit colored containers (Phase 1) — sprites + UV-cycled animation deferred", "impact": "high (visual identity)", "mitigation": "FDR-002; Phase 2 plan documented in todo"},
+    {"area": "camera pan/zoom", "source": "drag pan + pinch/wheel zoom + key zoom, world bounds", "stem": "fixed orthographic camera (Phase 1)", "impact": "medium", "mitigation": "FDR-001; Phase 2 plan"},
+    {"area": "physics-driven unit movement and collision", "source": "Phaser arcade physics groups", "stem": "manual position tracking + distance checks", "impact": "low", "mitigation": "matches math-meteors approach; no physics behavior change"},
+    {"area": "tilemap terrain (water + ground tiles)", "source": "Phaser tilemap rendering", "stem": "UIKit gradient backgrounds (water = blue, ground = beige)", "impact": "medium-low", "mitigation": "Phase 1 stylization; Phase 2 imports tilemap PNGs"},
+    {"area": "projectiles (archer arrows)", "source": "Phaser physics group of arrow sprites", "stem": "Phase 1 omits archer unit; only warriors. Documented in FDR-003", "impact": "medium", "mitigation": "Phase 2 plan to add archer + arrow primitive"},
+    {"area": "torch unit (advanced multi-attack)", "source": "Phaser sprite-sheet 7-col 5-row", "stem": "Phase 1 omits", "impact": "low", "mitigation": "Phase 2 plan"}
+  ]
+}

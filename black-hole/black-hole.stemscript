@@ -1,0 +1,55 @@
+# ============================================================
+# Black Hole - StemStudio port of webgl-black-hole
+# Source: https://github.com/brunosimon/webgl-black-hole
+# Type: shader demo (pure visual; no gameplay)
+# ============================================================
+
+project title "Black Hole"
+
+# --- Scene-Level Settings ---
+# Black background — the entire view is composed inside the behavior; main
+# scene only holds the orbit camera and the final composite plane.
+scene background type=Color color=#000000
+render settings useShadows=false useInstancing=false
+game settings enabled=true maxScore=0 showHUD=false
+
+# Set the directional light to zero — the shader scene is fully self-lit.
+update "Directional Light" position=0,1,0
+light "Directional Light" intensity=0 castShadow=false
+
+# ============================================================
+# Asset Imports
+# ============================================================
+import model name="CupolaTemplate" filepath="models/cupola.glb" comment="Optional cockpit frame (commented out upstream)"
+import image name="LennaTexture"   filepath="textures/lenna.png" comment="Mirrored upstream test texture (unused at runtime)"
+import image name="ProjectCover"   filepath="textures/lenna.png" comment="Scene thumbnail (placeholder)"
+scene thumbnail name="ProjectCover"
+
+# Hide cupola template (mounted at runtime if user enables bhCupola)
+update CupolaTemplate objectSettings={gameVisibility:false,enableAtStart:false}
+
+# ============================================================
+# Behavior Imports
+# ============================================================
+import behavior name="BH Black Hole"   filepath="behaviors/bhBlackHole.yaml"
+import behavior name="BH Orbit Camera" filepath="behaviors/bhOrbitCamera.yaml"
+import behavior name="BH Cupola"       filepath="behaviors/bhCupola.yaml"
+
+# ============================================================
+# Scene root — single object hosts both behaviors
+# ============================================================
+add group name="BlackHoleRoot" position=0,0,0
+update BlackHoleRoot tag=Player
+behavior attach BlackHoleRoot behaviorId=bh.blackHole config={innerColor:"#ff8080",outerColor:"#3633ff",blackHoleParticleSize:0.015,starParticleSize:0.001,rgbShiftRadius:0.00001,discRadiusOuter:5,discRadiusInner:1,starSphereRadius:400,debugLogs:false}
+behavior attach BlackHoleRoot behaviorId=bh.orbitCamera config={fov:45,distance:7,distanceMin:2,distanceMax:50,initialPitchDeg:18,initialYawDeg:30,yawSensitivity:0.005,pitchSensitivity:0.005,pitchClampDeg:80,zoomStep:0.5,debugLogs:false}
+
+# Optional cupola — uncomment to mount the cockpit frame to the camera
+# (matches the upstream Spaceship/Cupola code path that's commented out
+# in sources/Experience/World.js).
+#
+# behavior attach BlackHoleRoot behaviorId=bh.cupola config={cupolaTemplate:"CupolaTemplate",cupolaScale:0.1,debugLogs:false}
+
+# ============================================================
+# Camera — bhOrbitCamera owns it
+# ============================================================
+camera "DefaultCamera" cameraType=NONE

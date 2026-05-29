@@ -1,0 +1,628 @@
+meta:
+  tool: "StemStudio"
+  type: "behavior"
+  exportVersion: 1
+
+config:
+  name: "HGL Race Manager"
+  id: "hgl.raceManager"
+  author: "HexGL-Port"
+  isScript: true
+  main: "script.js"
+  priority: 0
+  version: "1.0.0"
+  description: "Race state machine — countdown, checkpoint/lap tracking,
+    finish/destroy detection, audio. Port of Gameplay.js."
+  tags:
+    - gameplay
+  attributes:
+    maxLaps:
+      name: "Max Laps"
+      type: "number"
+      default: 3
+      description: "Number of laps to complete the race"
+    startDelay:
+      name: "Start Delay"
+      type: "number"
+      default: 1000
+      description: "Delay in ms before countdown begins"
+    countDownDelay:
+      name: "Countdown Delay"
+      type: "number"
+      default: 1500
+      description: "Delay in ms between each countdown step"
+    collisionMapAsset:
+      name: "Collision Map"
+      type: "imageAsset"
+      description: "Track collision map for checkpoint detection (same as ship controller)"
+    bgMusicAsset:
+      name: "Background Music"
+      type: "audioAsset"
+      description: "Looping background music"
+    windAsset:
+      name: "Wind Ambient"
+      type: "audioAsset"
+      description: "Looping wind ambient sound"
+    crashAsset:
+      name: "Crash Sound"
+      type: "audioAsset"
+      description: "Collision impact sound effect"
+    boostAsset:
+      name: "Boost Sound"
+      type: "audioAsset"
+      description: "Boost pad activation sound"
+    destroyedAsset:
+      name: "Destroyed Sound"
+      type: "audioAsset"
+      description: "Ship destruction sound"
+    pixelRatio:
+      name: "Pixel Ratio"
+      type: "number"
+      default: 0.3413
+      description: "World-to-pixel scale for checkpoint detection"
+    showLaunchMenu:
+      name: "Show Launch Menu"
+      type: "boolean"
+      default: false
+      description: "Disabled — HTML launch overlay removed in StemStudio port. Race starts immediately."
+  inputs:
+    hgl_Restart: { action: true, bindings: [{ keyboard: Escape }, { keyboard: Enter }] }
+  documentation: Race state machine — countdown, checkpoint/lap tracking, finish/destroy
+    detection, audio. Port of Gameplay.js. Configure attributes in the editor to
+    tune gameplay behavior.
+
+code: |
+  /* HGL Race Manager — port of Gameplay.js with original-style launch flow */
+
+  let game;
+  let erth;
+  let step = 0;
+  let raceActive = false;
+  let elapsedMs = 0;
+  let countdownStartMs = 0;
+  let lap = 1;
+  let lapTimes = [];
+  let lapTimeElapsed = 0;
+  let previousCheckPoint = -1;
+  let maxLaps = 3;
+  let startDelay = 1000;
+  let countDownDelay = 1500;
+  let pixelRatio = 0.3413;
+  let finishTimer = 0;
+  let showLaunchMenu = true;
+  let menuVisible = false;
+  let pendingStart = false;
+  let menuRoot = null;
+  let menuStyleEl = null;
+  let menuStep = "stepMenu";
+  let menuSelectionIndex = 0;
+  let menuItems = [];
+  let menuElements = {};
+  let controlMode = "keyboard";
+  let qualityMode = "high";
+  let hudMode = "on";
+  let loadingTimer = 0;
+
+  const RESULTS = { FINISH: 1, DESTROYED: 2, NONE: -1 };
+  let result = RESULTS.NONE;
+  let spawnPos = null;
+  let spawnQuat = null;
+
+  let checkPixels = null, checkW = 0, checkH = 0;
+  const checkpoints = { list: [0, 1, 2], start: 0, last: 2 };
+  // sounds[id] = { audio, loop, baseVolume, source?, panner?, gain? }.
+  // source/panner/gain are lazily attached on first playSound() — the
+  // AudioContext can only be created after a user gesture.
+  let sounds = {};
+  let audioCtx = null;
+
+  function ensureAudioCtx() {
+    if (audioCtx) return audioCtx;
+    const AC = typeof AudioContext !== "undefined" ? AudioContext : null;
+    if (!AC) return null;
+    try { audioCtx = new AC(); } catch { audioCtx = null; }
+    return audioCtx;
+  }
+
+  function loadAudio(attr, id, loop, erth) {
+    if (!attr) return;
+    erth.asset.audio.getUrl(attr).then(function(url) {
+      let audio = new Audio(url);
+      audio.loop = !!loop;
+      audio.crossOrigin = "anonymous";  // required so Web Audio can tap the stream
+      const baseVolume = id === "bg" ? 0.6 : id === "wind" ? 0.3 : 0.8;
+      audio.volume = baseVolume;
+      sounds[id] = {
+        audio: audio,
+        loop: !!loop,
+        baseVolume: baseVolume,
+        source: null,
+        panner: null,
+        gain: null,
+      };
+    });
+  }
+
+  // Build the Web Audio graph on first play. We keep a raw HTMLAudioElement
+  // fallback: if MediaElementAudioSource or createStereoPanner isn't available,
+  // playSound still works (sans panning).
+  function ensureAudioGraph(s) {
+    if (!s || s.source) return;
+    const ctx = ensureAudioCtx();
+    if (!ctx || typeof ctx.createMediaElementSource !== "function") return;
+    try {
+      s.source = ctx.createMediaElementSource(s.audio);
+      s.gain = ctx.createGain();
+      s.gain.gain.value = s.baseVolume;
+      if (typeof ctx.createStereoPanner === "function") {
+        s.panner = ctx.createStereoPanner();
+        s.source.connect(s.panner).connect(s.gain).connect(ctx.destination);
+      } else {
+        s.source.connect(s.gain).connect(ctx.destination);
+      }
+      // Gain node now controls the level — relinquish the HTMLAudio volume.
+      s.audio.volume = 1.0;
+    } catch (err) {
+      console.warn("[HGL-RACE] Web Audio graph failed, falling back to HTMLAudio:", err);
+      s.source = null;
+      s.panner = null;
+      s.gain = null;
+    }
+  }
+
+  // Derive a stereo pan from the collision side flags written by ShipController.
+  function collisionPan(c) {
+    if (!c) return 0;
+    if (c.left && !c.right) return -0.6;
+    if (c.right && !c.left) return 0.6;
+    return 0;
+  }
+
+  function playSound(id, pan) {
+    let s = sounds[id];
+    if (!s) return;
+    ensureAudioGraph(s);
+    if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
+    if (s.panner && typeof pan === "number") {
+      try { s.panner.pan.value = Math.max(-1, Math.min(1, pan)); } catch { /* no-op */ }
+    }
+    if (s.loop) {
+      if (s.audio.paused || s.audio.currentTime === 0) s.audio.play().catch(function() {});
+    } else {
+      s.audio.currentTime = 0;
+      s.audio.play().catch(function() {});
+    }
+  }
+
+  function stopSound(id) {
+    let s = sounds[id];
+    if (s && s.audio) {
+      s.audio.pause();
+      s.audio.currentTime = 0;
+    }
+  }
+
+  // ── HTML launch menu removed — `showLaunchMenu` defaults to false ──
+  // The original game shipped a styled DOM overlay (HEXGL title, menu items,
+  // credits, controls). DOM is forbidden in behaviors, and porting the full
+  // menu to UIKit is out of scope for this pass. The race now starts directly
+  // and Esc/Enter restart it via InputManager.
+
+  function setMenuVisibility(visible) {
+    menuVisible = false;
+  }
+
+  function ensureMenuStyles() { /* HTML overlay removed */ }
+  function updateHelpCopy() {}
+  function refreshMenuLabels() {}
+  function refreshMenuSelection() {}
+  function setActiveStep(nextStep) { menuStep = nextStep; }
+  function buildMenuButton(label, onClick) { return null; }
+  function beginLaunchLoading() {
+    loadingTimer = 0;
+    pendingStart = true;
+    setActiveStep("stepLoading");
+  }
+  function createLaunchMenu() { /* HTML overlay removed */ }
+
+  function formatTime(ms) {
+    let mins = Math.floor(ms / 60000);
+    let secs = Math.floor((ms % 60000) / 1000);
+    let centis = Math.floor((ms % 1000) / 10);
+    let m = mins < 10 ? "0" + mins : "" + mins;
+    let s = secs < 10 ? "0" + secs : "" + secs;
+    let c = centis < 10 ? "0" + centis : "" + centis;
+    return m + "'" + s + "''" + c;
+  }
+
+  function loadImageData(attr, erth, callback) {
+    if (!attr) {
+      console.warn("[HGL-RACE] loadImageData: attr is falsy");
+      return;
+    }
+    erth.asset.image.createTexture(attr).then(function(texture) {
+      let img = texture.image;
+      if (!img) {
+        console.warn("[HGL-RACE] loadImageData: texture.image is null");
+        return;
+      }
+      let canvas = document.createElement("canvas"); // @check-ok
+      canvas.width = img.width;
+      canvas.height = img.height;
+      let ctx = canvas.getContext("2d");
+      ctx.drawImage(img, 0, 0);
+      let data = ctx.getImageData(0, 0, img.width, img.height);
+      callback(data.data, img.width, img.height);
+    }).catch(function(err) {
+      console.error("[HGL-RACE] Map load FAILED:", err);
+    });
+  }
+
+  function getPixel(pixels, w, h, x, y) {
+    let px = Math.max(0, Math.min(w - 1, Math.round(x)));
+    let py = Math.max(0, Math.min(h - 1, Math.round(y)));
+    let i = (py * w + px) * 4;
+    return { r: pixels[i], g: pixels[i + 1], b: pixels[i + 2] };
+  }
+
+  function checkPoint(shipPos) {
+    if (!checkPixels) return -1;
+    let x = Math.round(checkW / 2 + shipPos.x * pixelRatio);
+    let z = Math.round(checkH / 2 + shipPos.z * pixelRatio);
+    let c = getPixel(checkPixels, checkW, checkH, x, z);
+
+    // Match original HexGL Gameplay.checkPoint(): lap gates are encoded as
+    // yellow pixels where the blue channel stores checkpoint id 0/1/2.
+    // Red markers in the map are not lap gates and must be ignored.
+    if (c.r === 255 && c.g === 255 && c.b < 250) {
+      return c.b;
+    }
+
+    return -1;
+  }
+
+  function startRaceSequence() {
+    if (raceActive) return;
+
+    step = 0;
+    raceActive = true;
+    elapsedMs = 0;
+    countdownStartMs = 0;
+    lap = 1;
+    lapTimes = [];
+    lapTimeElapsed = 0;
+    previousCheckPoint = checkpoints.start;
+    result = RESULTS.NONE;
+    finishTimer = 0;
+    pendingStart = false;
+    loadingTimer = 0;
+
+    stopSound("bg");
+    stopSound("wind");
+
+    let player = game.scene.getObjectByName("Player");
+    if (player) {
+      game.behaviorManager.sendEventToObjectBehaviors(player, "hgl_deactivate", {});
+      game.behaviorManager.sendEventToObjectBehaviors(player, "hgl_reset", {});
+      if (spawnPos) player.position.copy(spawnPos);
+      if (spawnQuat) player.quaternion.copy(spawnQuat);
+    }
+    this.erth.store.set("hgl_time", 0);
+    this.erth.store.set("hgl_lap", "1/" + maxLaps);
+    this.erth.store.set("hgl_message", "");
+    this.erth.store.set("hgl_raceActive", true);
+    this.erth.store.set("hgl_destroyed", false);
+    this.erth.store.set("hgl_uiHudVisible", hudMode === "on");
+
+    setMenuVisibility(false);
+  }
+  startRaceSequence = startRaceSequence.bind(this);
+
+  function restartRace() {
+    pendingStart = false;
+    loadingTimer = 0;
+    step = 0;
+    raceActive = false;
+    elapsedMs = 0;
+    countdownStartMs = 0;
+    lap = 1;
+    lapTimes = [];
+    lapTimeElapsed = 0;
+    previousCheckPoint = checkpoints.start;
+    result = RESULTS.NONE;
+    finishTimer = 0;
+
+    stopSound("bg");
+    stopSound("wind");
+
+    let player = game.scene.getObjectByName("Player");
+    if (player) {
+      game.behaviorManager.sendEventToObjectBehaviors(player, "hgl_deactivate", {});
+      game.behaviorManager.sendEventToObjectBehaviors(player, "hgl_reset", {});
+      if (spawnPos) player.position.copy(spawnPos);
+      if (spawnQuat) player.quaternion.copy(spawnQuat);
+    }
+
+    this.erth.store.set("hgl_time", 0);
+    this.erth.store.set("hgl_lap", "1/" + maxLaps);
+    this.erth.store.set("hgl_message", "");
+    this.erth.store.set("hgl_raceActive", false);
+    this.erth.store.set("hgl_destroyed", false);
+    this.erth.store.set("hgl_uiHudVisible", hudMode === "on");
+
+    if (showLaunchMenu) {
+      setMenuVisibility(true);
+      setActiveStep("stepMenu");
+    } else {
+      startRaceSequence();
+    }
+  }
+  restartRace = restartRace.bind(this);
+
+  function onEscapeKey(e) {
+    if (e.keyCode !== 27) return;
+    if (showLaunchMenu && menuVisible && menuStep !== "stepMenu") {
+      setActiveStep("stepMenu");
+      return;
+    }
+    restartRace();
+  }
+
+  function onStartKey(e) {
+    if (!showLaunchMenu || !menuVisible) return;
+    if (menuStep === "stepMenu") {
+      if (e.keyCode === 38) {
+        menuSelectionIndex = (menuSelectionIndex - 1 + menuItems.length) % menuItems.length;
+        refreshMenuSelection();
+        return;
+      }
+      if (e.keyCode === 40) {
+        menuSelectionIndex = (menuSelectionIndex + 1) % menuItems.length;
+        refreshMenuSelection();
+        return;
+      }
+      if (e.keyCode === 13 && menuItems[menuSelectionIndex]) {
+        menuItems[menuSelectionIndex].click();
+      }
+    } else if (menuStep === "stepHelp") {
+      if (e.keyCode === 13 || e.keyCode === 32) beginLaunchLoading();
+    } else if (menuStep === "stepCredits") {
+      if (e.keyCode === 13 || e.keyCode === 27) setActiveStep("stepMenu");
+    } else if (menuStep === "stepResult") {
+      if (e.keyCode === 13) restartRace();
+      if (e.keyCode === 27) setActiveStep("stepMenu");
+    }
+  }
+  onStartKey = onStartKey.bind(this);
+
+  this.init = function(_game) {
+    game = _game;
+    erth = this.erth;
+    maxLaps = this.getAttribute("maxLaps") || 3;
+    startDelay = this.getAttribute("startDelay") || 1000;
+    countDownDelay = this.getAttribute("countDownDelay") || 1500;
+    pixelRatio = this.getAttribute("pixelRatio") || 0.3413;
+    // Default true — the UIKit hglLaunchOverlay drives the actual UI and
+    // sends hgl_startRace when PLAY is clicked. Set to false in the editor
+    // to have the race auto-start (useful during development).
+    showLaunchMenu = this.getAttribute("showLaunchMenu") !== false;
+
+    loadImageData(this.getAttribute("collisionMapAsset"), this.erth, function(data, w, h) {
+      checkPixels = data;
+      checkW = w;
+      checkH = h;
+    });
+
+    loadAudio(this.getAttribute("bgMusicAsset"), "bg", true, this.erth);
+    loadAudio(this.getAttribute("windAsset"), "wind", true, this.erth);
+    loadAudio(this.getAttribute("crashAsset"), "crash", false, this.erth);
+    loadAudio(this.getAttribute("boostAsset"), "boost", false, this.erth);
+    loadAudio(this.getAttribute("destroyedAsset"), "destroyed", false, this.erth);
+
+    // Restart hotkey (Esc/Enter) polled per-frame in update() via InputManager.
+    this._restartPrev = false;
+    this.erth.store.set("hgl_uiHudVisible", true);
+
+    if (showLaunchMenu) createLaunchMenu();
+  };
+
+  this.onStart = function() {
+    step = 0;
+    raceActive = false;
+    elapsedMs = 0;
+    countdownStartMs = 0;
+    lap = 1;
+    lapTimes = [];
+    lapTimeElapsed = 0;
+    previousCheckPoint = checkpoints.start;
+    result = RESULTS.NONE;
+    finishTimer = 0;
+
+    let playerObj = game.scene.getObjectByName("Player");
+    if (playerObj) {
+      spawnPos = playerObj.position.clone();
+      spawnQuat = playerObj.quaternion.clone();
+    }
+
+    this.erth.store.set("hgl_time", 0);
+    this.erth.store.set("hgl_lap", "1/" + maxLaps);
+    this.erth.store.set("hgl_message", "");
+    this.erth.store.set("hgl_raceActive", false);
+    this.erth.store.set("hgl_uiHudVisible", hudMode === "on");
+
+    if (showLaunchMenu) {
+      setMenuVisibility(true);
+      setActiveStep("stepMenu");
+    } else {
+      startRaceSequence();
+    }
+  };
+
+  this.onEvent = function(msg, data) {
+    // Launch overlay tells us the player is ready. If the manager is in the
+    // pre-start menu state, begin the countdown now; otherwise ignore (avoids
+    // double-starting on late events).
+    if (msg === "hgl_startRace") {
+      if (!raceActive) startRaceSequence();
+    }
+  };
+
+  this.update = function(deltaTime) {
+    // Cap deltaTime to prevent state teleportation after a tab-switch or frame spike.
+    const dt = Math.min(deltaTime, 0.1);
+
+    // Edge-detect Esc/Enter restart via InputManager
+    if (game && game.inputManager) {
+      const restartNow = !!game.inputManager.getAction('hgl_Restart');
+      if (restartNow && !this._restartPrev) restartRace();
+      this._restartPrev = restartNow;
+    }
+
+    if (menuVisible && menuStep === "stepLoading" && pendingStart) {
+      loadingTimer += dt;
+      let progress = Math.min(1, loadingTimer / 1.35);
+      // HTML progress bar removed — loading is invisible, race auto-starts.
+      if (menuElements.loadingText) {
+        menuElements.loadingText.textContent = progress < 0.5 ? "Loading Cityscape..." : progress < 0.9 ? "Preparing race systems..." : "Synchronizing start sequence...";
+      }
+      if (progress >= 1) startRaceSequence();
+    }
+
+    if (!raceActive) return;
+
+    elapsedMs += dt * 1000;
+
+    if (step === 0 && elapsedMs >= countDownDelay + startDelay) {
+      this.erth.store.set("hgl_message", "3");
+      step = 1;
+    } else if (step === 1 && elapsedMs >= 2 * countDownDelay + startDelay) {
+      this.erth.store.set("hgl_message", "2");
+      step = 2;
+    } else if (step === 2 && elapsedMs >= 3 * countDownDelay + startDelay) {
+      this.erth.store.set("hgl_message", "1");
+      step = 3;
+    } else if (step === 3 && elapsedMs >= 4 * countDownDelay + startDelay) {
+      this.erth.store.set("hgl_message", "Go");
+      step = 4;
+      countdownStartMs = elapsedMs;
+
+      let player = game.scene.getObjectByName("Player");
+      if (player) {
+        game.behaviorManager.sendEventToObjectBehaviors(player, "hgl_activate", {});
+      }
+      playSound("bg");
+      playSound("wind");
+    } else if (step === 4) {
+      let raceMs = elapsedMs - countdownStartMs;
+      this.erth.store.set("hgl_time", raceMs);
+
+      if (this.erth.store.get("hgl_destroyed")) {
+        endRace(RESULTS.DESTROYED);
+        return;
+      }
+
+      let boostHit = this.erth.store.get("hgl_boostHit");
+      if (boostHit) {
+        playSound("boost");
+        this.erth.store.set("hgl_boostHit", false);
+      }
+
+      let collision = this.erth.store.get("hgl_collision");
+      if (collision && (collision.left || collision.right || collision.front)) {
+        playSound("crash", collisionPan(collision));
+      }
+
+      let player = game.scene.getObjectByName("Player");
+      if (!player) return;
+
+      let cp = checkPoint(player.position);
+      if (cp === checkpoints.start && previousCheckPoint === checkpoints.last) {
+        previousCheckPoint = cp;
+        let lapTime = raceMs - lapTimeElapsed;
+        lapTimes.push(lapTime);
+        lapTimeElapsed = raceMs;
+
+        if (lap >= maxLaps) {
+          endRace(RESULTS.FINISH);
+          return;
+        }
+
+        lap++;
+        this.erth.store.set("hgl_lap", lap + "/" + maxLaps);
+        this.erth.store.set("hgl_message", lap === maxLaps ? "Final lap" : "Lap " + lap);
+      } else if (cp !== -1 && cp !== previousCheckPoint) {
+        previousCheckPoint = cp;
+      }
+    } else if (step === 100) {
+      finishTimer += deltaTime * 1000;
+      if (finishTimer >= 2000) {
+        raceActive = false;
+        this.erth.store.set("hgl_raceActive", false);
+      }
+    }
+  };
+
+  function endRace(r) {
+    result = r;
+    step = 100;
+    finishTimer = 0;
+
+    let player = game.scene.getObjectByName("Player");
+    if (player) {
+      game.behaviorManager.sendEventToObjectBehaviors(player, "hgl_deactivate", {});
+    }
+
+    if (r === RESULTS.FINISH) {
+      this.erth.store.set("hgl_message", "Finish");
+      playSound("wind");
+    } else if (r === RESULTS.DESTROYED) {
+      this.erth.store.set("hgl_message", "Destroyed");
+      playSound("destroyed");
+      stopSound("bg");
+    }
+
+    if (showLaunchMenu && menuRoot) {
+      if (menuElements.resultTitle) menuElements.resultTitle.textContent = r === RESULTS.FINISH ? "Finish" : "Destroyed";
+      if (menuElements.resultTime) menuElements.resultTime.textContent = "Time " + formatTime(this.erth.store.get("hgl_time") || elapsedMs);
+      if (menuElements.resultCopy) {
+        menuElements.resultCopy.textContent = r === RESULTS.FINISH
+          ? "Cityscape completed. Press Enter to launch another run."
+          : "The ship was destroyed. Press Enter to retry from the grid.";
+      }
+      setMenuVisibility(true);
+      setActiveStep("stepResult");
+    }
+  }
+  endRace = endRace.bind(this);
+
+  this.dispose = function() {
+    this._restartPrev = false;
+    Object.keys(sounds).forEach(function(id) {
+      const s = sounds[id];
+      if (!s) return;
+      if (s.audio) {
+        try {
+          s.audio.pause();
+          s.audio.currentTime = 0;
+          if (typeof s.audio.load === "function") s.audio.load();
+          s.audio.src = "";
+        } catch { /* no-op */ }
+      }
+      try { s.source?.disconnect?.(); } catch { /* no-op */ }
+      try { s.panner?.disconnect?.(); } catch { /* no-op */ }
+      try { s.gain?.disconnect?.(); } catch { /* no-op */ }
+    });
+    sounds = {};
+    if (audioCtx && typeof audioCtx.close === "function") {
+      audioCtx.close().catch(function() { /* no-op */ });
+      audioCtx = null;
+    }
+    if (menuRoot && menuRoot.parentNode) menuRoot.parentNode.removeChild(menuRoot); // @check-ok
+    if (menuStyleEl && menuStyleEl.parentNode) menuStyleEl.parentNode.removeChild(menuStyleEl); // @check-ok
+    menuRoot = null;
+    menuStyleEl = null;
+    menuElements = {};
+    menuItems = [];
+    sounds = {};
+    checkPixels = null;
+  };

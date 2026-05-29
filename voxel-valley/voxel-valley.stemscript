@@ -1,0 +1,54 @@
+# Voxel Valley — Minecraft-style voxel building game
+# Ported from Rosebud.ai "3D Multiplayer Template v1"
+
+project title "Voxel Valley"
+
+# --- Asset Imports ---
+import model name="Tree1" filepath="models/Tree_1.glb"
+import model name="Tree2" filepath="models/Tree_2.glb"
+import model name="Tree3" filepath="models/Tree_3.glb"
+update "Tree1" objectSettings={gameVisibility:false}
+update "Tree2" objectSettings={gameVisibility:false}
+update "Tree3" objectSettings={gameVisibility:false}
+
+import image name="Skybox" filepath="textures/rosebud_skybox_01.png"
+import image name="GrassColor" filepath="textures/Grass005_1K-JPG_Color.jpg"
+import image name="GrassRoughness" filepath="textures/Grass005_1K-JPG_Roughness.jpg"
+import image name="GrassAO" filepath="textures/Grass005_1K-JPG_AmbientOcclusion.jpg"
+import image name="GrassNormal" filepath="textures/Grass005_1K-JPG_NormalGL.jpg"
+
+import audio name="WindAmbience" filepath="audio/windy_day_ambience_01.wav"
+
+import behavior name="vvWorld" filepath="behaviors/vvWorld.yaml"
+import behavior name="vvPlayer" filepath="behaviors/vvPlayer.yaml"
+import behavior name="vvHUD" filepath="behaviors/vvHUD.yaml"
+import behavior name="vvTrees" filepath="behaviors/vvTrees.yaml"
+import behavior name="vvAudio" filepath="behaviors/vvAudio.yaml"
+
+# --- Scene Settings ---
+scene background type=Texture texture="Skybox"
+scene fog type=linear near=16 far=44 color=#87ceeb
+scene tonemapping type=ACESFilmicToneMapping exposure=0.9
+scene lighting ambient={intensity:0.32,color:"#87ceeb"} hemisphere={intensity:0.5,skyColor:"#87ceeb",groundColor:"#654321"} shadows={enabled:true,type:2,size:2048}
+render settings useShadows=true
+
+# --- Directional Light (Sun) ---
+light "Directional Light" intensity=1.8 color=#FFF8DC castShadow=true shadowMapSize=2048 shadowBias=-0.0001 shadowRadius=4
+
+# --- Camera ---
+camera "DefaultCamera" cameraType=NONE fov=75 near=0.01 far=72
+
+# --- Game Settings ---
+game settings enabled=true showHUD=false isSandbox=true
+
+# --- Player Object ---
+add capsule name="Player" position=0,8,0 size=0.4,2,0.4
+update Player tag=Player
+physics enable Player ctype=kinematic shape=capsule
+
+# --- Attach Behaviors ---
+behavior attach "Default Scene" behaviorId=vv.world config={grassColorTex:"GrassColor",grassRoughnessTex:"GrassRoughness",grassAOTex:"GrassAO",grassNormalTex:"GrassNormal"}
+behavior attach "Player" behaviorId=vv.player
+behavior attach "Default Scene" behaviorId=vv.hud
+behavior attach "Default Scene" behaviorId=vv.trees config={tree1Model:"Tree1",tree2Model:"Tree2",tree3Model:"Tree3"}
+behavior attach "Default Scene" behaviorId=vv.audio config={ambienceSound:"WindAmbience"}

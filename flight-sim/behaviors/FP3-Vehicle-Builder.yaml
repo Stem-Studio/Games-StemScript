@@ -1,0 +1,392 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "FP3 Vehicle Builder"
+  id: "fp3.vehicleBuilder"
+  author: "flight-sim"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  priority: 0
+  description: "Procedurally builds vehicle geometry for 5 vehicle types based on store selection"
+  tags:
+    - gameplay
+  attributes: {}
+  documentation: Procedurally builds vehicle geometry for 5 vehicle types (cessna, f16, apache, tank, cyberpink).
+    Reads fp3_vehicleName from store, constructs geometry as children of gameObject, and writes stats/parts back to store.
+
+code: |
+  let game;
+  let group = null;
+  let allGeometries = [];
+  let allMaterials = [];
+
+  let GROUND_LEVEL = 10;
+
+  function makeMat(color, opts) {
+    opts = opts || {};
+    let params = { color: color };
+    if (opts.transparent) { params.transparent = true; params.opacity = opts.opacity || 1; }
+    if (opts.shininess !== undefined) { params.shininess = opts.shininess; }
+    if (opts.emissive !== undefined) { params.emissive = opts.emissive; }
+    if (opts.emissiveIntensity !== undefined) { params.emissiveIntensity = opts.emissiveIntensity; }
+    let mat = new THREE.MeshStandardNodeMaterial(params);
+    allMaterials.push(mat);
+    return mat;
+  }
+
+  function makeGeo(GeoCtor, args) {
+    let geo = new (Function.prototype.bind.apply(GeoCtor, [null].concat(args)));
+    allGeometries.push(geo);
+    return geo;
+  }
+
+  function addMesh(parent, geo, mat, pos, rot) {
+    let mesh = new THREE.Mesh(geo, mat);
+    if (pos) { mesh.position.set(pos[0], pos[1], pos[2]); }
+    if (rot) {
+      if (rot[0]) mesh.rotation.x = rot[0];
+      if (rot[1]) mesh.rotation.y = rot[1];
+      if (rot[2]) mesh.rotation.z = rot[2];
+    }
+    mesh.userData = mesh.userData || {};
+    mesh.userData.isRuntimeOnly = true;
+    parent.add(mesh);
+    return mesh;
+  }
+
+  this.init = function(_game) {
+    game = _game;
+  };
+
+  this.onStart = function() {
+    let vehicleName = this.erth.store.get('fp3_vehicleName') || 'cessna';
+    this.buildVehicle(vehicleName);
+  };
+
+  this.buildVehicle = function(name) {
+    group = this.gameObject._internal.three;
+
+    // Hide placeholder mesh
+    group.traverse(function(child) {
+      if (child.isMesh && child.material) {
+        if (Array.isArray(child.material)) {
+          child.material.forEach(function(m) { m.visible = false; });
+        } else {
+          child.material.visible = false;
+        }
+      }
+    });
+
+    let parts = {};
+    let stats = {};
+
+    if (name === 'cessna') {
+      this.buildCessna(parts);
+      stats = { minSpeed: 0, maxSpeed: 2.5, takeoffSpeed: 0.28, speedIncrement: 0.10, rollSpeed: 1.44, maxRoll: Math.PI / 2, yawRate: 5, pitchSpeed: 0.9 };
+    } else if (name === 'f16') {
+      this.buildF16(parts);
+      stats = { minSpeed: 0, maxSpeed: 2.5, takeoffSpeed: 0.28, speedIncrement: 0.02, rollSpeed: 1.44, maxRoll: Math.PI / 2, yawRate: 1, pitchSpeed: 0.9 };
+    } else if (name === 'apache') {
+      this.buildApache(parts);
+      stats = { minSpeed: 0, maxSpeed: 5, takeoffSpeed: 0.28, speedIncrement: 0.15, rollSpeed: 1.44, maxRoll: Math.PI / 2, yawRate: 2, pitchSpeed: 0.9 };
+    } else if (name === 'tank') {
+      this.buildTank(parts);
+      stats = { minSpeed: 0, maxSpeed: 0.2, takeoffSpeed: 0.28, speedIncrement: 0.02, rollSpeed: 1.44, maxRoll: Math.PI / 2, yawRate: 1, pitchSpeed: 0.9 };
+    } else if (name === 'cyberpink') {
+      this.buildCyberpink(parts);
+      stats = { minSpeed: 0, maxSpeed: 6, takeoffSpeed: 0.3, speedIncrement: 0.2, rollSpeed: 1.5, maxRoll: Math.PI / 2.2, yawRate: 1.8, pitchSpeed: 1.0 };
+    } else {
+      // Default to cessna
+      this.buildCessna(parts);
+      stats = { minSpeed: 0, maxSpeed: 2.5, takeoffSpeed: 0.28, speedIncrement: 0.10, rollSpeed: 1.44, maxRoll: Math.PI / 2, yawRate: 5, pitchSpeed: 0.9 };
+    }
+
+    // Mark all created children as runtime-only
+    group.traverse(function(child) {
+      child.userData = child.userData || {};
+      child.userData.isRuntimeOnly = true;
+    });
+
+    this.erth.store.set('fp3_vehicleStats', stats);
+    this.erth.store.set('fp3_vehicleParts', parts);
+    this.erth.store.set('fp3_vehicleReady', true);
+  };
+
+  // ─── CESSNA ──────────────────────────────────────────────
+  this.buildCessna = function(parts) {
+    let bodyMat = makeMat(0xFFFFFF);
+    let wingMat = makeMat(0xFFFFFF);
+    let trimMat = makeMat(0x2244CC);
+    let darkMat = makeMat(0x333333);
+    let glassMat = makeMat(0x87CEEB, { transparent: true, opacity: 0.5 });
+
+    // Fuselage
+    addMesh(group, makeGeo(THREE.BoxGeometry, [0.8, 0.8, 4]), bodyMat, null, null);
+
+    // Nose
+    addMesh(group, makeGeo(THREE.BoxGeometry, [0.6, 0.6, 0.8]), bodyMat, [0, -0.1, -2.2], null);
+
+    // Propeller
+    parts.propeller = addMesh(group, makeGeo(THREE.BoxGeometry, [2, 0.1, 0.1]), darkMat, [0, 0, -2.6], null);
+
+    // Propeller hub
+    addMesh(group, makeGeo(THREE.CylinderGeometry, [0.1, 0.1, 0.2, 8]), darkMat, [0, 0, -2.6], [Math.PI / 2, 0, 0]);
+
+    // Wings
+    addMesh(group, makeGeo(THREE.BoxGeometry, [7, 0.1, 1.2]), wingMat, [0, 0.3, 0], null);
+
+    // Left aileron
+    parts.aileronLeft = addMesh(group, makeGeo(THREE.BoxGeometry, [1.5, 0.1, 0.6]), wingMat, [-2.5, 0.3, 0.3], null);
+
+    // Right aileron
+    parts.aileronRight = addMesh(group, makeGeo(THREE.BoxGeometry, [1.5, 0.1, 0.6]), wingMat, [2.5, 0.3, 0.3], null);
+
+    // Tail wings (elevator)
+    parts.elevator = addMesh(group, makeGeo(THREE.BoxGeometry, [2.2, 0.1, 0.8]), wingMat, [0, 0.2, 1.8], null);
+
+    // Vertical stabilizer (rudder)
+    parts.rudder = addMesh(group, makeGeo(THREE.BoxGeometry, [0.1, 0.8, 1.2]), trimMat, [0, 0.5, 1.8], null);
+
+    // Windows
+    addMesh(group, makeGeo(THREE.BoxGeometry, [0.82, 0.82, 1.2]), glassMat, [0, 0.1, -0.8], null);
+
+    // Landing gear
+    let landingGearParts = [];
+
+    // Left wheel
+    let leftWheel = addMesh(group, makeGeo(THREE.CylinderGeometry, [0.2, 0.2, 0.1, 8]), darkMat, [-1, -0.6, 0], [0, 0, Math.PI / 2]);
+    landingGearParts.push({ mesh: leftWheel, origY: -0.6 });
+
+    // Right wheel
+    let rightWheel = addMesh(group, makeGeo(THREE.CylinderGeometry, [0.2, 0.2, 0.1, 8]), darkMat, [1, -0.6, 0], [0, 0, Math.PI / 2]);
+    landingGearParts.push({ mesh: rightWheel, origY: -0.6 });
+
+    // Left strut
+    let leftStrut = addMesh(group, makeGeo(THREE.BoxGeometry, [0.05, 0.5, 0.05]), bodyMat, [-1, -0.35, 0], null);
+    landingGearParts.push({ mesh: leftStrut, origY: -0.35 });
+
+    // Right strut
+    let rightStrut = addMesh(group, makeGeo(THREE.BoxGeometry, [0.05, 0.5, 0.05]), bodyMat, [1, -0.35, 0], null);
+    landingGearParts.push({ mesh: rightStrut, origY: -0.35 });
+
+    // Nose wheel
+    let noseWheel = addMesh(group, makeGeo(THREE.CylinderGeometry, [0.2, 0.2, 0.1, 8]), darkMat, [0, -0.6, -1.5], [0, 0, Math.PI / 2]);
+    landingGearParts.push({ mesh: noseWheel, origY: -0.6 });
+
+    // Nose strut
+    let noseStrut = addMesh(group, makeGeo(THREE.BoxGeometry, [0.05, 0.5, 0.05]), bodyMat, [0, -0.35, -1.5], null);
+    landingGearParts.push({ mesh: noseStrut, origY: -0.35 });
+
+    parts.landingGearParts = landingGearParts;
+  };
+
+  // ─── F16 ─────────────────────────────────────────────────
+  this.buildF16 = function(parts) {
+    let bodyMat = makeMat(0x808080);
+    let darkMat = makeMat(0x555555);
+    let glassMat = makeMat(0x87CEEB, { transparent: true, opacity: 0.5 });
+
+    // Fuselage - longer and sleeker than cessna
+    addMesh(group, makeGeo(THREE.BoxGeometry, [0.8, 0.6, 5]), bodyMat, null, null);
+
+    // Nose cone
+    addMesh(group, makeGeo(THREE.BoxGeometry, [0.5, 0.4, 1.2]), darkMat, [0, 0, -3], null);
+
+    // Cockpit canopy
+    addMesh(group, makeGeo(THREE.BoxGeometry, [0.7, 0.5, 1.2]), glassMat, [0, 0.4, -1], null);
+
+    // Delta wings
+    // Left wing
+    let leftWingGeo = makeGeo(THREE.BoxGeometry, [3.5, 0.08, 2]);
+    let leftWing = addMesh(group, leftWingGeo, bodyMat, [-2, 0, 0.5], null);
+
+    // Right wing
+    let rightWingGeo = makeGeo(THREE.BoxGeometry, [3.5, 0.08, 2]);
+    let rightWing = addMesh(group, rightWingGeo, bodyMat, [2, 0, 0.5], null);
+
+    // Left aileron
+    parts.aileronLeft = addMesh(group, makeGeo(THREE.BoxGeometry, [1.2, 0.08, 0.5]), bodyMat, [-2.5, 0, 1.2], null);
+
+    // Right aileron
+    parts.aileronRight = addMesh(group, makeGeo(THREE.BoxGeometry, [1.2, 0.08, 0.5]), bodyMat, [2.5, 0, 1.2], null);
+
+    // Vertical stabilizer (rudder)
+    parts.rudder = addMesh(group, makeGeo(THREE.BoxGeometry, [0.08, 1.2, 1.5]), darkMat, [0, 0.7, 2], null);
+
+    // Horizontal stabilizers (elevator)
+    parts.elevator = addMesh(group, makeGeo(THREE.BoxGeometry, [2, 0.08, 0.8]), bodyMat, [0, 0.1, 2.2], null);
+
+    // Jet intake left
+    addMesh(group, makeGeo(THREE.BoxGeometry, [0.4, 0.4, 0.6]), darkMat, [-0.5, -0.2, -0.5], null);
+
+    // Jet intake right
+    addMesh(group, makeGeo(THREE.BoxGeometry, [0.4, 0.4, 0.6]), darkMat, [0.5, -0.2, -0.5], null);
+
+    // Exhaust nozzle
+    addMesh(group, makeGeo(THREE.CylinderGeometry, [0.3, 0.35, 0.6, 8]), darkMat, [0, 0, 2.8], [Math.PI / 2, 0, 0]);
+
+    // Landing gear (retractable style)
+    let landingGearParts = [];
+
+    let leftWheel = addMesh(group, makeGeo(THREE.CylinderGeometry, [0.15, 0.15, 0.08, 8]), darkMat, [-1, -0.5, 0], [0, 0, Math.PI / 2]);
+    landingGearParts.push({ mesh: leftWheel, origY: -0.5 });
+
+    let rightWheel = addMesh(group, makeGeo(THREE.CylinderGeometry, [0.15, 0.15, 0.08, 8]), darkMat, [1, -0.5, 0], [0, 0, Math.PI / 2]);
+    landingGearParts.push({ mesh: rightWheel, origY: -0.5 });
+
+    let noseWheel = addMesh(group, makeGeo(THREE.CylinderGeometry, [0.15, 0.15, 0.08, 8]), darkMat, [0, -0.5, -2], [0, 0, Math.PI / 2]);
+    landingGearParts.push({ mesh: noseWheel, origY: -0.5 });
+
+    parts.landingGearParts = landingGearParts;
+  };
+
+  // ─── APACHE ──────────────────────────────────────────────
+  this.buildApache = function(parts) {
+    let bodyMat = makeMat(0x4B5320);
+    let rotorMat = makeMat(0x1a1a1a);
+    let detailMat = makeMat(0x3B4210);
+    let glassMat = makeMat(0x333333, { transparent: true, opacity: 0.7 });
+    let missileMat = makeMat(0x333333);
+
+    // Body
+    addMesh(group, makeGeo(THREE.BoxGeometry, [2, 1.8, 6]), bodyMat, [0, 0.5, 0], null);
+
+    // Cockpit
+    addMesh(group, makeGeo(THREE.BoxGeometry, [1.8, 0.8, 2.5]), glassMat, [0, 1.3, -1.5], null);
+
+    // Rotor hub
+    addMesh(group, makeGeo(THREE.CylinderGeometry, [0.3, 0.3, 0.5, 8]), rotorMat, [0, 2.5, 0], null);
+
+    // Main rotor blade 1
+    parts.mainRotor = addMesh(group, makeGeo(THREE.BoxGeometry, [10, 0.1, 0.4]), rotorMat, [0, 2.7, 0], null);
+
+    // Main rotor blade 2 (perpendicular)
+    parts.mainRotor2 = addMesh(group, makeGeo(THREE.BoxGeometry, [10, 0.1, 0.4]), rotorMat, [0, 2.7, 0], [0, Math.PI / 2, 0]);
+
+    // Tail boom
+    addMesh(group, makeGeo(THREE.BoxGeometry, [0.5, 0.5, 4]), detailMat, [0, 0.5, 4], null);
+
+    // Tail rotor
+    parts.tailRotor = addMesh(group, makeGeo(THREE.BoxGeometry, [1.5, 0.1, 0.2]), rotorMat, [0.4, 0.5, 5.8], null);
+
+    // Stub wings
+    addMesh(group, makeGeo(THREE.BoxGeometry, [5, 0.2, 1]), bodyMat, [0, 0.2, 0], null);
+
+    // Hellfire missiles at wing hardpoints
+    let missilePositions = [-2, -1, 1, 2];
+    for (let i = 0; i < missilePositions.length; i++) {
+      addMesh(group, makeGeo(THREE.CylinderGeometry, [0.1, 0.1, 1.2, 8]), missileMat, [missilePositions[i], 0, 0], [Math.PI / 2, 0, 0]);
+    }
+
+    // Chain gun
+    addMesh(group, makeGeo(THREE.CylinderGeometry, [0.15, 0.15, 1.5, 8]), missileMat, [0, 0, -3], [Math.PI / 2, 0, 0]);
+
+    // Skids
+    addMesh(group, makeGeo(THREE.BoxGeometry, [0.2, 0.2, 4]), detailMat, [-1, -0.8, 0], null);
+    addMesh(group, makeGeo(THREE.BoxGeometry, [0.2, 0.2, 4]), detailMat, [1, -0.8, 0], null);
+
+    // Skid supports (front and rear, left and right)
+    addMesh(group, makeGeo(THREE.BoxGeometry, [0.1, 0.5, 0.1]), detailMat, [-1, -0.55, -1.5], null);
+    addMesh(group, makeGeo(THREE.BoxGeometry, [0.1, 0.5, 0.1]), detailMat, [-1, -0.55, 1.5], null);
+    addMesh(group, makeGeo(THREE.BoxGeometry, [0.1, 0.5, 0.1]), detailMat, [1, -0.55, -1.5], null);
+    addMesh(group, makeGeo(THREE.BoxGeometry, [0.1, 0.5, 0.1]), detailMat, [1, -0.55, 1.5], null);
+  };
+
+  // ─── TANK ────────────────────────────────────────────────
+  this.buildTank = function(parts) {
+    let bodyMat = makeMat(0x4B5320);
+    let trackMat = makeMat(0x1a1a1a);
+    let turretMat = makeMat(0x3B4210);
+
+    // Body hull
+    addMesh(group, makeGeo(THREE.BoxGeometry, [3, 1.2, 4]), bodyMat, [0, 0.6, 0], null);
+
+    // Left track
+    addMesh(group, makeGeo(THREE.BoxGeometry, [0.8, 0.6, 4.5]), trackMat, [-1.5, 0.3, 0], null);
+
+    // Right track
+    addMesh(group, makeGeo(THREE.BoxGeometry, [0.8, 0.6, 4.5]), trackMat, [1.5, 0.3, 0], null);
+
+    // Turret base
+    addMesh(group, makeGeo(THREE.CylinderGeometry, [1, 1.2, 0.8, 8]), turretMat, [0, 1.5, 0], null);
+
+    // Turret body
+    parts.tankTurret = addMesh(group, makeGeo(THREE.BoxGeometry, [1.8, 1, 2]), turretMat, [0, 1.8, 0], null);
+
+    // Gun barrel
+    addMesh(group, makeGeo(THREE.CylinderGeometry, [0.15, 0.15, 3, 8]), turretMat, [0, 1.8, -2.5], [Math.PI / 2, 0, 0]);
+
+    // Front armor plate
+    addMesh(group, makeGeo(THREE.BoxGeometry, [3.2, 0.3, 0.8]), bodyMat, [0, 0.8, 1.8], [-Math.PI / 6, 0, 0]);
+
+    // Lower group to ground
+    group.position.y = 0.3;
+  };
+
+  // ─── CYBERPINK ───────────────────────────────────────────
+  this.buildCyberpink = function(parts) {
+    let bodyMat = makeMat(0xff69b4, { shininess: 80 });
+    let wingMat = makeMat(0xff1493, { shininess: 80 });
+    let glassMat = makeMat(0xffb6ed, { transparent: true, opacity: 0.7, shininess: 100 });
+    let neonMat = makeMat(0xff69b4, { emissive: 0xff00ff, emissiveIntensity: 0.8 });
+    let thrusterMat = makeMat(0xff1493, { emissive: 0xff00ff, emissiveIntensity: 0.5 });
+
+    // Main body
+    addMesh(group, makeGeo(THREE.BoxGeometry, [2.5, 1, 5]), bodyMat, null, null);
+
+    // Cab
+    addMesh(group, makeGeo(THREE.BoxGeometry, [2.4, 0.8, 2]), bodyMat, [0, 0.8, -0.5], null);
+
+    // Windshield
+    addMesh(group, makeGeo(THREE.BoxGeometry, [2.3, 0.7, 0.2]), glassMat, [0, 0.5, -1.5], [-Math.PI / 12, 0, 0]);
+
+    // Wings
+    addMesh(group, makeGeo(THREE.BoxGeometry, [8, 0.2, 2]), wingMat, [0, 0, 0], null);
+
+    // Wing tip left
+    addMesh(group, makeGeo(THREE.BoxGeometry, [0.2, 0.8, 1.5]), wingMat, [-4, 0.3, 0], null);
+
+    // Wing tip right
+    addMesh(group, makeGeo(THREE.BoxGeometry, [0.2, 0.8, 1.5]), wingMat, [4, 0.3, 0], null);
+
+    // Rear stabilizer
+    addMesh(group, makeGeo(THREE.BoxGeometry, [2, 0.2, 1]), wingMat, [0, 0.3, 2.5], null);
+
+    // Vertical fin
+    addMesh(group, makeGeo(THREE.BoxGeometry, [0.2, 0.8, 1]), wingMat, [0, 0.6, 2.5], null);
+
+    // Thruster left
+    addMesh(group, makeGeo(THREE.CylinderGeometry, [0.3, 0.4, 0.5, 8]), thrusterMat, [-1, -0.2, 2.7], [Math.PI / 2, 0, 0]);
+
+    // Thruster right
+    addMesh(group, makeGeo(THREE.CylinderGeometry, [0.3, 0.4, 0.5, 8]), thrusterMat, [1, -0.2, 2.7], [Math.PI / 2, 0, 0]);
+
+    // Neon underglow strips
+    // Left strip
+    addMesh(group, makeGeo(THREE.BoxGeometry, [0.1, 0.05, 4.5]), neonMat, [-1.2, -0.5, 0], null);
+    // Right strip
+    addMesh(group, makeGeo(THREE.BoxGeometry, [0.1, 0.05, 4.5]), neonMat, [1.2, -0.5, 0], null);
+    // Front strip
+    addMesh(group, makeGeo(THREE.BoxGeometry, [2.3, 0.05, 0.1]), neonMat, [0, -0.5, -2.4], null);
+    // Rear strip
+    addMesh(group, makeGeo(THREE.BoxGeometry, [2.3, 0.05, 0.1]), neonMat, [0, -0.5, 2.4], null);
+  };
+
+  this.dispose = function() {
+    allGeometries.forEach(function(g) { g.dispose(); });
+    allMaterials.forEach(function(m) { m.dispose(); });
+    allGeometries = [];
+    allMaterials = [];
+  };
+
+  this.onEditorAdded = function() {
+    // No editor preview for runtime-only procedural geometry
+  };
+
+  this.onEditorDispose = function() {
+    // Nothing to clean up in editor
+  };

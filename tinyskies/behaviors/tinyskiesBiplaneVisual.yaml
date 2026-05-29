@@ -1,0 +1,122 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Biplane Visual"
+  id: "tinyskies.biplaneVisual"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Procedural biplane mesh built via the shared biplane-mesh import script. Visual-only child of the player object."
+  documentation: "Wraps imports/biplane-mesh.js createBiplane() — same fuselage lathe, double-wing struts, radial-engine, propeller. Sets matrixAutoUpdate=false on the parent so the flight controller can write the great-circle matrix directly each frame. Hoists userData.propeller up to the gameObject's THREE node so the flight controller's prop-spin reaches it. Also renders in the editor preview so the scene is not empty when the game is stopped."
+  tags:
+    - visual
+    - vehicle
+  priority: 0
+  throttleConfig:
+    throttlePriority: "HIGH"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: false
+  attributes:
+    hullColor:
+      name: "Hull Color"
+      type: "color"
+      default: "#ff4444"
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  @import "biplane-mesh" as B;
+
+  const LOG_TAG = "[tinyskies.biplaneVisual]";
+  let game;
+
+  this.init = function (_game) {
+    game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._buildVisual(this.gameObject._internal.three, false);
+    this._log("init");
+  };
+
+  this.onEditorAdded = function (editor) {
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._buildVisual(this.gameObject._internal.three, true);
+  };
+
+  this.onEditorAttributesUpdated = function () {
+    this._teardownVisual();
+    this._buildVisual(this.gameObject._internal.three, true);
+  };
+
+  this.onEditorDispose = function () {
+    this._teardownVisual();
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    this._teardownVisual();
+  };
+
+  // Toggle visibility based on vehicle type (Batch D — boat + carpet siblings).
+  this.update = function () {
+    if (!this._planeRoot) return;
+    const vt = this.erth.store.get("tinyskies/vehicleType") || "plane";
+    this._planeRoot.visible = (vt === "plane");
+  };
+
+  this._buildVisual = function (parent, isEditor) {
+    const colorAttr = this.getAttribute("hullColor");
+    const colorHex = (typeof colorAttr === "string")
+      ? new THREE.Color(colorAttr).getHex()
+      : colorAttr;
+
+    const plane = B.createBiplane(colorHex);
+    plane.userData.isRuntimeOnly = true;
+    plane.traverse((child) => { child.userData.isRuntimeOnly = true; });
+
+    parent.add(plane);
+
+    // The flight controller writes its great-circle matrix directly to the
+    // parent's `matrix`. Disable Three's auto-update so user-set matrices are
+    // not overwritten by position/quaternion sync. (Source pattern: Plane.ts:133.)
+    if (!isEditor) {
+      parent.matrixAutoUpdate = false;
+    }
+
+    // Surface the propeller group so the flight controller can spin it.
+    parent.userData.tinyskiesPropeller = plane.userData.propeller;
+    parent.userData.tinyskiesHullMaterial = plane.userData.hullMaterial;
+
+    this._planeRoot = plane;
+  };
+
+  this._teardownVisual = function () {
+    if (!this._planeRoot) return;
+    this._planeRoot.traverse((child) => {
+      if (child.geometry && typeof child.geometry.dispose === "function") child.geometry.dispose();
+      if (child.material) {
+        if (Array.isArray(child.material)) {
+          for (const m of child.material) if (m && typeof m.dispose === "function") m.dispose();
+        } else if (typeof child.material.dispose === "function") {
+          child.material.dispose();
+        }
+      }
+    });
+    if (this._planeRoot.parent) this._planeRoot.parent.remove(this._planeRoot);
+    const parent = this.gameObject?._internal?.three;
+    if (parent) {
+      delete parent.userData.tinyskiesPropeller;
+      delete parent.userData.tinyskiesHullMaterial;
+    }
+    this._planeRoot = null;
+  };

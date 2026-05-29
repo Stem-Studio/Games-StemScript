@@ -1,0 +1,197 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Void Carpet Trail"
+  id: "tinyskies.voidCarpetTrail"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Wide additive-blended luminous ribbon trailing the magic carpet's center while in void. Reads as soft sky-light. Source-faithful port of VoidCarpetTrail.ts (241 LOC)."
+  documentation: "Active only when vehicleType==='carpet' AND `tinyskies/inVoid` is true. Single 52-segment FIFO ribbon, HALF_WIDTH=0.042 (~10× the gold CarpetTrail width). Bitangent uses the player's surface-normal cross trail-tangent (so the ribbon stays parallel to the void plane / globe tangent rather than turning to face the camera). Source uses raw GLSL ShaderMaterial with white tint scaled by uSpeedAlpha; replaced with MeshBasicNodeMaterial + RGBA vertexColors for WebGPU compat. Group parented to scene root."
+  tags:
+    - vehicle
+    - vfx
+    - void
+  priority: 0
+  throttleConfig:
+    throttlePriority: "MEDIUM"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  const LOG_TAG = "[tinyskies.voidCarpetTrail]";
+
+  // Source VoidCarpetTrail.ts:18-20 — verbatim.
+  const TRAIL_LENGTH = 52;
+  const HALF_WIDTH = 0.042;
+  // Source VoidCarpetTrail.ts:225-228 — center-rear offset in carpet local space.
+  const CENTER_OFF_X = 0;
+  const CENTER_OFF_Y = -0.01;
+  const CENTER_OFF_Z = -0.06;
+  // White tint.
+  const TRAIL_R = 1.0, TRAIL_G = 0.98, TRAIL_B = 0.95;
+
+  this.init = function (_game) {
+    this._game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+
+    const vertCount = TRAIL_LENGTH * 2;
+    const posArray = new Float32Array(vertCount * 3);
+    const colArray = new Float32Array(vertCount * 4);
+    this._posAttr = new THREE.BufferAttribute(posArray, 3);
+    this._colAttr = new THREE.BufferAttribute(colArray, 4);
+
+    const geo = new THREE.BufferGeometry(); // @check-ok no editor preview — only renders during void play
+    geo.setAttribute("position", this._posAttr);
+    geo.setAttribute("color", this._colAttr);
+    const indices = [];
+    for (let i = 0; i < TRAIL_LENGTH - 1; i++) {
+      const a = i * 2;
+      indices.push(a, a + 2, a + 1, a + 1, a + 2, a + 3);
+    }
+    geo.setIndex(indices);
+    this._geo = geo;
+
+    this._mat = new THREE.MeshBasicNodeMaterial({
+      transparent: true,
+      depthWrite: false,
+      vertexColors: true,
+      side: THREE.DoubleSide,
+      blending: THREE.AdditiveBlending,
+    });
+    this._mesh = new THREE.Mesh(geo, this._mat);
+    this._mesh.frustumCulled = false;
+    this._mesh.userData.isRuntimeOnly = true;
+
+    this._group = new THREE.Group();
+    this._group.userData.isRuntimeOnly = true;
+    this._group.visible = false;
+    this._group.add(this._mesh);
+    const sceneParent = this.gameObject._internal.three.parent || this.gameObject._internal.three;
+    sceneParent.add(this._group);
+
+    this._points = []; // FIFO of world-space positions
+    this._lastBit = new THREE.Vector3(0, 1, 0);
+    this._tmpCenter = new THREE.Vector3();
+    this._tmpUp = new THREE.Vector3();
+    this._tmpDir = new THREE.Vector3();
+    this._tmpBit = new THREE.Vector3();
+    this._localOffset = new THREE.Vector3(CENTER_OFF_X, CENTER_OFF_Y, CENTER_OFF_Z);
+
+    this._log("init");
+  };
+
+  this._reset = function () {
+    this._points.length = 0;
+    this._lastBit.set(0, 1, 0);
+    this._posAttr.array.fill(0);
+    this._colAttr.array.fill(0);
+    this._posAttr.needsUpdate = true;
+    this._colAttr.needsUpdate = true;
+  };
+
+  this._tickRibbon = function (worldPos, speedAlpha) {
+    this._points.unshift(worldPos.clone());
+    if (this._points.length > TRAIL_LENGTH) this._points.length = TRAIL_LENGTH;
+
+    const positions = this._posAttr.array;
+    const colors = this._colAttr.array;
+    const count = this._points.length;
+    const fallback = this._lastBit;
+
+    for (let i = 0; i < TRAIL_LENGTH; i++) {
+      const p = this._points[i];
+      if (!p) {
+        positions[i * 6]     = 0; positions[i * 6 + 1] = 0; positions[i * 6 + 2] = 0;
+        positions[i * 6 + 3] = 0; positions[i * 6 + 4] = 0; positions[i * 6 + 5] = 0;
+        colors[i * 8]     = 0; colors[i * 8 + 1] = 0; colors[i * 8 + 2] = 0; colors[i * 8 + 3] = 0;
+        colors[i * 8 + 4] = 0; colors[i * 8 + 5] = 0; colors[i * 8 + 6] = 0; colors[i * 8 + 7] = 0;
+        continue;
+      }
+
+      const prevIdx = Math.max(i - 1, 0);
+      const nextIdx = Math.min(i + 1, count - 1);
+      this._tmpDir.subVectors(this._points[prevIdx], this._points[nextIdx]);
+
+      // Bitangent = (radial up at p) × dir. Keeps ribbon parallel to the
+      // globe tangent rather than rotating toward the camera.
+      this._tmpUp.copy(p).normalize();
+      this._tmpBit.crossVectors(this._tmpUp, this._tmpDir);
+
+      if (this._tmpBit.lengthSq() < 1e-10 || this._tmpDir.lengthSq() < 1e-10) {
+        this._tmpBit.copy(fallback);
+      } else {
+        this._tmpBit.normalize();
+        fallback.copy(this._tmpBit);
+      }
+
+      const fadeIn = Math.min(1, i / 10);
+      const fadeOut = 1 - i / TRAIL_LENGTH;
+      const w = HALF_WIDTH * fadeOut;
+      const a = fadeIn * fadeOut * speedAlpha;
+
+      positions[i * 6]     = p.x + this._tmpBit.x * w;
+      positions[i * 6 + 1] = p.y + this._tmpBit.y * w;
+      positions[i * 6 + 2] = p.z + this._tmpBit.z * w;
+      positions[i * 6 + 3] = p.x - this._tmpBit.x * w;
+      positions[i * 6 + 4] = p.y - this._tmpBit.y * w;
+      positions[i * 6 + 5] = p.z - this._tmpBit.z * w;
+
+      const cR = TRAIL_R * a, cG = TRAIL_G * a, cB = TRAIL_B * a;
+      colors[i * 8]     = cR; colors[i * 8 + 1] = cG; colors[i * 8 + 2] = cB; colors[i * 8 + 3] = a;
+      colors[i * 8 + 4] = cR; colors[i * 8 + 5] = cG; colors[i * 8 + 6] = cB; colors[i * 8 + 7] = a;
+    }
+
+    this._posAttr.needsUpdate = true;
+    this._colAttr.needsUpdate = true;
+  };
+
+  this.update = function () {
+    if (!this._group) return;
+    const store = this.erth.store;
+    const vt = store.get("tinyskies/vehicleType") || "plane";
+    const inVoid = store.get("tinyskies/inVoid") === true;
+    const active = (vt === "carpet") && inVoid;
+
+    if (!active) {
+      if (this._group.visible) {
+        this._group.visible = false;
+        this._reset();
+      }
+      return;
+    }
+    if (!this._group.visible) this._group.visible = true;
+
+    const speedRatio = store.get("tinyskies/speedRatio") || 0;
+    // Source: alpha = clamp(0.25 + speed*0.9, 0.2..1).
+    const speedAlpha = Math.max(0.2, Math.min(1, 0.25 + speedRatio * 0.9));
+
+    // Carpet world matrix → center-rear offset.
+    const m = this.gameObject._internal.three.matrixWorld;
+    this._tmpCenter.copy(this._localOffset).applyMatrix4(m);
+    this._tickRibbon(this._tmpCenter, speedAlpha);
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    if (this._geo && typeof this._geo.dispose === "function") this._geo.dispose();
+    if (this._mat && typeof this._mat.dispose === "function") this._mat.dispose();
+    if (this._group && this._group.parent) this._group.parent.remove(this._group);
+    this._group = null;
+    this._geo = null;
+    this._mat = null;
+    this._mesh = null;
+    this._points = null;
+  };

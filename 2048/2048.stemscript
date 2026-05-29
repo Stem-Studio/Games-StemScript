@@ -1,0 +1,31 @@
+# 2048 — Classic sliding tile puzzle
+# Ported from github.com/gabrielecirulli/2048
+
+project title "2048"
+
+# Scene: warm beige background matching the original
+scene background type=Color color=#faf8ef
+
+# Lighting: bright ambient for flat unlit rendering
+light "AmbientLight" intensity=3
+delete "HemisphereLight"
+delete "Directional Light"
+
+# Game board anchor — empty group so the behavior's editor preview isn't
+# scaled or occluded by a placeholder mesh. Play mode renders via UIKit
+# Fullscreen; this group is just an attach point for the behavior.
+add group name="GameBoard" position=0,0,0
+
+# Camera: fixed overhead, no built-in behavior
+camera "DefaultCamera" cameraType=NONE
+update "DefaultCamera" position=0,10,0 rotation=-90,0,0
+
+# Shared script-import asset — UIKit dual-mode helper used by the game behavior.
+import script name="uikit-dual-mode" filepath="imports/uikit-dual-mode.yaml" comment="Dual-mode UIKit lifecycle helper"
+
+# Import and attach game behavior
+import behavior name="2048 Game" filepath="behaviors/game2048.yaml"
+behavior attach "GameBoard" behaviorId=g2048.game
+
+# Enable game mode
+game settings enabled=true

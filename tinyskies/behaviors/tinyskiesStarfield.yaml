@@ -1,0 +1,286 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Starfield"
+  id: "tinyskies.starfield"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Celestial-sphere starfield: 6000 random stars + 240 bright stars + 8000 Milky-Way band stars + 1200 nebula clouds. Opacity tied to nightWeight."
+  documentation: "Three Points groups parented to a single root Group on the scene. Per-vertex aSize / aBrightness / aColor attributes drive a TSL sizeNode + colorNode. Materials share a single opacity uniform mutated each frame from `tinyskies/nightWeight`. Source Starfield.ts uses raw ShaderMaterial + perspective-sized gl_PointSize; the WebGPU port drops the perspective scaling (TSL doesn't expose vViewPosition for PointsNodeMaterial.sizeNode reliably) and uses a constant-factor pixel size — this is a small visual fidelity loss documented in tinyskies-fidelity-decision-record.md."
+  tags:
+    - environment
+    - vfx
+  priority: 0
+  throttleConfig:
+    throttlePriority: "LOW"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: false
+  attributes:
+    sphereRadius:
+      name: "Sphere Radius (units)"
+      type: "number"
+      default: 80
+      min: 20
+      max: 500
+    seed:
+      name: "Star Seed"
+      type: "number"
+      default: 9999
+      min: 1
+      max: 1000000
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  const LOG_TAG = "[tinyskies.starfield]";
+
+  // Match source Starfield.ts:12-18.
+  const STAR_COUNT = 6000;
+  const BRIGHT_STAR_COUNT = 240;
+  const MILKY_STAR_COUNT = 8000;
+  const MILKY_CLOUD_COUNT = 1200;
+  const BAND_TILT = Math.PI * 0.35;
+
+  // Source Starfield.ts:74-85 — nebula color palette.
+  const NEBULA_PALETTE = [
+    [0.35, 0.20, 0.60],
+    [0.50, 0.25, 0.70],
+    [0.20, 0.25, 0.65],
+    [0.65, 0.20, 0.50],
+    [0.80, 0.35, 0.55],
+    [0.25, 0.40, 0.75],
+    [0.40, 0.55, 0.80],
+    [0.70, 0.50, 0.35],
+    [0.55, 0.30, 0.65],
+    [0.30, 0.35, 0.80],
+  ];
+
+  function seededRandom(seed) {
+    let s = seed >>> 0;
+    if (s === 0) s = 1;
+    return function () {
+      s = (s * 16807) % 2147483647;
+      return (s - 1) / 2147483646;
+    };
+  }
+
+  function bandPoint(rand, tiltQuat, sphereRadius) {
+    const phi = rand() * Math.PI * 2;
+    const spread = (rand() - 0.5) * 0.45;
+    const theta = Math.PI * 0.5 + spread;
+    const v = new THREE.Vector3(
+      sphereRadius * Math.sin(theta) * Math.cos(phi),
+      sphereRadius * Math.cos(theta),
+      sphereRadius * Math.sin(theta) * Math.sin(phi),
+    );
+    v.applyQuaternion(tiltQuat);
+    return v;
+  }
+
+  function makeStarSprite() {
+    const size = 64;
+    const canvas = document.createElement("canvas");
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext("2d");
+    const grad = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+    grad.addColorStop(0.0, "rgba(255,255,255,1.0)");
+    grad.addColorStop(0.4, "rgba(255,255,255,0.55)");
+    grad.addColorStop(1.0, "rgba(255,255,255,0)");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, size, size);
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }
+
+  let game;
+
+  this.init = function (_game) {
+    game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._buildVisuals(this.gameObject._internal.three);
+    this._log("init");
+  };
+
+  this.onEditorAdded = function (editor) {
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._buildVisuals(this.gameObject._internal.three);
+    if (this._opacityUniform) this._opacityUniform.value = 0.4; // dim preview in editor
+  };
+
+  this.onEditorAttributesUpdated = function () {
+    this._teardownVisuals();
+    this._buildVisuals(this.gameObject._internal.three);
+  };
+
+  this.onEditorDispose = function () {
+    this._teardownVisuals();
+  };
+
+  this.update = function () {
+    if (!this._opacityUniform) return;
+    const w = this.erth.store.get("tinyskies/nightWeight");
+    if (typeof w === "number") {
+      this._opacityUniform.value = w;
+    }
+  };
+
+  this._buildVisuals = function (parent) {
+    const sphereRadius = this.getAttribute("sphereRadius");
+    const seed = this.getAttribute("seed");
+    const TSL = THREE.TSL;
+    const rand = seededRandom(seed);
+
+    const root = new THREE.Group();
+    root.name = "tinyskiesStarfieldRoot";
+    root.userData.isRuntimeOnly = true;
+
+    this._opacityUniform = TSL.uniform(1.0);
+    this._spriteTex = makeStarSprite();
+
+    root.add(this._buildBackgroundStars(rand, sphereRadius, TSL));
+    const tiltQuat = new THREE.Quaternion().setFromAxisAngle(
+      new THREE.Vector3(1, 0, 0.3).normalize(),
+      BAND_TILT,
+    );
+    root.add(this._buildMilkyStars(rand, tiltQuat, sphereRadius, TSL));
+    root.add(this._buildNebulaClouds(rand, tiltQuat, sphereRadius, TSL));
+
+    parent.add(root);
+    this._root = root;
+  };
+
+  this._buildBackgroundStars = function (rand, sphereRadius, TSL) {
+    const total = STAR_COUNT + BRIGHT_STAR_COUNT;
+    const positions = new Float32Array(total * 3);
+    const sizes = new Float32Array(total);
+    const brightnesses = new Float32Array(total);
+    for (let i = 0; i < total; i++) {
+      const theta = Math.acos(2 * rand() - 1);
+      const phi = 2 * Math.PI * rand();
+      positions[i * 3] = sphereRadius * Math.sin(theta) * Math.cos(phi);
+      positions[i * 3 + 1] = sphereRadius * Math.sin(theta) * Math.sin(phi);
+      positions[i * 3 + 2] = sphereRadius * Math.cos(theta);
+      const isBright = i >= STAR_COUNT;
+      if (isBright) {
+        sizes[i] = 6.0 + rand() * 12.0;
+        brightnesses[i] = 0.7 + rand() * 0.3;
+      } else {
+        sizes[i] = 1.5 + rand() * 6.0;
+        brightnesses[i] = 0.15 + rand() * 0.45;
+      }
+    }
+    return this._makePointsCloud(positions, sizes, brightnesses, null, TSL, false);
+  };
+
+  this._buildMilkyStars = function (rand, tiltQuat, sphereRadius, TSL) {
+    const positions = new Float32Array(MILKY_STAR_COUNT * 3);
+    const sizes = new Float32Array(MILKY_STAR_COUNT);
+    const brightnesses = new Float32Array(MILKY_STAR_COUNT);
+    for (let i = 0; i < MILKY_STAR_COUNT; i++) {
+      const v = bandPoint(rand, tiltQuat, sphereRadius);
+      positions[i * 3] = v.x;
+      positions[i * 3 + 1] = v.y;
+      positions[i * 3 + 2] = v.z;
+      sizes[i] = 1.0 + rand() * 4.0;
+      brightnesses[i] = 0.2 + rand() * 0.5;
+    }
+    return this._makePointsCloud(positions, sizes, brightnesses, null, TSL, false);
+  };
+
+  this._buildNebulaClouds = function (rand, tiltQuat, sphereRadius, TSL) {
+    const positions = new Float32Array(MILKY_CLOUD_COUNT * 3);
+    const sizes = new Float32Array(MILKY_CLOUD_COUNT);
+    const colors = new Float32Array(MILKY_CLOUD_COUNT * 3);
+    const brightnesses = new Float32Array(MILKY_CLOUD_COUNT);
+    for (let i = 0; i < MILKY_CLOUD_COUNT; i++) {
+      const v = bandPoint(rand, tiltQuat, sphereRadius);
+      positions[i * 3] = v.x;
+      positions[i * 3 + 1] = v.y;
+      positions[i * 3 + 2] = v.z;
+      const sizeRoll = rand();
+      sizes[i] = sizeRoll < 0.4
+        ? 8 + rand() * 24
+        : sizeRoll < 0.75
+          ? 30 + rand() * 60
+          : 90 + rand() * 140;
+      const pal = NEBULA_PALETTE[Math.floor(rand() * NEBULA_PALETTE.length)];
+      const brighten = 0.8 + rand() * 0.4;
+      colors[i * 3] = pal[0] * brighten;
+      colors[i * 3 + 1] = pal[1] * brighten;
+      colors[i * 3 + 2] = pal[2] * brighten;
+      brightnesses[i] = 0.04 + rand() * 0.10;
+    }
+    return this._makePointsCloud(positions, sizes, brightnesses, colors, TSL, true);
+  };
+
+  this._makePointsCloud = function (positions, sizes, brightnesses, colors, TSL, isNebula) {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    geo.setAttribute("aSize", new THREE.BufferAttribute(sizes, 1));
+    geo.setAttribute("aBright", new THREE.BufferAttribute(brightnesses, 1));
+    if (colors) geo.setAttribute("aColor", new THREE.BufferAttribute(colors, 3));
+
+    const mat = new THREE.PointsNodeMaterial({
+      map: this._spriteTex,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    });
+    mat.sizeNode = TSL.attribute("aSize");
+
+    const aBright = TSL.attribute("aBright");
+    const opacityNode = aBright.mul(this._opacityUniform);
+    if (isNebula) {
+      const aColor = TSL.attribute("aColor");
+      mat.colorNode = TSL.vec4(aColor, opacityNode);
+    } else {
+      // White star core; brightness drives both alpha and a tiny blue lift.
+      mat.colorNode = TSL.vec4(TSL.vec3(TSL.float(1.0), TSL.float(1.0), TSL.float(1.0)), opacityNode);
+    }
+
+    const pts = new THREE.Points(geo, mat);
+    pts.frustumCulled = false;
+    pts.userData.isRuntimeOnly = true;
+    if (!this._materials) this._materials = [];
+    this._materials.push(mat);
+    return pts;
+  };
+
+  this._teardownVisuals = function () {
+    if (this._root) {
+      this._root.traverse((child) => {
+        if (child.geometry && typeof child.geometry.dispose === "function") child.geometry.dispose();
+      });
+      if (this._root.parent) this._root.parent.remove(this._root);
+      this._root = null;
+    }
+    if (this._materials) {
+      for (const m of this._materials) m.dispose();
+      this._materials.length = 0;
+    }
+    if (this._spriteTex) {
+      this._spriteTex.dispose();
+      this._spriteTex = null;
+    }
+    this._opacityUniform = null;
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    if (this._spriteTex) this._spriteTex.dispose();
+    this._teardownVisuals();
+  };

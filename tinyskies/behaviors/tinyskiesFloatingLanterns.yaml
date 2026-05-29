@@ -1,0 +1,295 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Floating Lanterns"
+  id: "tinyskies.floatingLanterns"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Glowing lantern clusters drifting on the globe surface; brighter at night."
+  documentation: "5 clusters of 14 glowing lanterns each (~70 total), placed at deterministic seeded random positions on the globe surface (CLUSTER_ALTITUDE 0.55 above radius). Each lantern bobs + sways with sin/cos phase. PointsNodeMaterial with a procedural radial-gradient sprite texture (warm orange core, deep red edge — matches source FloatingLanterns.ts:43-66 fragment shader). Alpha = 0.3 + 0.7 × nightWeight (always faintly visible by day, brightest at night). Source uses InstancedMesh + BoxGeometry; the WebGPU port uses PointsNodeMaterial + sprite for cheaper per-frame mutation."
+  tags:
+    - environment
+    - vfx
+  priority: 0
+  throttleConfig:
+    throttlePriority: "LOW"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    globeRadius:
+      name: "Globe Radius"
+      type: "number"
+      default: 5
+      min: 0.5
+      max: 200
+    clusterCount:
+      name: "Cluster Count"
+      type: "number"
+      default: 5
+      min: 1
+      max: 20
+    lanternsPerCluster:
+      name: "Lanterns per Cluster"
+      type: "number"
+      default: 14
+      min: 4
+      max: 40
+    seed:
+      name: "Cluster Seed"
+      type: "number"
+      default: 42
+      min: 1
+      max: 1000000
+    terrainSeed:
+      name: "Terrain Seed (match globeVisual)"
+      type: "number"
+      default: 42
+      min: 1
+      max: 1000000
+    terrainType:
+      name: "Terrain Type (match globeVisual)"
+      type: "string"
+      default: "default"
+    landOnly:
+      name: "Land-Only Clusters"
+      type: "boolean"
+      default: true
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  @import "terrain" as T;
+
+  const LOG_TAG = "[tinyskies.floatingLanterns]";
+
+  // Match source FloatingLanterns.ts:21-28.
+  const CLUSTER_ALTITUDE = 0.55;
+  const CLUSTER_SPREAD = 0.4;
+  const SWAY_SPEED = 0.35;
+  const SWAY_AMP = 0.018;
+  const BOB_SPEED = 0.6;
+  const BOB_AMP = 0.012;
+
+  function seededRandom(seed) {
+    let s = seed >>> 0;
+    if (s === 0) s = 1;
+    return function () {
+      s = (s * 16807) % 2147483647;
+      return (s - 1) / 2147483646;
+    };
+  }
+
+  function makeLanternSprite() {
+    const size = 64;
+    const canvas = document.createElement("canvas");
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext("2d");
+    const grad = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+    // Match source FloatingLanterns.ts fragment palette: bright core → warm red → deep red.
+    grad.addColorStop(0.0, "rgba(255,180,90,1.0)");
+    grad.addColorStop(0.45, "rgba(220,50,20,0.85)");
+    grad.addColorStop(0.75, "rgba(140,15,5,0.45)");
+    grad.addColorStop(1.0, "rgba(60,5,2,0)");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, size, size);
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }
+
+  let game;
+
+  this.init = function (_game) {
+    game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._buildVisuals(this.gameObject._internal.three);
+    const lanterns = this._lanterns;
+    this._log("init", lanterns ? lanterns.length : 0, "lanterns");
+  };
+
+  this.onEditorAdded = function (editor) {
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._buildVisuals(this.gameObject._internal.three);
+    if (this._opacityUniform) this._opacityUniform.value = 0.5;
+  };
+
+  this.onEditorAttributesUpdated = function () {
+    this._teardownVisuals();
+    this._buildVisuals(this.gameObject._internal.three);
+  };
+
+  this.onEditorDispose = function () {
+    this._teardownVisuals();
+  };
+
+  this.update = function (deltaTime) {
+    const lanterns = this._lanterns;
+    const positions = this._positions;
+    const posAttr = this._posAttr;
+    if (!lanterns || !positions || !posAttr) return;
+    const dt = Math.min(deltaTime, 0.1);
+    this._time += dt;
+
+    const t = this._time;
+    for (let i = 0; i < lanterns.length; i++) {
+      const L = lanterns[i];
+      const sway = Math.sin(t * SWAY_SPEED + L.phase) * SWAY_AMP;
+      const bob = Math.sin(t * BOB_SPEED + L.bobPhase) * BOB_AMP;
+      // Bob is along the surface-radial; sway is tangent.
+      positions[i * 3]     = L.basePos.x + L.up.x * bob + L.east.x * sway;
+      positions[i * 3 + 1] = L.basePos.y + L.up.y * bob + L.east.y * sway;
+      positions[i * 3 + 2] = L.basePos.z + L.up.z * bob + L.east.z * sway;
+    }
+    posAttr.needsUpdate = true;
+
+    if (this._opacityUniform) {
+      const w = this.erth.store.get("tinyskies/nightWeight");
+      const nightWeight = typeof w === "number" ? w : 1;
+      this._opacityUniform.value = 0.3 + 0.7 * nightWeight;
+    }
+  };
+
+  this._buildVisuals = function (parent) {
+    const TSL = THREE.TSL;
+    const globeRadius = this.getAttribute("globeRadius");
+    const clusterCount = this.getAttribute("clusterCount");
+    const lanternsPerCluster = this.getAttribute("lanternsPerCluster");
+    const seed = this.getAttribute("seed");
+
+    const root = new THREE.Group();
+    root.name = "tinyskiesFloatingLanternsRoot";
+    root.userData.isRuntimeOnly = true;
+
+    this._spriteTex = makeLanternSprite();
+    const totalCount = clusterCount * lanternsPerCluster;
+    const positions = new Float32Array(totalCount * 3);
+    const sizes = new Float32Array(totalCount);
+    const lanterns = [];
+    const terrainSeed = this.getAttribute("terrainSeed");
+    const terrainType = this.getAttribute("terrainType");
+    const landOnly = !!this.getAttribute("landOnly");
+
+    for (let c = 0; c < clusterCount; c++) {
+      const rand = seededRandom(seed + c * 1000003);
+      // Random surface point for the cluster center — re-roll up to N times if
+      // landOnly and the rolled point falls in ocean.
+      let nx = 0, ny = 0, nz = 0;
+      const maxAttempts = landOnly ? 24 : 1;
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        const theta = rand() * Math.PI * 2;
+        const phi = Math.acos(2 * rand() - 1);
+        nx = Math.sin(phi) * Math.cos(theta);
+        ny = Math.sin(phi) * Math.sin(theta);
+        nz = Math.cos(phi);
+        if (!landOnly) break;
+        const sample = T.sampleTerrain(terrainSeed, terrainType, nx, ny, nz);
+        if (sample.isLand) break;
+      }
+      // Lift cluster altitude above whatever terrain is at this point.
+      const surfaceDisp = T.surfaceDisplacementAt(terrainSeed, terrainType, nx, ny, nz);
+      const refUp = new THREE.Vector3(0, 1, 0);
+      const surfaceNormal = new THREE.Vector3(nx, ny, nz);
+      const baseCenter = surfaceNormal.clone().multiplyScalar(globeRadius + surfaceDisp + CLUSTER_ALTITUDE);
+      // Tangent frame at this point: derive east from arbitrary perpendicular to up.
+      const upLocal = surfaceNormal.clone();
+      const tmp = Math.abs(upLocal.y) < 0.95 ? refUp.clone() : new THREE.Vector3(1, 0, 0);
+      const east = new THREE.Vector3().crossVectors(upLocal, tmp).normalize();
+      const north = new THREE.Vector3().crossVectors(east, upLocal).normalize();
+
+      for (let i = 0; i < lanternsPerCluster; i++) {
+        const idx = c * lanternsPerCluster + i;
+        const localR = (rand() * 0.7 + 0.3) * CLUSTER_SPREAD;
+        const localTheta = rand() * Math.PI * 2;
+        const offsetEast = Math.cos(localTheta) * localR;
+        const offsetNorth = Math.sin(localTheta) * localR;
+        // Random small altitude offset (lanterns drift at slightly varied heights).
+        const altOffset = (rand() - 0.5) * 0.1;
+        const basePos = baseCenter.clone()
+          .addScaledVector(east, offsetEast)
+          .addScaledVector(north, offsetNorth)
+          .addScaledVector(upLocal, altOffset);
+
+        positions[idx * 3] = basePos.x;
+        positions[idx * 3 + 1] = basePos.y;
+        positions[idx * 3 + 2] = basePos.z;
+        sizes[idx] = 14 + rand() * 12; // pixel size
+
+        lanterns.push({
+          basePos: basePos,
+          up: upLocal,
+          east: east,
+          phase: rand() * Math.PI * 2,
+          bobPhase: rand() * Math.PI * 2,
+        });
+      }
+    }
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    geo.setAttribute("aSize", new THREE.BufferAttribute(sizes, 1));
+
+    const opacityUniform = TSL.uniform(1.0);
+
+    const mat = new THREE.PointsNodeMaterial({
+      map: this._spriteTex,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    });
+    mat.sizeNode = TSL.attribute("aSize");
+    mat.colorNode = TSL.vec4(TSL.float(2.0), TSL.float(2.0), TSL.float(2.0), opacityUniform);
+    mat.opacityNode = opacityUniform;
+
+    const points = new THREE.Points(geo, mat);
+    points.frustumCulled = false;
+    points.userData.isRuntimeOnly = true;
+    root.add(points);
+    parent.add(root);
+
+    this._root = root;
+    this._mesh = points;
+    this._mat = mat;
+    this._geo = geo;
+    this._positions = positions;
+    this._posAttr = geo.attributes.position;
+    this._lanterns = lanterns;
+    this._opacityUniform = opacityUniform;
+    this._time = 0;
+  };
+
+  this._teardownVisuals = function () {
+    if (this._geo) this._geo.dispose();
+    if (this._mat) this._mat.dispose();
+    if (this._spriteTex) {
+      this._spriteTex.dispose();
+      this._spriteTex = null;
+    }
+    if (this._root && this._root.parent) this._root.parent.remove(this._root);
+    this._root = null;
+    this._mesh = null;
+    this._mat = null;
+    this._geo = null;
+    this._positions = null;
+    this._posAttr = null;
+    this._lanterns = null;
+    this._opacityUniform = null;
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    if (this._spriteTex) this._spriteTex.dispose();
+    this._teardownVisuals();
+  };

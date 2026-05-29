@@ -1,0 +1,141 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+config:
+  priority: 0
+  name: "FP3-Day-Night-Cycle"
+  id: "fp3.dayNightCycle"
+  author: "flight-sim"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Time-based day/night cycle with altitude-driven space transition"
+  tags:
+    - gameplay
+  attributes: {}
+  documentation: "Cycles sky, fog, and light between day and night over a 24000-unit period. Above altitude 2000, transitions to a dark space sky and enables star visibility."
+code: |
+  const SEA_LEVEL = 0;
+  const GROUND_LEVEL = 10;
+
+  let game;
+  let gameTime = 10000; // start at midday
+  const TIME_RATE = 1.0;
+  const FULL_CYCLE = 24000;
+
+  // Day / Night color targets
+  const DAY_SKY = { r: 0x7F / 255, g: 0xAF / 255, b: 0xFF / 255 };
+  const NIGHT_SKY = { r: 0x0A / 255, g: 0x0A / 255, b: 0x2A / 255 };
+  const DAY_FOG = { r: 0xE6 / 255, g: 0xE6 / 255, b: 0xFA / 255 };
+  const NIGHT_FOG = { r: 0x1A / 255, g: 0x1A / 255, b: 0x3A / 255 };
+
+  const SPACE_SKY = { r: 0, g: 0, b: 0 };
+
+  const DAY_AMBIENT = 0.5;
+  const NIGHT_AMBIENT = 0.1;
+  const DAY_DIR = 0.7;
+  const NIGHT_DIR = 0.2;
+
+  const DAY_FOG_NEAR = 100;
+  const DAY_FOG_FAR = 2000;
+  const NIGHT_FOG_NEAR = 50;
+  const NIGHT_FOG_FAR = 1500;
+  const SPACE_FOG_NEAR = 5000;
+  const SPACE_FOG_FAR = 50000;
+
+  const SPACE_ALT = 2000;
+
+  let ambientLight = null;
+  let dirLight = null;
+
+  function lerp(a, b, t) { return a + (b - a) * t; }
+
+  function lerpColor(c, a, b, t) {
+    c.r = lerp(a.r, b.r, t);
+    c.g = lerp(a.g, b.g, t);
+    c.b = lerp(a.b, b.b, t);
+  }
+
+  function getDayFactor(time) {
+    // Dawn 5000-7000, Dusk 19000-21000
+    if (time >= 7000 && time <= 19000) return 1; // full day
+    if (time <= 5000 || time >= 21000) return 0; // full night
+    if (time > 5000 && time < 7000) return (time - 5000) / 2000; // dawn
+    return 1 - (time - 19000) / 2000; // dusk
+  }
+
+  this.init = function(_game) {
+    game = _game;
+
+    // Find lights in scene
+    game.scene.traverse(function(child) {
+      if (child.isAmbientLight && !ambientLight) ambientLight = child;
+      if (child.isDirectionalLight && !dirLight) dirLight = child;
+    });
+
+    // Ensure scene has fog
+    if (!game.scene.fog) {
+      game.scene.fog = new THREE.Fog(0xE6E6FA, DAY_FOG_NEAR, DAY_FOG_FAR);
+    }
+
+    // Ensure scene background is a Color
+    if (!game.scene.background || !game.scene.background.isColor) {
+      game.scene.background = new THREE.Color(0x7FAFFF);
+    }
+  };
+
+  this.update = function(delta) {
+    const dt = Math.min(delta, 0.1);
+    gameTime = (gameTime + delta * TIME_RATE) % FULL_CYCLE;
+    const dayFactor = getDayFactor(gameTime);
+    const store = this.erth.store;
+
+    store.set('fp3_timeOfDay', gameTime);
+
+    // Get player altitude for space transition
+    const playerPos = store.get('fp3_playerPosition');
+    const altitude = playerPos ? (playerPos.y || 0) : 0;
+    const spaceBlend = Math.min(1, Math.max(0, (altitude - SPACE_ALT) / 1000));
+
+    // Compute base sky/fog from day factor
+    const baseSky = { r: 0, g: 0, b: 0 };
+    const baseFog = { r: 0, g: 0, b: 0 };
+    lerpColor(baseSky, NIGHT_SKY, DAY_SKY, dayFactor);
+    lerpColor(baseFog, NIGHT_FOG, DAY_FOG, dayFactor);
+
+    // Blend toward space if at altitude
+    const finalSky = { r: 0, g: 0, b: 0 };
+    const finalFog = { r: 0, g: 0, b: 0 };
+    lerpColor(finalSky, baseSky, SPACE_SKY, spaceBlend);
+    lerpColor(finalFog, baseFog, SPACE_SKY, spaceBlend);
+
+    // Apply sky
+    if (game.scene.background && game.scene.background.isColor) {
+      game.scene.background.setRGB(finalSky.r, finalSky.g, finalSky.b);
+    }
+
+    // Apply fog
+    if (game.scene.fog) {
+      game.scene.fog.color.setRGB(finalFog.r, finalFog.g, finalFog.b);
+      const fogNear = lerp(lerp(NIGHT_FOG_NEAR, DAY_FOG_NEAR, dayFactor), SPACE_FOG_NEAR, spaceBlend);
+      const fogFar = lerp(lerp(NIGHT_FOG_FAR, DAY_FOG_FAR, dayFactor), SPACE_FOG_FAR, spaceBlend);
+      game.scene.fog.near = fogNear;
+      game.scene.fog.far = fogFar;
+    }
+
+    // Apply light intensities
+    const ambIntensity = lerp(NIGHT_AMBIENT, DAY_AMBIENT, dayFactor);
+    const dirIntensity = lerp(NIGHT_DIR, DAY_DIR, dayFactor);
+    if (ambientLight) ambientLight.intensity = ambIntensity;
+    if (dirLight) dirLight.intensity = dirIntensity;
+
+    // Stars visibility flag
+    store.set('fp3_showStars', spaceBlend > 0.1);
+  };
+
+  this.dispose = function() {
+    ambientLight = null;
+    dirLight = null;
+    game = null;
+  };

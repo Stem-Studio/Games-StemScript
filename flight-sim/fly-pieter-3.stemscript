@@ -1,0 +1,180 @@
+project title "Flight Simulator"
+
+# =============================================================================
+# Step 1: Import Behaviors
+# =============================================================================
+# --- Core Player ---
+import behavior VehicleBuilder behaviors/FP3-Vehicle-Builder.yaml "Procedural vehicle geometry — 5 types"
+import behavior FlightPhysics behaviors/FP3-Flight-Physics.yaml "Throttle, lift, drag, stall, gravity, ground physics"
+import behavior InputController behaviors/FP3-Input-Controller.yaml "Keyboard, mouse, gamepad, touch input"
+import behavior CameraController behaviors/FP3-Camera-Controller.yaml "Third-person chase + cockpit camera"
+import behavior CombatSystem behaviors/FP3-Combat-System.yaml "Missiles, health, damage, kills/deaths, respawn"
+import behavior LandingGear behaviors/FP3-Landing-Gear.yaml "Animated landing gear with auto-retract"
+# --- HUD / UI ---
+import behavior HUD behaviors/FP3-HUD.yaml "UIKit speed/altitude/throttle/health/compass/horizon"
+import behavior Minimap behaviors/FP3-Minimap.yaml "UIKit radar with rotating sweep"
+import behavior StartScreen behaviors/FP3-Start-Screen.yaml "Vehicle selection + username + start"
+import behavior Leaderboard behaviors/FP3-Leaderboard.yaml "TAB-toggle kills/deaths table"
+import behavior MessageFeed behaviors/FP3-Message-Feed.yaml "Kill feed, crash messages, chat"
+import behavior PauseMenu behaviors/FP3-Pause-Menu.yaml "ESC pause overlay"
+# --- World ---
+import behavior EnvironmentBuilder behaviors/FP3-Environment-Builder.yaml "Procedural terrain, buildings, houses, mountains"
+import behavior Runway behaviors/FP3-Runway.yaml "Runway, stripes, tower, approach lights"
+import behavior OceanCarrier behaviors/FP3-Ocean-Carrier.yaml "Ocean plane, aircraft carrier, beach"
+import behavior Clouds behaviors/FP3-Clouds.yaml "Low/mid/high clouds, recycling"
+import behavior DayNightCycle behaviors/FP3-Day-Night-Cycle.yaml "Sun angle, color transitions, space at altitude"
+import behavior Stars behaviors/FP3-Stars.yaml "Star field at high altitude"
+import behavior Rain behaviors/FP3-Rain.yaml "Particle rain system"
+# --- Decorative ---
+import behavior Birds behaviors/FP3-Birds.yaml "Instanced bird flock"
+import behavior Blimps behaviors/FP3-Blimps.yaml "Circling blimps with banners"
+import behavior Ships behaviors/FP3-Ships.yaml "Ships on the ocean"
+import behavior Balloons behaviors/FP3-Balloons.yaml "100 shootable balloon targets"
+import behavior Windsock behaviors/FP3-Windsock.yaml "Animated windsock near runway"
+import behavior Fireworks behaviors/FP3-Fireworks.yaml "Random celebratory fireworks"
+import behavior Portals behaviors/FP3-Portals.yaml "Start/exit portals with particles"
+import behavior Castle behaviors/FP3-Castle.yaml "Decorative castle structure"
+import behavior Decorations behaviors/FP3-Decorations.yaml "Mailbox, robot, UFO, hot air balloon, banner"
+# --- Audio ---
+import behavior ProceduralAudio behaviors/FP3-Procedural-Audio.yaml "Engine, wheel, missile, explosion sounds"
+# --- Multiplayer ---
+import behavior MultiplayerManager behaviors/FP3-Multiplayer-Manager.yaml "Colyseus room, state sync, remote spawn"
+import behavior RemoteVehicle behaviors/FP3-Remote-Vehicle.yaml "Interpolated remote player rendering"
+
+# =============================================================================
+# Scene Settings — matched to source exactly
+# =============================================================================
+scene background type=Color color=#7FAFFF
+scene fog type=linear color=#E6E6FA near=100 far=500
+scene lighting ambient={color:"#fff6e6",intensity:0.5}
+scene lighting shadows={enabled:true}
+render settings useShadows=true shadowMapType=2
+
+# Camera: FOV=75 (normalFOV from source), near=0.01 for UIKit, far=10000 for flight altitudes
+camera "DefaultCamera" cameraType=NONE fov=75 near=0.01 far=10000
+
+# Directional light: warm sunlight with shadows
+light "Directional Light" intensity=0.7 color=#fff0e0 castShadow=true shadowMapSize=512 shadowBias=-0.001
+update "Directional Light" position=100,100,50
+
+# =============================================================================
+# Game Settings
+# =============================================================================
+game settings enabled=true isMultiplayer=true showHUD=false maxScore=0
+
+# =============================================================================
+# World — procedural environment
+# =============================================================================
+add group name="World" position=0,0,0
+behavior attach World behaviorId=fp3.environmentBuilder
+
+# Runway + tower + approach lights
+add group name="Runway" position=0,0,0
+behavior attach Runway behaviorId=fp3.runway
+
+# Ocean, carrier, beach
+add group name="OceanCarrier" position=0,0,0
+behavior attach OceanCarrier behaviorId=fp3.oceanCarrier
+
+# =============================================================================
+# Atmosphere — clouds, day/night, stars, rain
+# =============================================================================
+add group name="Clouds" position=0,0,0
+behavior attach Clouds behaviorId=fp3.clouds
+
+add group name="DayNight" position=0,0,0
+behavior attach DayNight behaviorId=fp3.dayNightCycle
+
+add group name="Stars" position=0,0,0
+behavior attach Stars behaviorId=fp3.stars
+
+add group name="Rain" position=0,0,0
+behavior attach Rain behaviorId=fp3.rain
+
+# =============================================================================
+# Decorative objects
+# =============================================================================
+add group name="Birds" position=0,0,0
+behavior attach Birds behaviorId=fp3.birds
+
+add group name="Blimps" position=0,0,0
+behavior attach Blimps behaviorId=fp3.blimps
+
+add group name="Ships" position=0,0,0
+behavior attach Ships behaviorId=fp3.ships
+
+add group name="Balloons" position=0,0,0
+behavior attach Balloons behaviorId=fp3.balloons
+
+add group name="Windsock" position=0,0,0
+behavior attach Windsock behaviorId=fp3.windsock
+
+add group name="Fireworks" position=0,0,0
+behavior attach Fireworks behaviorId=fp3.fireworks
+
+add group name="Portals" position=0,0,0
+behavior attach Portals behaviorId=fp3.portals
+
+add group name="Castle" position=0,0,0
+behavior attach Castle behaviorId=fp3.castle
+
+add group name="Decorations" position=0,0,0
+behavior attach Decorations behaviorId=fp3.decorations
+
+# =============================================================================
+# Player — vehicle, physics, input, combat, camera, audio, landing gear
+# =============================================================================
+add group name="Player" position=0,10.6,97
+update Player tag=Player
+
+# Procedural vehicle mesh
+behavior attach Player behaviorId=fp3.vehicleBuilder
+
+# Flight physics
+behavior attach Player behaviorId=fp3.flightPhysics
+
+# Input controller
+behavior attach Player behaviorId=fp3.inputController
+
+# Combat system
+behavior attach Player behaviorId=fp3.combatSystem
+
+# Camera controller
+behavior attach Player behaviorId=fp3.cameraController
+
+# Landing gear
+behavior attach Player behaviorId=fp3.landingGear
+
+# Procedural audio
+behavior attach Player behaviorId=fp3.proceduralAudio
+
+# Minimap radar
+behavior attach Player behaviorId=fp3.minimap
+
+# =============================================================================
+# GameManager — UI behaviors + multiplayer
+# =============================================================================
+add group name="GameManager" position=0,0,0
+
+# Start screen
+behavior attach GameManager behaviorId=fp3.startScreen
+
+# HUD
+behavior attach GameManager behaviorId=fp3.hud
+
+# Leaderboard
+behavior attach GameManager behaviorId=fp3.leaderboard
+
+# Message feed
+behavior attach GameManager behaviorId=fp3.messageFeed
+
+# Pause menu
+behavior attach GameManager behaviorId=fp3.pauseMenu
+
+# Multiplayer manager
+behavior attach GameManager behaviorId=fp3.multiplayerManager
+
+# =============================================================================
+# Mobile Touch Controls
+# =============================================================================
+behavior attach "Default Scene" behaviorId=touchControls config={mobileEnabled:true,tabletEnabled:true,desktopEnabled:false,mobileHorizontalLayout:{joystick:{joystickEnabled:true,joystickPosition:[0.12,0.75],joystickSize:140,joystickDeadzone:0.12,joystickRunThreshold:0.95},buttons:[{buttonId:"fireBtn",buttonType:"jump",buttonEnabled:true,buttonPosition:[0.88,0.80],buttonSize:75},{buttonId:"turboBtn",buttonType:"interact",buttonEnabled:true,buttonPosition:[0.88,0.56],buttonSize:55}]},mobileVerticalLayout:{joystick:{joystickEnabled:true,joystickPosition:[0.12,0.82],joystickSize:120,joystickDeadzone:0.12,joystickRunThreshold:0.95},buttons:[{buttonId:"fireBtn",buttonType:"jump",buttonEnabled:true,buttonPosition:[0.88,0.85],buttonSize:70},{buttonId:"turboBtn",buttonType:"interact",buttonEnabled:true,buttonPosition:[0.88,0.68],buttonSize:50}]},tabletHorizontalLayout:{joystick:{joystickEnabled:true,joystickPosition:[0.10,0.75],joystickSize:160,joystickDeadzone:0.10,joystickRunThreshold:0.95},buttons:[{buttonId:"fireBtn",buttonType:"jump",buttonEnabled:true,buttonPosition:[0.88,0.80],buttonSize:80},{buttonId:"turboBtn",buttonType:"interact",buttonEnabled:true,buttonPosition:[0.88,0.56],buttonSize:60}]}}

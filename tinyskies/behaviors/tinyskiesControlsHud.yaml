@@ -1,0 +1,265 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Controls HUD"
+  id: "tinyskies.controlsHud"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Bottom-left key-hint overlay. Reads tinyskies/vehicleType to dim climb/descend rows when boat is active. Press H to toggle."
+  documentation: "Single UIKit Fullscreen root parented to game.uiCamera (in play) or editor.camera (in editor) via the canonical uikit-dual-mode helper. Bottom-left absolute-positioned panel lists every key the player needs: A/D yaw, W thrust, S brake, Shift climb (Ctrl descend), Space fire, R cycle vehicle, F interact, H toggle this overlay. The Shift/Ctrl rows fade to half opacity when vehicleType === 'boat' (boat is surface-locked; climb does nothing). Pointer events are intentionally `none` everywhere so the overlay never swallows clicks intended for the game."
+  tags:
+    - ui
+    - hud
+  priority: 0
+  throttleConfig:
+    throttlePriority: "LOW"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    initiallyVisible:
+      name: "Initially Visible"
+      type: "boolean"
+      default: true
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  @import "uikit-dual-mode" as uikit;
+
+  const LOG_TAG = "[tinyskies.controlsHud]";
+
+  // Layout — single bottom-left card with one row per key. Two-column layout
+  // inside each row: a fixed-width key chip + a label.
+  const PANEL_BG = 0x101820;
+  const PANEL_BG_OPACITY = 0.55;
+  const KEY_CHIP_BG = 0x2a3340;
+  const KEY_CHIP_BORDER = 0x60728a;
+  const TEXT_COLOR = 0xeef2f8;
+  const DIM_OPACITY = 0.35;
+
+  // Each row: { key, label, dimWhen (optional vehicleType -> dim) }.
+  const ROWS = [
+    { key: "A / D", label: "Yaw left / right" },
+    { key: "W",     label: "Thrust" },
+    { key: "S",     label: "Brake" },
+    { key: "Shift", label: "Climb",   dimWhenVehicle: "boat" },
+    { key: "Ctrl",  label: "Descend", dimWhenVehicle: "boat" },
+    { key: "Space", label: "Fire paintball" },
+    { key: "R",     label: "Cycle vehicle (plane / boat / carpet)" },
+    { key: "F",     label: "Interact" },
+    { key: "H",     label: "Toggle this overlay" },
+  ];
+
+  let game;
+
+  function buildHudApi(behavior, ctx) {
+    let root = null;
+    let panel = null;
+    let rowEntries = [];      // [{ container, isDimmable, dimWhen }]
+    let lastDimVehicle = null;
+    let visible = true;
+    let toggleHeld = false;
+    let mounted = false;
+
+    function build() {
+      root = uikit.buildRoot(ctx);
+      if (!root) return;
+
+      panel = new UIKit.Container({
+        visibility: "visible",
+        positionType: "absolute",
+        positionLeft: 16,
+        positionBottom: 16,
+        flexDirection: "column",
+        gap: 6,
+        paddingTop: 12,
+        paddingBottom: 12,
+        paddingLeft: 14,
+        paddingRight: 14,
+        borderRadius: 10,
+        backgroundColor: PANEL_BG,
+        backgroundOpacity: PANEL_BG_OPACITY,
+        pointerEvents: "none",
+      });
+      root.add(panel);
+
+      const titleRow = new UIKit.Container({
+        visibility: "visible",
+        flexDirection: "row",
+        alignItems: "center",
+        marginBottom: 4,
+        pointerEvents: "none",
+      });
+      titleRow.add(new UIKit.Text({
+        visibility: "visible",
+        text: "Controls",
+        fontSize: 12,
+        color: TEXT_COLOR,
+        opacity: 0.7,
+        pointerEvents: "none",
+      }));
+      panel.add(titleRow);
+
+      for (const row of ROWS) {
+        const rowContainer = new UIKit.Container({
+          visibility: "visible",
+          flexDirection: "row",
+          alignItems: "center",
+          gap: 10,
+          pointerEvents: "none",
+        });
+        const keyChip = new UIKit.Container({
+          visibility: "visible",
+          minWidth: 56,
+          paddingTop: 2,
+          paddingBottom: 2,
+          paddingLeft: 8,
+          paddingRight: 8,
+          borderRadius: 4,
+          borderWidth: 1,
+          borderColor: KEY_CHIP_BORDER,
+          backgroundColor: KEY_CHIP_BG,
+          backgroundOpacity: 0.85,
+          alignItems: "center",
+          justifyContent: "center",
+          pointerEvents: "none",
+        });
+        keyChip.add(new UIKit.Text({
+          visibility: "visible",
+          text: row.key,
+          fontSize: 11,
+          color: TEXT_COLOR,
+          pointerEvents: "none",
+        }));
+        rowContainer.add(keyChip);
+
+        rowContainer.add(new UIKit.Text({
+          visibility: "visible",
+          text: row.label,
+          fontSize: 12,
+          color: TEXT_COLOR,
+          pointerEvents: "none",
+        }));
+
+        panel.add(rowContainer);
+        rowEntries.push({
+          container: rowContainer,
+          dimWhen: row.dimWhenVehicle || null,
+        });
+      }
+
+      visible = !!behavior.getAttribute("initiallyVisible");
+      panel.setProperties({ visibility: visible ? "visible" : "hidden" });
+    }
+
+    function ensureMount() {
+      if (mounted || !root) return;
+      behavior._uiRoot = root;
+      if (uikit.attach(behavior, ctx)) mounted = true;
+    }
+
+    function applyDimState(vehicleType) {
+      if (vehicleType === lastDimVehicle) return;
+      for (const entry of rowEntries) {
+        if (!entry.dimWhen) continue;
+        const dim = (entry.dimWhen === vehicleType);
+        entry.container.setProperties({ opacity: dim ? DIM_OPACITY : 1.0 });
+      }
+      lastDimVehicle = vehicleType;
+    }
+
+    return {
+      init() {
+        build();
+        ensureMount();
+      },
+      update(dt) {
+        ensureMount();
+        // Toggle on H (InputManager has no default H binding; fall back to the
+        // raw "h" through `getAction("h")` if the engine exposes it; otherwise
+        // a custom action would need to be registered. For the cap, lean on
+        // `getAction("h")` and noop if undefined — it just means H won't
+        // toggle, which is fine since `initiallyVisible` controls the default.
+        const im = game && game.inputManager;
+        if (im && typeof im.getAction === "function") {
+          const heldNow = !!im.getAction("h");
+          if (heldNow && !toggleHeld) {
+            visible = !visible;
+            if (panel) panel.setProperties({ visibility: visible ? "visible" : "hidden" });
+          }
+          toggleHeld = heldNow;
+        }
+        // Live-dim rows that depend on vehicleType.
+        const vt = behavior.erth.store.get("tinyskies/vehicleType") || "plane";
+        applyDimState(vt);
+        // Forward the dt to the dual-mode helper so UIKit's internal animation
+        // clock advances in both play and editor.
+        uikit.tick(behavior, dt);
+      },
+      dispose() {
+        rowEntries = [];
+        panel = null;
+        root = null;
+        mounted = false;
+        uikit.teardown(behavior);
+      },
+    };
+  }
+
+  let api = null;
+
+  this.init = function (_game) {
+    game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    api = buildHudApi(this, uikit.createPlayContext(_game));
+    api.init();
+    this._log("init");
+  };
+
+  this.update = function (deltaTime) {
+    if (!api) return;
+    const dt = Math.min(deltaTime, 0.1);
+    api.update(dt);
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    if (api) {
+      api.dispose();
+      api = null;
+    }
+  };
+
+  this.onEditorAdded = async function (editor) {
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    if (api) return;
+    const ctx = await uikit.createEditorContext(editor);
+    api = buildHudApi(this, ctx);
+    api.init();
+  };
+
+  this.onEditorAttributesUpdated = function () {
+    if (api) {
+      api.dispose();
+      api = null;
+    }
+  };
+
+  this.onEditorDispose = function () {
+    if (api) {
+      api.dispose();
+      api = null;
+    }
+  };

@@ -1,0 +1,101 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Boat Visual"
+  id: "tinyskies.boatVisual"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Procedural boat hull (capped Batch D — no sail/oars/NPC variant). Visible when tinyskies/vehicleType === 'boat'."
+  documentation: "Sibling of tinyskiesBiplaneVisual. Builds the boat mesh once at init, parents it to gameObject._internal.three, and toggles its `visible` based on the `tinyskies/vehicleType` store key. The flightController writes the matrix on the parent (matrixAutoUpdate=false set by tinyskiesBiplaneVisual already), so all three vehicle visuals share that same matrix slot."
+  tags:
+    - visual
+    - vehicle
+  priority: 0
+  throttleConfig:
+    throttlePriority: "HIGH"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: false
+  attributes:
+    hullColor:
+      name: "Hull Color"
+      type: "color"
+      default: "#b83c2b"
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  @import "vehicle-meshes" as V;
+
+  const LOG_TAG = "[tinyskies.boatVisual]";
+  let game;
+
+  this.init = function (_game) {
+    game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._buildVisual(this.gameObject._internal.three);
+    this._log("init");
+  };
+
+  this.onEditorAdded = function (editor) {
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._buildVisual(this.gameObject._internal.three);
+    if (this._mesh) this._mesh.visible = false; // hide in editor preview by default
+  };
+
+  this.onEditorAttributesUpdated = function () {
+    this._teardownVisual();
+    this._buildVisual(this.gameObject._internal.three);
+  };
+
+  this.onEditorDispose = function () {
+    this._teardownVisual();
+  };
+
+  this.update = function () {
+    if (!this._mesh) return;
+    const vt = this.erth.store.get("tinyskies/vehicleType") || "plane";
+    this._mesh.visible = (vt === "boat");
+  };
+
+  this._buildVisual = function (parent) {
+    const colorAttr = this.getAttribute("hullColor");
+    const colorHex = (typeof colorAttr === "string")
+      ? new THREE.Color(colorAttr).getHex()
+      : colorAttr;
+    const boat = V.createBoatMesh(colorHex);
+    boat.userData.isRuntimeOnly = true;
+    boat.visible = false; // start hidden; switcher / update() reveals when active
+    parent.add(boat);
+    this._mesh = boat;
+  };
+
+  this._teardownVisual = function () {
+    if (!this._mesh) return;
+    this._mesh.traverse((c) => {
+      if (c.geometry && c.geometry.dispose) c.geometry.dispose();
+      if (c.material) {
+        if (Array.isArray(c.material)) {
+          for (const m of c.material) if (m && m.dispose) m.dispose();
+        } else if (c.material.dispose) c.material.dispose();
+      }
+    });
+    if (this._mesh.parent) this._mesh.parent.remove(this._mesh);
+    this._mesh = null;
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    this._teardownVisual();
+  };

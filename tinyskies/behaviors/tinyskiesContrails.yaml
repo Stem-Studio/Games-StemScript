@@ -1,0 +1,251 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Contrails"
+  id: "tinyskies.contrails"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Camera-facing ribbon contrails behind the player plane's wingtips. Verbatim port of source Contrails.ts (2 trails, 72 segments each, icy-blue additive)."
+  documentation: "Two ribbon trails (left + right wingtip) following the player plane. Each frame: read the Player gameObject's matrix, transform the wingtip offset (-/+0.111, 0.035, -0.005) into world space, push the world position into a FIFO of length 72, recompute side vectors via cross(direction, toCamera) for camera-facing quad strips, write into the BufferGeometry. MeshBasicNodeMaterial with TSL colorNode reading per-vertex `alpha` attribute (faded by `1 - i/length` squared, max 0.55). Source uses ShaderMaterial + premultipliedAlpha; the WebGPU port keeps the same look via TSL emissive add."
+  tags:
+    - vfx
+    - vehicle
+  priority: 0
+  throttleConfig:
+    throttlePriority: "LOW"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    trailLength:
+      name: "Trail Segments"
+      type: "number"
+      default: 72
+      min: 8
+      max: 256
+    trailWidth:
+      name: "Trail Half-Width (units)"
+      type: "number"
+      default: 0.005
+      min: 0.001
+      max: 0.05
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  const LOG_TAG = "[tinyskies.contrails]";
+
+  // Wingtip offsets in local plane space (matches source Contrails.ts:157-158).
+  const LEFT_OFFSET = [-0.111, 0.035, -0.005];
+  const RIGHT_OFFSET = [0.111, 0.035, -0.005];
+  const TRAIL_COLOR = [0.9, 0.95, 1.0]; // icy blue
+
+  let game;
+
+  this.init = function (_game) {
+    game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+
+    this._tmpLeft = new THREE.Vector3();
+    this._tmpRight = new THREE.Vector3();
+    this._tmpLeftLocal = new THREE.Vector3();
+    this._tmpRightLocal = new THREE.Vector3();
+    this._tmpDir = new THREE.Vector3();
+    this._tmpToCam = new THREE.Vector3();
+    this._tmpCross = new THREE.Vector3();
+    this._tmpFallback = new THREE.Vector3(0, 1, 0);
+    this._lastCrossLeft = new THREE.Vector3(0, 1, 0);
+    this._lastCrossRight = new THREE.Vector3(0, 1, 0);
+    this._camPos = new THREE.Vector3();
+
+    this._playerMesh = null;
+    this._buildVisuals(this.gameObject._internal.three);
+    this._log("init");
+  };
+
+  this.update = function () {
+    if (!game || !game.camera || !this._leftTrail || !this._rightTrail) return;
+    if (!this._playerMesh || !this._playerMesh.parent) {
+      this._playerMesh = this._findPlayer();
+      if (!this._playerMesh) return;
+    }
+
+    // Player matrix is written each frame by tinyskiesFlightController.
+    // Compute world wingtip positions.
+    this._tmpLeftLocal.fromArray(LEFT_OFFSET).applyMatrix4(this._playerMesh.matrix);
+    this._tmpRightLocal.fromArray(RIGHT_OFFSET).applyMatrix4(this._playerMesh.matrix);
+
+    game.camera.getWorldPosition(this._camPos);
+
+    this._stepTrail(this._leftTrail, this._tmpLeftLocal, this._lastCrossLeft);
+    this._stepTrail(this._rightTrail, this._tmpRightLocal, this._lastCrossRight);
+  };
+
+  this._findPlayer = function () {
+    let found = null;
+    game.scene.traverse((obj) => {
+      if (found) return;
+      if (!obj || !obj.userData) return;
+      if (obj.userData.tag === "Player") found = obj;
+    });
+    return found;
+  };
+
+  this._buildVisuals = function (parent) {
+    const trailLength = this.getAttribute("trailLength");
+    const TSL = THREE.TSL;
+
+    const root = new THREE.Group();
+    root.name = "tinyskiesContrailsRoot";
+    root.userData.isRuntimeOnly = true;
+
+    const leftTrail = this._buildTrail(trailLength, TSL);
+    const rightTrail = this._buildTrail(trailLength, TSL);
+    root.add(leftTrail.mesh);
+    root.add(rightTrail.mesh);
+    parent.add(root);
+
+    this._root = root;
+    this._leftTrail = leftTrail;
+    this._rightTrail = rightTrail;
+    this._trailLength = trailLength;
+  };
+
+  this._buildTrail = function (trailLength, TSL) {
+    const vertCount = trailLength * 2;
+    const posArr = new Float32Array(vertCount * 3);
+    const alphaArr = new Float32Array(vertCount);
+    const posAttr = new THREE.BufferAttribute(posArr, 3);
+    const alphaAttr = new THREE.BufferAttribute(alphaArr, 1);
+
+    // No editor preview — contrails only exist while the player is flying. An
+    // empty editor stub would be bloat per CLAUDE.md memory feedback_no_empty_editor_stubs.md.
+    const geo = new THREE.BufferGeometry();                                       // @check-ok runtime-only trail geometry, no editor preview
+    geo.setAttribute("position", posAttr);
+    geo.setAttribute("alpha", alphaAttr);
+    const indices = [];
+    for (let i = 0; i < trailLength - 1; i++) {
+      const a = i * 2;
+      const b = a + 1;
+      const c = a + 2;
+      const d = a + 3;
+      indices.push(a, c, b, b, c, d);
+    }
+    geo.setIndex(indices);
+
+    const mat = new THREE.MeshBasicNodeMaterial({
+      transparent: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      blending: THREE.AdditiveBlending,
+      toneMapped: false,
+    });
+    const aAlpha = TSL.attribute("alpha");
+    const tint = TSL.vec3(TSL.float(TRAIL_COLOR[0]), TSL.float(TRAIL_COLOR[1]), TSL.float(TRAIL_COLOR[2]));
+    mat.colorNode = TSL.vec4(tint.mul(aAlpha), aAlpha);
+
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.frustumCulled = false;
+    mesh.userData.isRuntimeOnly = true;
+    return {
+      mesh: mesh,
+      geom: geo,
+      mat: mat,
+      posAttr: posAttr,
+      alphaAttr: alphaAttr,
+      points: [],
+    };
+  };
+
+  this._stepTrail = function (trail, currentWorldPos, lastCross) {
+    const trailLength = this._trailLength;
+    const halfWidth = this.getAttribute("trailWidth");
+    // FIFO — newest at index 0; capped to trailLength.
+    if (trail.points.length === 0) {
+      // First frame — seed N points at the current location so the trail starts collapsed.
+      for (let i = 0; i < trailLength; i++) {
+        trail.points.push(new THREE.Vector3().copy(currentWorldPos));
+      }
+    }
+    // Reuse oldest Vector3 as the new head to avoid allocation.
+    const recycled = trail.points.pop();
+    recycled.copy(currentWorldPos);
+    trail.points.unshift(recycled);
+
+    const positions = trail.posAttr.array;
+    const alphas = trail.alphaAttr.array;
+    const count = trail.points.length;
+
+    for (let i = 0; i < trailLength; i++) {
+      const p = trail.points[i];
+      if (!p) {
+        positions[i * 6] = 0; positions[i * 6 + 1] = 0; positions[i * 6 + 2] = 0;
+        positions[i * 6 + 3] = 0; positions[i * 6 + 4] = 0; positions[i * 6 + 5] = 0;
+        alphas[i * 2] = 0; alphas[i * 2 + 1] = 0;
+        continue;
+      }
+      const prevIdx = Math.max(i - 1, 0);
+      const nextIdx = Math.min(i + 1, count - 1);
+      this._tmpDir.subVectors(trail.points[prevIdx], trail.points[nextIdx]);
+
+      if (this._tmpDir.lengthSq() < 1e-10) {
+        this._tmpCross.copy(lastCross);
+      } else {
+        this._tmpDir.normalize();
+        this._tmpToCam.subVectors(this._camPos, p).normalize();
+        this._tmpCross.crossVectors(this._tmpDir, this._tmpToCam);
+        if (this._tmpCross.lengthSq() < 1e-10) {
+          this._tmpCross.crossVectors(this._tmpDir, this._tmpFallback);
+        }
+        this._tmpCross.normalize();
+        lastCross.copy(this._tmpCross);
+      }
+
+      const fade = 1 - i / trailLength;
+      const w = halfWidth * fade;
+
+      positions[i * 6]     = p.x + this._tmpCross.x * w;
+      positions[i * 6 + 1] = p.y + this._tmpCross.y * w;
+      positions[i * 6 + 2] = p.z + this._tmpCross.z * w;
+      positions[i * 6 + 3] = p.x - this._tmpCross.x * w;
+      positions[i * 6 + 4] = p.y - this._tmpCross.y * w;
+      positions[i * 6 + 5] = p.z - this._tmpCross.z * w;
+
+      const a = fade * fade * 0.55;
+      alphas[i * 2]     = a;
+      alphas[i * 2 + 1] = a;
+    }
+
+    trail.posAttr.needsUpdate = true;
+    trail.alphaAttr.needsUpdate = true;
+  };
+
+  // No editor preview — contrails only exist while the player flies; nothing to
+  // render in static editor view. Per CLAUDE.md memory feedback_no_empty_editor_stubs.md,
+  // no empty stub.
+
+  this.dispose = function () {
+    this._log("dispose");
+    if (this._leftTrail) {
+      this._leftTrail.geom.dispose();
+      this._leftTrail.mat.dispose();
+    }
+    if (this._rightTrail) {
+      this._rightTrail.geom.dispose();
+      this._rightTrail.mat.dispose();
+    }
+    if (this._root && this._root.parent) this._root.parent.remove(this._root);
+    this._root = null;
+    this._leftTrail = null;
+    this._rightTrail = null;
+    this._playerMesh = null;
+  };

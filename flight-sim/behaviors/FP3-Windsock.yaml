@@ -1,0 +1,133 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+config:
+  priority: 0
+  name: "FP3-Windsock"
+  id: "fp3.windsock"
+  author: "flight-sim"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Animated windsock near the runway"
+  tags:
+    - gameplay
+  attributes: {}
+  documentation: "Creates a windsock with pole and 5 orange/white striped segments that wave in simulated wind using sine-based rotations."
+code: |
+  const SEA_LEVEL = 0;
+  const GROUND_LEVEL = 10;
+
+  let game;
+  const disposables = [];
+  const segments = [];
+  let sockGroup = null;
+
+  function trackGeo(geo) { disposables.push(geo); return geo; }
+  function trackMat(mat) { disposables.push(mat); return mat; }
+
+  this.init = function(_game) {
+    game = _game;
+
+    const root = new THREE.Group();
+    root.userData.isRuntimeOnly = true;
+    root.position.set(20, GROUND_LEVEL, 10);
+
+    // Pole
+    const poleGeo = trackGeo(new THREE.CylinderGeometry(0.1, 0.1, 5, 8));
+    const poleMat = trackMat(new THREE.MeshStandardNodeMaterial({ color: 0x999999 }));
+    const pole = new THREE.Mesh(poleGeo, poleMat);
+    pole.position.set(0, 2.5, 0);
+    pole.userData.isRuntimeOnly = true;
+    root.add(pole);
+
+    // Sock segments - 5 segments of decreasing radius
+    const SEGMENT_COUNT = 5;
+    const colors = [0xFF6600, 0xFFFFFF];
+    sockGroup = new THREE.Group();
+    sockGroup.position.set(0, 5, 0);
+    sockGroup.userData.isRuntimeOnly = true;
+    root.add(sockGroup);
+
+    let parent = sockGroup;
+    for (let i = 0; i < SEGMENT_COUNT; i++) {
+      const radiusTop = 0.4 - i * 0.06;
+      const radiusBottom = 0.4 - (i + 1) * 0.06;
+      const segLen = 0.8;
+
+      const segGeo = trackGeo(new THREE.CylinderGeometry(
+        Math.max(radiusTop, 0.05),
+        Math.max(radiusBottom, 0.05),
+        segLen,
+        8,
+        1,
+        true
+      ));
+      const segMat = trackMat(new THREE.MeshStandardNodeMaterial({
+        color: colors[i % 2],
+        side: THREE.DoubleSide
+      }));
+
+      const segPivot = new THREE.Group();
+      segPivot.userData.isRuntimeOnly = true;
+
+      const segMesh = new THREE.Mesh(segGeo, segMat);
+      segMesh.userData.isRuntimeOnly = true;
+      // Rotate cylinder to point horizontally (along +X)
+      segMesh.rotation.z = -Math.PI / 2;
+      segMesh.position.set(segLen / 2, 0, 0);
+      segPivot.add(segMesh);
+
+      if (i === 0) {
+        segPivot.position.set(0, 0, 0);
+      } else {
+        segPivot.position.set(segLen, 0, 0);
+      }
+
+      parent.add(segPivot);
+      segments.push(segPivot);
+      parent = segPivot;
+    }
+
+    this.gameObject._internal.three.add(root);
+  };
+
+  this.update = function(deltaTime) {
+    if (!game || segments.length === 0) return;
+
+    const time = Date.now() * 0.001;
+    const windStrength = 0.3 + Math.sin(time * 0.3) * 0.15;
+
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i];
+      // Each segment waves more than the previous
+      const wave = Math.sin(time * 2.5 + i * 0.8) * (0.1 + i * 0.05) * windStrength;
+      const droop = (i + 1) * 0.04; // gravity droop increases along chain
+      seg.rotation.z = -droop + wave;
+      seg.rotation.y = Math.sin(time * 1.8 + i * 0.6) * 0.08 * windStrength;
+    }
+  };
+
+  this.dispose = function() {
+    // Root group is first child we added
+    const root = this.gameObject._internal.three.children.find(
+      c => c.userData.isRuntimeOnly
+    );
+    if (root && root.parent) root.parent.remove(root);
+
+    for (const d of disposables) {
+      if (d.dispose) d.dispose();
+    }
+    disposables.length = 0;
+    segments.length = 0;
+    sockGroup = null;
+  };
+
+  this.onEditorAdded = function() {
+    // No editor preview for runtime-only procedural geometry
+  };
+
+  this.onEditorDispose = function() {
+    // Nothing to clean up in editor
+  };

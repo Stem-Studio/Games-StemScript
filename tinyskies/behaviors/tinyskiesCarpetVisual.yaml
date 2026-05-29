@@ -1,0 +1,172 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Carpet Visual"
+  id: "tinyskies.carpetVisual"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Procedural magic carpet with cloth wobble + speed-curl tassels (Pass 8 lifts the FDR-005 cap). Visible when tinyskies/vehicleType === 'carpet'."
+  documentation: "Sibling of tinyskiesBiplaneVisual / tinyskiesBoatVisual. Builds the carpet mesh once at init, parents it to gameObject._internal.three, toggles `visible` based on the `tinyskies/vehicleType` store key. Cloth wobble: source CarpetMesh.ts uses a raw GLSL vertex shader hooked via onBeforeCompile. We mirror it on the CPU — `carpetWobbleY(x, z, time)` is evaluated each frame against per-vertex base positions of every mesh tagged `userData.tinyskiesWobble`. Tassels (named tassel0..3 in vehicle-meshes.js) curl backward as speed rises: targetCurl = clamp(speedRatio) * 1.2 rad, smoothed via exponential approach (factor 3.0 / source Carpet.ts:357)."
+  tags:
+    - visual
+    - vehicle
+  priority: 0
+  throttleConfig:
+    throttlePriority: "HIGH"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: false
+  attributes:
+    baseColor:
+      name: "Base Color"
+      type: "color"
+      default: "#6b1d6e"
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  @import "vehicle-meshes" as V;
+
+  const LOG_TAG = "[tinyskies.carpetVisual]";
+  let game;
+
+  // Source CarpetMesh.ts:24-32 — CPU mirror of the GLSL wobble.
+  function carpetWobbleY(x, z, time) {
+    const dx = Math.sin(x * 60 + time * 5) * 0.4
+             + Math.sin(z * 40 + time * 3.5) * 0.6;
+    const len = Math.sqrt(x * x + z * z);
+    const edge = Math.min(1, Math.max(0, len / 0.06));
+    return dx * 0.012 * (0.35 + 0.65 * edge);
+  }
+
+  // Source Carpet.ts:357 smoothing constant.
+  const TASSEL_CURL_RESPONSE = 3.0;
+  const MAX_TASSEL_CURL = 1.2;
+
+  this.init = function (_game) {
+    game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._time = 0;
+    this._tasselCurl = 0;
+    this._buildVisual(this.gameObject._internal.three);
+    this._log("init");
+  };
+
+  this.onEditorAdded = function (editor) {
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._time = 0;
+    this._tasselCurl = 0;
+    this._buildVisual(this.gameObject._internal.three);
+    if (this._mesh) this._mesh.visible = false;
+  };
+
+  this.onEditorAttributesUpdated = function () {
+    this._teardownVisual();
+    this._buildVisual(this.gameObject._internal.three);
+  };
+
+  this.onEditorDispose = function () {
+    this._teardownVisual();
+  };
+
+  this.update = function (deltaTime) {
+    if (!this._mesh) return;
+    const vt = this.erth.store.get("tinyskies/vehicleType") || "plane";
+    const isCarpet = (vt === "carpet");
+    this._mesh.visible = isCarpet;
+    if (!isCarpet) return;
+
+    const dt = Math.min(deltaTime || 0, 0.1);
+    this._time += dt;
+
+    // Cloth wobble — mutate Y on every wobble-tagged mesh.
+    if (this._wobbleMeshes) {
+      for (let m = 0; m < this._wobbleMeshes.length; m++) {
+        const w = this._wobbleMeshes[m];
+        const arr = w.posAttr.array;
+        const base = w.basePositions;
+        const offX = w.offset[0];
+        const offZ = w.offset[2];
+        for (let i = 0; i < base.length; i += 3) {
+          const bx = base[i];
+          const bz = base[i + 2];
+          arr[i + 1] = base[i + 1] + carpetWobbleY(bx + offX, bz + offZ, this._time);
+        }
+        w.posAttr.needsUpdate = true;
+      }
+    }
+
+    // Tassel speed-curl — source Carpet.ts:357-360.
+    const speedRatio = this.erth.store.get("tinyskies/speedRatio") || 0;
+    const targetCurl = Math.max(0, Math.min(1, speedRatio)) * MAX_TASSEL_CURL;
+    this._tasselCurl += (targetCurl - this._tasselCurl) * Math.min(1, TASSEL_CURL_RESPONSE * dt);
+    if (this._tassels) {
+      for (let i = 0; i < this._tassels.length; i++) {
+        this._tassels[i].rotation.x = Math.PI - this._tasselCurl;
+      }
+    }
+  };
+
+  this._buildVisual = function (parent) {
+    const colorAttr = this.getAttribute("baseColor");
+    const colorHex = (typeof colorAttr === "string")
+      ? new THREE.Color(colorAttr).getHex()
+      : colorAttr;
+    const carpet = V.createCarpetMesh(colorHex);
+    carpet.userData.isRuntimeOnly = true;
+    carpet.visible = false;
+    parent.add(carpet);
+    this._mesh = carpet;
+
+    // Index wobble meshes (cache base position arrays so per-frame Y mutation
+    // never accumulates drift).
+    this._wobbleMeshes = [];
+    this._tassels = [];
+    carpet.traverse((c) => {
+      if (c.userData && c.userData.tinyskiesWobble && c.geometry && c.geometry.attributes && c.geometry.attributes.position) {
+        const posAttr = c.geometry.attributes.position;
+        const basePositions = new Float32Array(posAttr.array);
+        this._wobbleMeshes.push({
+          mesh: c,
+          posAttr,
+          basePositions,
+          offset: c.userData.wobbleOffset || [0, 0, 0],
+        });
+      }
+      if (c.name && /^tassel\d$/.test(c.name)) {
+        this._tassels.push(c);
+      }
+    });
+  };
+
+  this._teardownVisual = function () {
+    if (!this._mesh) return;
+    this._mesh.traverse((c) => {
+      if (c.geometry && c.geometry.dispose) c.geometry.dispose();
+      if (c.material) {
+        if (Array.isArray(c.material)) {
+          for (const m of c.material) if (m && m.dispose) m.dispose();
+        } else if (c.material.dispose) c.material.dispose();
+      }
+    });
+    if (this._mesh.parent) this._mesh.parent.remove(this._mesh);
+    this._mesh = null;
+    this._wobbleMeshes = null;
+    this._tassels = null;
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    this._teardownVisual();
+  };

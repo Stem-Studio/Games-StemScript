@@ -1,0 +1,232 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "SF Laser System"
+  id: "sf.laserSystem"
+  author: "starfox"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Burst-fire laser shooting system. Creates bright green projectiles
+    that travel in the ship's forward direction."
+  tags:
+    - gameplay
+  priority: 1
+  attributes:
+    laserSpeed:
+      name: "Laser Speed"
+      type: "number"
+      default: 250
+      description: "Projectile travel speed in units per second"
+    burstCount:
+      name: "Burst Count"
+      type: "number"
+      default: 3
+      description: "Number of shots per burst before requiring key release"
+    burstDelay:
+      name: "Burst Delay"
+      type: "number"
+      default: 0.1
+      description: "Delay in seconds between consecutive burst shots"
+    laserLifetime:
+      name: "Laser Lifetime"
+      type: "number"
+      default: 5
+      description: "Time in seconds before a laser projectile is removed"
+  documentation: Burst-fire laser shooting system. Creates bright green projectiles that
+    travel in the ship's forward direction. Configure attributes in the editor
+    to tune gameplay behavior.
+
+code: |
+  // SF Laser System — burst-fire projectiles
+  // Source: Lasers.jsx from Starfox-railpath-2.0
+
+  let game;
+  let lasers;
+  let laserGeo;
+  let laserMat;
+  const erth = this.erth;
+
+  function cleanupLasers() {
+    for (const laser of lasers || []) {
+      if (laser.mesh.parent) {
+        laser.mesh.parent.remove(laser.mesh);
+      }
+    }
+    lasers = [];
+    if (laserGeo) laserGeo.dispose();
+    if (laserMat) laserMat.dispose();
+    laserGeo = null;
+    laserMat = null;
+  }
+
+  function ensureLaserSetup(owner, sceneRoot) {
+    if (!laserGeo || !laserMat || !lasers) {
+      game = { scene: sceneRoot };
+
+      const laserSpeedAttr = owner.getAttribute('laserSpeed');
+      const burstCountAttr = owner.getAttribute('burstCount');
+      const burstDelayAttr = owner.getAttribute('burstDelay');
+      const laserLifetimeAttr = owner.getAttribute('laserLifetime');
+      owner.speed = laserSpeedAttr == null ? 250 : laserSpeedAttr;
+      owner.burstMax = burstCountAttr == null ? 3 : burstCountAttr;
+      owner.burstDelay = burstDelayAttr == null ? 0.1 : burstDelayAttr;
+      owner.lifetime = laserLifetimeAttr == null ? 5 : laserLifetimeAttr;
+
+      laserGeo = new THREE.IcosahedronGeometry(0.1, 1);
+      laserMat = new THREE.MeshStandardNodeMaterial({
+        emissive: 0x20fa5a,
+        emissiveIntensity: 40
+      });
+
+      lasers = [];
+    }
+
+    owner._burstRemaining = owner._burstRemaining == null ? owner.burstMax : owner._burstRemaining;
+    owner._burstTimer = owner._burstTimer == null ? 0 : owner._burstTimer;
+    owner._wasShooting = owner._wasShooting || false;
+    owner._worldPos = owner._worldPos || new THREE.Vector3();
+    owner._worldDir = owner._worldDir || new THREE.Vector3();
+    owner._worldQuat = owner._worldQuat || new THREE.Quaternion();
+    owner._editorFireTimer = owner._editorFireTimer == null ? 0 : owner._editorFireTimer;
+  }
+
+  async function spawnLaser(owner) {
+    const obj = owner.gameObject._internal.three;
+    obj.getWorldPosition(owner._worldPos);
+    obj.getWorldQuaternion(owner._worldQuat);
+    obj.getWorldDirection(owner._worldDir);
+
+    const fireDir = owner._worldDir.clone();
+
+    const mesh = new THREE.Mesh(laserGeo, laserMat);
+    mesh.position.copy(owner._worldPos);
+    mesh.quaternion.copy(owner._worldQuat);
+    mesh.scale.set(1, 1, 20);
+    mesh.name = 'Laser';
+    mesh.frustumCulled = false;
+    mesh.userData.isRuntimeOnly = true;
+
+    const laserGameObject = erth.object.createFromThreeObject(mesh);
+    await erth.scene.addObject(laserGameObject);
+
+    lasers.push({
+      mesh: mesh,
+      direction: fireDir,
+      age: 0
+    });
+
+    if (owner._laserSoundUrl) {
+      const audio = new Audio(owner._laserSoundUrl);
+      audio.volume = 0.3;
+      audio.play();
+    }
+  }
+
+  this.init = function(_game) {
+      game = _game;
+    // Config
+    const laserSpeedAttr = this.getAttribute('laserSpeed');
+    const burstCountAttr = this.getAttribute('burstCount');
+    const burstDelayAttr = this.getAttribute('burstDelay');
+    const laserLifetimeAttr = this.getAttribute('laserLifetime');
+    this.speed = laserSpeedAttr == null ? 250 : laserSpeedAttr;
+    this.burstMax = burstCountAttr == null ? 3 : burstCountAttr;
+    this.burstDelay = burstDelayAttr == null ? 0.1 : burstDelayAttr;
+    this.lifetime = laserLifetimeAttr == null ? 5 : laserLifetimeAttr;
+
+    // Shared laser geometry and material (reused for all projectiles)
+    laserGeo = new THREE.IcosahedronGeometry(0.1, 1);
+    laserMat = new THREE.MeshStandardNodeMaterial({
+      emissive: 0x20fa5a,
+      emissiveIntensity: 40
+    });
+
+    // Active laser pool
+    lasers = [];
+
+    // Burst state
+    this._burstRemaining = this.burstMax;
+    this._burstTimer = 0;
+    this._wasShooting = false;
+
+    // Reusable temp vectors
+    this._worldPos = new THREE.Vector3();
+    this._worldDir = new THREE.Vector3();
+    this._worldQuat = new THREE.Quaternion();
+
+    // Preload laser sound if attribute is set
+    this._laserSoundUrl = null;
+    const soundAttr = this.getAttribute("laserSound");
+    if (soundAttr) {
+      this.erth.asset.audio.getUrl(soundAttr).then((url) => {
+        this._laserSoundUrl = url;
+      });
+    }
+  };
+
+  this.update = function(dt) {
+    const _dtCapped = Math.min(dt, 0.1);
+    const shooting = erth.store.get('sf.shoot') || false;
+
+    // Reset burst when shoot key released
+    if (!shooting && this._wasShooting) {
+      this._burstRemaining = this.burstMax;
+      this._burstTimer = 0;
+    }
+    this._wasShooting = shooting;
+
+    // Countdown burst timer
+    this._burstTimer -= dt;
+
+    // Spawn lasers on shoot
+    if (shooting && this._burstRemaining > 0 && this._burstTimer <= 0) {
+      spawnLaser(this);
+      this._burstRemaining--;
+      this._burstTimer = this.burstDelay;
+    }
+
+    // Update all active lasers
+    for (let i = lasers.length - 1; i >= 0; i--) {
+      const laser = lasers[i];
+      laser.age += dt;
+
+      // Move along stored direction
+      laser.mesh.position.addScaledVector(laser.direction, this.speed * dt);
+
+      // Remove expired lasers
+      if (laser.age > this.lifetime) {
+        if (laser.mesh.parent) {
+          laser.mesh.parent.remove(laser.mesh);
+        }
+        laser.mesh.geometry = null;
+        laser.mesh.material = null;
+        lasers.splice(i, 1);
+      }
+    }
+  };
+
+  this.onEditorAdded = function(editor) {
+    ensureLaserSetup(this, editor.scene);
+  };
+
+  this.onEditorUpdate = function() {
+    ensureLaserSetup(this, this.gameObject._internal.three.parent || null);
+    this._editorFireTimer -= 0.016;
+    if (this._editorFireTimer <= 0) {
+      spawnLaser(this);
+      this._editorFireTimer = 0.5;
+    }
+    this.update(0.016);
+  };
+
+  this.onEditorDispose = function() {
+    cleanupLasers();
+  };
+
+  this.dispose = function() {
+    cleanupLasers();
+  };

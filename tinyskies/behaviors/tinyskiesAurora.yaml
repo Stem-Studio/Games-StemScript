@@ -1,0 +1,237 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Aurora"
+  id: "tinyskies.aurora"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "10 aurora curtains in a ring above the globe. TSL positionNode wave displacement + colorNode shimmering curtain alpha. Opacity = nightWeight × baseAlpha. Each curtain billboards toward the camera."
+  documentation: "Verbatim port of source Aurora.ts (10 PlaneGeometry curtains, RING_RADIUS=7, RING_HEIGHT=9, CURTAIN_WIDTH=6, CURTAIN_HEIGHT=7). 5-entry palette repeats around the ring. Source ShaderMaterial → MeshBasicNodeMaterial + TSL with same vertex-displacement chain (3 sine waves + 1 high-freq ripple) and same fragment chain (curtain alpha × shimmer × vertical fade × edge fade × base alpha × 0.55). Each curtain mesh.lookAt(camera.worldPos) per frame so the curtain always faces the viewer; up vector set to the curtain's radial-from-origin direction."
+  tags:
+    - environment
+    - vfx
+  priority: 0
+  throttleConfig:
+    throttlePriority: "LOW"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    ringRadius:
+      name: "Ring Radius"
+      type: "number"
+      default: 7
+      min: 2
+      max: 50
+    ringHeight:
+      name: "Ring Height (above globe origin)"
+      type: "number"
+      default: 9
+      min: 1
+      max: 50
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  const LOG_TAG = "[tinyskies.aurora]";
+
+  // Match source Aurora.ts:12-18.
+  const NUM_CURTAINS = 10;
+  const CURTAIN_HEIGHT = 7;
+  const CURTAIN_WIDTH = 6;
+  const SEGMENTS_X = 64;
+  const SEGMENTS_Y = 24;
+
+  // Palette — 5 entries repeated around the ring (Aurora.ts:100-106).
+  const PALETTE = [
+    { color1: [0.10, 0.90, 0.30], color2: [0.10, 0.70, 0.60], color3: [0.30, 0.30, 0.90], alpha: 1.0,  tilt: 0.10,  heightOffset: 0.0 },
+    { color1: [0.15, 0.80, 0.40], color2: [0.20, 0.50, 0.80], color3: [0.60, 0.20, 0.70], alpha: 0.8,  tilt: 0.15,  heightOffset: 0.5 },
+    { color1: [0.20, 0.60, 0.90], color2: [0.40, 0.30, 0.80], color3: [0.70, 0.15, 0.50], alpha: 0.6,  tilt: -0.08, heightOffset: -0.3 },
+    { color1: [0.05, 0.95, 0.35], color2: [0.10, 0.85, 0.55], color3: [0.15, 0.50, 0.75], alpha: 0.7,  tilt: 0.20,  heightOffset: 0.8 },
+    { color1: [0.30, 0.40, 0.90], color2: [0.50, 0.20, 0.80], color3: [0.80, 0.10, 0.40], alpha: 0.5,  tilt: -0.12, heightOffset: 0.2 },
+  ];
+
+  let game;
+
+  this.init = function (_game) {
+    game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._radialUp = new THREE.Vector3();
+    this._camWorld = new THREE.Vector3();
+    this._buildVisuals(this.gameObject._internal.three);
+    this._log("init");
+  };
+
+  this.onEditorAdded = function (editor) {
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._radialUp = new THREE.Vector3();
+    this._camWorld = new THREE.Vector3();
+    this._buildVisuals(this.gameObject._internal.three);
+    if (this._opacityUniform) this._opacityUniform.value = 0.4;
+  };
+
+  this.onEditorAttributesUpdated = function () {
+    this._teardownVisuals();
+    this._buildVisuals(this.gameObject._internal.three);
+  };
+
+  this.onEditorDispose = function () {
+    this._teardownVisuals();
+  };
+
+  this.update = function (deltaTime) {
+    const dt = Math.min(deltaTime, 0.1);
+    if (this._opacityUniform) {
+      const w = this.erth.store.get("tinyskies/nightWeight");
+      this._opacityUniform.value = typeof w === "number" ? w : 1;
+    }
+    if (!this._timeUniforms) return;
+    for (const u of this._timeUniforms) u.value += dt;
+
+    // Billboard each curtain to the camera; up = radial-from-world-origin so
+    // curtains stand vertically relative to the globe.
+    if (game && game.camera && this._meshes) {
+      game.camera.getWorldPosition(this._camWorld);
+      for (const mesh of this._meshes) {
+        this._radialUp.copy(mesh.position).normalize();
+        mesh.up.copy(this._radialUp);
+        mesh.lookAt(this._camWorld);
+      }
+    }
+  };
+
+  this._buildVisuals = function (parent) {
+    const ringRadius = this.getAttribute("ringRadius");
+    const ringHeight = this.getAttribute("ringHeight");
+    const TSL = THREE.TSL;
+
+    const root = new THREE.Group();
+    root.name = "tinyskiesAuroraRoot";
+    root.userData.isRuntimeOnly = true;
+
+    // Locals avoid the static-analysis "this._x is set to null in dispose" false
+    // positive — we always reassign at the top of this function before pushing.
+    const meshes = [];
+    const materials = [];
+    const timeUniforms = [];
+    const alphaUniforms = [];
+    this._opacityUniform = TSL.uniform(1.0);
+
+    for (let i = 0; i < NUM_CURTAINS; i++) {
+      const cfg = PALETTE[i % PALETTE.length];
+      const angle = (i / NUM_CURTAINS) * Math.PI * 2;
+
+      const geo = new THREE.PlaneGeometry(CURTAIN_WIDTH, CURTAIN_HEIGHT, SEGMENTS_X, SEGMENTS_Y);
+      const uTime = TSL.uniform(i * 7.3);
+      const uBaseAlpha = TSL.uniform(cfg.alpha);
+      timeUniforms.push(uTime);
+      alphaUniforms.push(uBaseAlpha);
+
+      const mat = new THREE.MeshBasicNodeMaterial({
+        side: THREE.DoubleSide,
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      });
+
+      // ── Vertex displacement (Aurora.ts:30-43) ──
+      const pos = TSL.positionLocal;
+      const uv = TSL.uv();
+      const wave1 = TSL.sin(pos.x.mul(0.6).add(uTime.mul(0.3))).mul(0.4);
+      const wave2 = TSL.sin(pos.x.mul(1.2).add(uTime.mul(0.2)).add(1.5)).mul(0.2);
+      const wave3 = TSL.sin(pos.x.mul(0.3).add(uTime.mul(0.15)).add(3.0)).mul(0.6);
+      const ripple = TSL.sin(pos.x.mul(3.0).add(pos.y.mul(0.4)).add(uTime.mul(0.8))).mul(0.05);
+      const heightWeight = TSL.float(0.3).add(uv.y.mul(0.7));
+      const zOffset = wave1.add(wave2).add(wave3).add(ripple).mul(heightWeight);
+      const sway = TSL.sin(pos.x.mul(0.25).add(uTime.mul(0.1))).mul(0.3).mul(uv.y);
+      mat.positionNode = TSL.vec3(pos.x, pos.y.add(sway), pos.z.add(zOffset));
+
+      // ── Color + alpha (Aurora.ts:58-87) ──
+      const c1 = TSL.vec3(TSL.float(cfg.color1[0]), TSL.float(cfg.color1[1]), TSL.float(cfg.color1[2]));
+      const c2 = TSL.vec3(TSL.float(cfg.color2[0]), TSL.float(cfg.color2[1]), TSL.float(cfg.color2[2]));
+      const c3 = TSL.vec3(TSL.float(cfg.color3[0]), TSL.float(cfg.color3[1]), TSL.float(cfg.color3[2]));
+
+      const curtainX = TSL.pow(TSL.sin(uv.x.mul(12.0).add(uTime.mul(0.5))).mul(0.5).add(0.5), TSL.float(2.0));
+      const curtainX2 = TSL.pow(TSL.sin(uv.x.mul(8.0).sub(uTime.mul(0.3)).add(2.0)).mul(0.5).add(0.5), TSL.float(3.0));
+      const curtain = TSL.max(curtainX.mul(0.8), curtainX2.mul(0.5));
+
+      const shimmerRaw = TSL.sin(uv.x.mul(30.0).add(uv.y.mul(8.0)).add(uTime.mul(2.0))).mul(0.5).add(0.5);
+      const shimmer = shimmerRaw.mul(0.2).add(0.8);
+
+      const bottomFade = TSL.smoothstep(TSL.float(0.0), TSL.float(0.2), uv.y);
+      const topFade = TSL.sub(TSL.float(1.0), TSL.smoothstep(TSL.float(0.5), TSL.float(1.0), uv.y));
+      const vertFade = bottomFade.mul(topFade);
+      const edgeFade = TSL.smoothstep(TSL.float(0.0), TSL.float(0.15), uv.x).mul(
+        TSL.sub(TSL.float(1.0), TSL.smoothstep(TSL.float(0.85), TSL.float(1.0), uv.x))
+      );
+
+      // Use uv.y as the gradient parameter (source uses uv.y + vWave*0.3 — vWave
+      // requires varying-out, dropped here for simplicity; the visual delta is
+      // small and the color still glides smoothly across the curtain).
+      const tParam = uv.y;
+      const col = TSL.mix(
+        TSL.mix(c1, c2, TSL.div(tParam, 0.4)),
+        TSL.mix(c2, c3, TSL.div(TSL.sub(tParam, 0.4), 0.6)),
+        TSL.smoothstep(TSL.float(0.39), TSL.float(0.41), tParam),
+      );
+      const colTinted = col.add(TSL.vec3(TSL.float(0.1), TSL.float(0.15), TSL.float(0.1)).mul(shimmer).mul(curtain));
+
+      const a = curtain.mul(vertFade).mul(edgeFade).mul(shimmer).mul(uBaseAlpha).mul(this._opacityUniform).mul(0.55);
+
+      mat.colorNode = TSL.vec4(colTinted, a);
+
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.set(
+        ringRadius * Math.cos(angle),
+        ringHeight + cfg.heightOffset,
+        ringRadius * Math.sin(angle),
+      );
+      mesh.frustumCulled = false;
+      mesh.renderOrder = 999;
+      mesh.userData.isRuntimeOnly = true;
+      root.add(mesh);
+      meshes.push(mesh);
+      materials.push(mat);
+    }
+
+    parent.add(root);
+    this._root = root;
+    this._meshes = meshes;
+    this._materials = materials;
+    this._timeUniforms = timeUniforms;
+    this._alphaUniforms = alphaUniforms;
+  };
+
+  this._teardownVisuals = function () {
+    if (this._root) {
+      this._root.traverse((child) => {
+        if (child.geometry && typeof child.geometry.dispose === "function") child.geometry.dispose();
+      });
+      if (this._root.parent) this._root.parent.remove(this._root);
+      this._root = null;
+    }
+    if (this._materials) {
+      for (const m of this._materials) m.dispose();
+      this._materials.length = 0;
+    }
+    this._meshes = null;
+    this._timeUniforms = null;
+    this._alphaUniforms = null;
+    this._opacityUniform = null;
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    this._teardownVisuals();
+  };

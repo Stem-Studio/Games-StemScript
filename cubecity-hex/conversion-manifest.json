@@ -1,0 +1,98 @@
+{
+  "generatedBy": "Script Wizard",
+  "generatedAt": "2026-03-28T05:59:32Z",
+  "source": {
+    "repoUrl": "https://github.com/hexianWeb/CubeCity",
+    "localPath": "/tmp/CubeCity",
+    "branch": "big-simcity",
+    "commit": "0191f5170872382954c15b7316f2e34d020d6d49"
+  },
+  "destination": {
+    "path": "cubecity-hex",
+    "projectTitle": "CubeCity",
+    "mainStemscript": "cubecity-hex.stemscript"
+  },
+  "generatedFiles": [
+    "README.md",
+    "behaviors/ccCityGame.yaml",
+    "conversion-manifest.json",
+    "conversion-notes.md",
+    "conversion-plan.md",
+    "cubecity-hex.stemscript",
+    "source-analysis.json",
+    "source-map.md"
+  ],
+  "assetInventory": {
+    "models": [
+      "models/chemistry_level1.glb",
+      "models/chemistry_level2.glb",
+      "models/chemistry_level3.glb",
+      "models/factory.glb",
+      "models/fire_station.glb",
+      "models/garbage_station.glb",
+      "models/hero_park.glb",
+      "models/hospital.glb",
+      "models/house2_level1.glb",
+      "models/house2_level2.glb",
+      "models/house2_level3.glb",
+      "models/house_level1.glb",
+      "models/house_level2.glb",
+      "models/house_level3.glb",
+      "models/nuke_factory.glb",
+      "models/office_level1.glb",
+      "models/office_level2.glb",
+      "models/office_level3.glb",
+      "models/police.glb",
+      "models/road-3way.glb",
+      "models/road-4way.glb",
+      "models/road-bend.glb",
+      "models/road-straight.glb",
+      "models/shop_level1.glb",
+      "models/shop_level2.glb",
+      "models/shop_level3.glb",
+      "models/sun_power.glb",
+      "models/tree_level1.glb",
+      "models/tree_level2.glb",
+      "models/tree_level3.glb",
+      "models/water_tower.glb",
+      "models/wind_power.glb"
+    ],
+    "textures": [
+      "textures/effect/angry.png",
+      "textures/effect/coinBuff.png",
+      "textures/effect/happy.png",
+      "textures/effect/humanBuff.png",
+      "textures/effect/humanDebuff.png",
+      "textures/effect/miss-population.png",
+      "textures/effect/miss-power.png",
+      "textures/effect/miss-road.png",
+      "textures/effect/over-population.png",
+      "textures/effect/pollutionDown.png",
+      "textures/effect/pollutionUp.png",
+      "textures/effect/pollutionlowerBuff.png",
+      "textures/effect/power.png",
+      "textures/effect/powerBuff.png",
+      "textures/effect/sad.png",
+      "textures/effect/upgrade.png"
+    ],
+    "audio": [
+      "audio/song01.mp3",
+      "audio/song02.mp3"
+    ]
+  },
+  "sourceToPortedAssetNames": {
+    "public/audio/song01.mp3": "CC Track 1",
+    "public/audio/song02.mp3": "CC Track 2",
+    "public/models/house_level1.glb": "CC House L1",
+    "public/models/road-straight.glb": "CC Road Straight",
+    "public/textures/effect/miss-road.png": "CC Icon Miss Road"
+  },
+  "rerunMetadata": {
+    "incrementalMergeTarget": true,
+    "regionMapGenerated": false,
+    "validation": {
+      "syntaxCheck": "passed",
+      "bundleCheck": "passed"
+    }
+  }
+}

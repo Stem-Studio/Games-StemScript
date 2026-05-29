@@ -1,0 +1,68 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Vehicle Switcher"
+  id: "tinyskies.vehicleSwitcher"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Cycle through plane / boat / carpet on a key press. Publishes tinyskies/vehicleType for the visual + flightController behaviors to read."
+  documentation: "Source has a vehicle-select lobby; the cap ships a runtime cycler. Bound to InputManager `reload` action (R key by default) — pressing it cycles plane → boat → carpet → plane. Publishes the active vehicle to `tinyskies/vehicleType` (default `plane`). Each vehicle visual behavior reads this key and toggles visibility; the flightController applies per-vehicle physics. Source's vehicle-specific lobby + capabilities + UI are deferred (FDR-005)."
+  tags:
+    - gameplay
+    - input
+  priority: 0
+  throttleConfig:
+    throttlePriority: "HIGH"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    initialVehicle:
+      name: "Initial Vehicle"
+      type: "string"
+      default: "plane"
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  const LOG_TAG = "[tinyskies.vehicleSwitcher]";
+  const VEHICLES = ["plane", "boat", "carpet"];
+  let game;
+
+  this.init = function (_game) {
+    game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._im = game.inputManager || null;
+    this._cycleHeldPrev = false;
+    const initial = this.getAttribute("initialVehicle") || "plane";
+    const idx = Math.max(0, VEHICLES.indexOf(initial));
+    this._currentIdx = idx;
+    this.erth.store.set("tinyskies/vehicleType", VEHICLES[this._currentIdx]);
+    this._log("init vehicle=", VEHICLES[this._currentIdx]);
+  };
+
+  this.update = function () {
+    if (!this._im) return;
+    // R key (default `reload` action) cycles vehicles. Edge-detected.
+    const held = !!this._im.getAction("reload");
+    if (held && !this._cycleHeldPrev) {
+      this._currentIdx = (this._currentIdx + 1) % VEHICLES.length;
+      this.erth.store.set("tinyskies/vehicleType", VEHICLES[this._currentIdx]);
+      this._log("switched to", VEHICLES[this._currentIdx]);
+    }
+    this._cycleHeldPrev = held;
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    this._im = null;
+  };

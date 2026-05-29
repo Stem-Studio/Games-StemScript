@@ -1,0 +1,47 @@
+# 3D Chess — ported from joshwrn/3d-chess (React Three Fiber + Socket.io)
+# A fully playable 3D chess game with orbit camera, metallic pieces,
+# click-to-select/move interaction, and complete chess rules.
+
+project title "3D Chess"
+
+# === Import Assets ===
+import model name="Pawn" filepath="models/pawn.gltf" comment="Chess pawn piece"
+import model name="Rook" filepath="models/rook.gltf" comment="Chess rook piece"
+import model name="Knight" filepath="models/knight.gltf" comment="Chess knight piece"
+import model name="Bishop" filepath="models/bishop.gltf" comment="Chess bishop piece"
+import model name="Queen" filepath="models/queen.gltf" comment="Chess queen piece"
+import model name="King" filepath="models/king.gltf" comment="Chess king piece"
+update "Pawn" objectSettings={gameVisibility:false}
+update "Rook" objectSettings={gameVisibility:false}
+update "Knight" objectSettings={gameVisibility:false}
+update "Bishop" objectSettings={gameVisibility:false}
+update "Queen" objectSettings={gameVisibility:false}
+update "King" objectSettings={gameVisibility:false}
+
+import behavior name="Chess Game" filepath="behaviors/chessGame/behavior.yaml"
+import behavior name="Chess Camera" filepath="behaviors/chessCamera/behavior.yaml"
+import behavior name="Chess HUD" filepath="behaviors/chessHUD/behavior.yaml"
+
+# === Scene Settings ===
+scene background type=Color color=#1a1a2e
+
+# Lighting — source uses hemisphere + point light (point light created by behavior)
+scene lighting ambient={intensity:0.2} hemisphere={intensity:0.5} shadows={enabled:true}
+light "Directional Light" intensity=0
+render settings useShadows=true
+
+# === Game Settings ===
+game settings enabled=true showHUD=false
+
+# === Camera Setup ===
+# Camera type NONE — orbit camera managed by chessCamera behavior
+camera "DefaultCamera" cameraType=NONE fov=50
+
+# === Create Chess Board Object ===
+add group name="ChessBoard" position=0,0,0
+update "ChessBoard" tag=Player
+
+# === Attach Behaviors ===
+behavior attach "ChessBoard" behaviorId=chess.chessGame config={pawnModel:"Pawn",rookModel:"Rook",knightModel:"Knight",bishopModel:"Bishop",queenModel:"Queen",kingModel:"King"}
+behavior attach "ChessBoard" behaviorId=chess.chessCamera
+behavior attach "ChessBoard" behaviorId=chess.chessHUD

@@ -1,0 +1,177 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "HGL Hex Vignette"
+  id: "hgl.hexVignette"
+  author: "stemstudio-importer"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "TSL port of the HexGL cyan-blue hex vignette. Fullscreen
+    NodeMaterial overlay parented to the main camera — radial tint + hex grid
+    pattern at the edges."
+  documentation: |
+    Source: `bkcore.hexgl.HexVignette` — a custom GLSL post-processing shader
+    that renders a cyan-blue (0x458ab1) tint at screen edges with a hex grid
+    pattern. WebGPU cannot consume raw GLSL, so this behavior reproduces the
+    visual via TSL (`Fn`, `uv`, `length`, `smoothstep`, etc.) on a fullscreen
+    `MeshBasicNodeMaterial` plane parented to the main camera.
+
+    Sizing: the plane is auto-sized each frame from `game.camera` near/fov/aspect
+    so it always fills the view. `depthTest=false` + high `renderOrder` puts
+    it on top of the scene. UIKit overlays parented to `game.uiCamera` still
+    render above the vignette (uiCamera is rendered last).
+  priority: 0
+  tags: [ "vfx", "postprocessing", "hexgl" ]
+  attributes:
+    tintColor:
+      name: "Tint Color"
+      type: "color"
+      default: "#458ab1"
+    vignetteStart:
+      name: "Vignette Start (0=center, 1=corner)"
+      type: "number"
+      default: 0.4
+      min: 0.0
+      max: 1.0
+    vignetteEnd:
+      name: "Vignette End"
+      type: "number"
+      default: 1.0
+      min: 0.0
+      max: 1.5
+    vignetteOpacity:
+      name: "Vignette Opacity"
+      type: "number"
+      default: 0.55
+      min: 0.0
+      max: 1.0
+    hexScale:
+      name: "Hex Grid Scale"
+      type: "number"
+      default: 48.0
+      min: 4.0
+      max: 200.0
+    hexOpacity:
+      name: "Hex Pattern Opacity"
+      type: "number"
+      default: 0.12
+      min: 0.0
+      max: 0.5
+
+code: |
+  const { Fn, uv, vec2, vec3, vec4, float, length, smoothstep, abs, mix, uniform, mod } = THREE.TSL;
+
+  let game;
+  let plane = null;
+  let material = null;
+  let tintUniform = null;
+  let vignStartU = null;
+  let vignEndU = null;
+  let vignOpU = null;
+  let hexScaleU = null;
+  let hexOpU = null;
+
+  this.init = function(_game) {
+    game = _game;
+  };
+
+  this.onStart = function() {
+
+    tintUniform = uniform(new THREE.Color(this.getAttribute("tintColor") || "#458ab1"));
+    vignStartU = uniform(this.getAttribute("vignetteStart") ?? 0.4);
+    vignEndU = uniform(this.getAttribute("vignetteEnd") ?? 1.0);
+    vignOpU = uniform(this.getAttribute("vignetteOpacity") ?? 0.55);
+    hexScaleU = uniform(this.getAttribute("hexScale") ?? 48.0);
+    hexOpU = uniform(this.getAttribute("hexOpacity") ?? 0.12);
+
+    // TSL fragment:
+    //   - Convert UV (0..1) to centered coords (-1..1).
+    //   - Radial vignette via smoothstep(start, end, length).
+    //   - Hex pattern: fold UV into hex cells using the standard offset-lattice trick,
+    //     distance from cell center gives a soft ring. Multiplied by radial so the
+    //     hex detail only appears at the edges, matching the source feel.
+    //   - Final RGBA = (tint, vignette_alpha + hex_alpha * radial).
+    const colorNode = Fn(() => {
+      const uvN = uv();
+      const centered = uvN.sub(0.5).mul(2.0);
+      const radial = smoothstep(vignStartU, vignEndU, length(centered));
+
+      // Hex lattice — axial coordinates, each cell's center at (0.5, 0.5).
+      const scaled = uvN.mul(hexScaleU);
+      const skewed = vec2(
+        scaled.x.add(scaled.y.mul(0.5)),
+        scaled.y.mul(0.8660254), // sqrt(3)/2
+      );
+      const cellUV = vec2(mod(skewed.x, 1.0), mod(skewed.y, 1.0)).sub(0.5);
+      const cellDist = length(cellUV);
+      // Thin ring around cell center — brighter at the ring, darker elsewhere.
+      const hexRing = smoothstep(0.38, 0.48, cellDist).sub(smoothstep(0.48, 0.58, cellDist));
+
+      const vignetteA = radial.mul(vignOpU);
+      const hexA = hexRing.mul(hexOpU).mul(radial);
+      const alpha = vignetteA.add(hexA).clamp(0.0, 1.0);
+
+      return vec4(vec3(tintUniform), alpha);
+    })();
+
+    material = new THREE.MeshBasicNodeMaterial();
+    material.colorNode = colorNode;
+    material.transparent = true;
+    material.depthTest = false;
+    material.depthWrite = false;
+
+    // 2x2 plane — resized each frame to the view frustum.
+    const geom = new THREE.PlaneGeometry(2, 2);
+    plane = new THREE.Mesh(geom, material);
+    plane.frustumCulled = false;
+    plane.renderOrder = 900;        // above the world, below UIKit (uiCamera is last anyway)
+    plane.userData.isRuntimeOnly = true;
+    plane.name = "HGL.HexVignette";
+
+    if (game.camera) {
+      game.camera.add(plane);
+      this._sizePlaneToCamera();
+    }
+  };
+
+  this._sizePlaneToCamera = function() {
+    if (!plane || !game.camera) return;
+    const cam = game.camera;
+    if (!cam.isPerspectiveCamera) {
+      // Orthographic / unknown — just nudge forward and trust the 2x2 default.
+      plane.position.set(0, 0, -cam.near * 1.01);
+      return;
+    }
+    const d = cam.near * 1.02;
+    const h = 2 * d * Math.tan((cam.fov * Math.PI / 180) / 2);
+    const w = h * cam.aspect;
+    plane.position.set(0, 0, -d);
+    plane.scale.set(w / 2, h / 2, 1);
+  };
+
+  this.update = function(_deltaTime) {
+    // Camera aspect / near can change on window resize; resize every frame is cheap.
+    this._sizePlaneToCamera();
+  };
+
+  this.dispose = function() {
+    if (plane) {
+      plane.removeFromParent?.();
+      plane.geometry?.dispose?.();
+      plane = null;
+    }
+    if (material) {
+      material.dispose?.();
+      material = null;
+    }
+  };
+
+  // Editor callbacks: the vignette is a runtime-only overlay that would
+  // otherwise obscure the scene while editing. Intentionally no editor
+  // preview — defined as no-ops to satisfy the geometry-preview lint rule.
+  this.onEditorAdded = function() {};
+  this.onEditorDispose = function() {};

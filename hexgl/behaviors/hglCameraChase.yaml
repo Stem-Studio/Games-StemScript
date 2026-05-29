@@ -1,0 +1,255 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "HGL Camera Chase"
+  id: "hgl.cameraChase"
+  author: "HexGL-Port"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  priority: 0
+  description: "Speed-responsive chase camera ported from HexGL CameraChase.js,
+    with skybox loading"
+  tags:
+    - gameplay
+  attributes:
+    yOffset:
+      name: "Y Offset"
+      type: "number"
+      default: 8.0
+      min: 1
+      max: 30
+      description: "Camera height above the ship"
+    zOffset:
+      name: "Z Offset"
+      type: "number"
+      default: 10.0
+      min: 1
+      max: 40
+      description: "Camera distance behind the ship"
+    viewOffset:
+      name: "View Offset"
+      type: "number"
+      default: 10.0
+      min: 0
+      max: 40
+      description: "Look-ahead distance in front of the ship"
+    speedOffsetMax:
+      name: "Speed Offset Max"
+      type: "number"
+      default: 10.0
+      min: 0
+      max: 30
+      description: "Maximum additional look-ahead from speed"
+    lerp:
+      name: "Smoothing"
+      type: "number"
+      default: 0.5
+      min: 0.01
+      max: 1.0
+      description: "Camera easing factor (lower = smoother, higher = snappier)"
+    skyPX:
+      name: "Skybox +X"
+      type: "imageAsset"
+      description: "Skybox positive-X face texture"
+    skyNX:
+      name: "Skybox -X"
+      type: "imageAsset"
+      description: "Skybox negative-X face texture"
+    skyPY:
+      name: "Skybox +Y"
+      type: "imageAsset"
+      description: "Skybox positive-Y face texture"
+    skyNY:
+      name: "Skybox -Y"
+      type: "imageAsset"
+      description: "Skybox negative-Y face texture"
+    skyPZ:
+      name: "Skybox +Z"
+      type: "imageAsset"
+      description: "Skybox positive-Z face texture"
+    skyNZ:
+      name: "Skybox -Z"
+      type: "imageAsset"
+      description: "Skybox negative-Z face texture"
+  documentation: Speed-responsive chase camera ported from HexGL CameraChase.js, with skybox
+    loading Configure attributes in the editor to tune gameplay behavior.
+
+code: |
+  // HGL Camera Chase — ported from HexGL CameraChase.js
+  // Speed-responsive chase camera that follows the ship, plus skybox setup.
+  //
+  // Source API translations (Three.js r53 → modern):
+  //   addSelf(v)        → add(v)
+  //   matrix.rotateAxis → transformDirection(matrix)
+
+  let game;
+  let behaviorInstance;
+  this.init = function(_game) {
+    game = _game;
+    behaviorInstance = this;
+    // Pre-allocate reusable vectors (never allocate in update)
+    this._dir = new THREE.Vector3();
+    this._up = new THREE.Vector3();
+    this._lookTarget = new THREE.Vector3();
+    this._camPos = new THREE.Vector3();
+    this._desiredCamPos = new THREE.Vector3();
+    this._followDir = new THREE.Vector3();
+    this._dirNorm = new THREE.Vector3();
+    this._smoothedLookTarget = new THREE.Vector3();
+    this._speedOffset = 0;
+    this._cameraReady = false;
+
+    // Cache attribute values
+    this._yOffset = this.getAttribute("yOffset");
+    this._zOffset = this.getAttribute("zOffset");
+    this._viewOffset = this.getAttribute("viewOffset");
+    this._speedOffsetMax = this.getAttribute("speedOffsetMax");
+    this._lerp = this.getAttribute("lerp");
+
+    // Load skybox textures and build CubeTexture
+    this._skyTextures = [];
+    this._loadSkybox();
+  };
+
+  this.onStart = function() {
+    this._cameraReady = false;
+  };
+
+  this._loadSkybox = function() {
+    let imgApi = this.erth.asset.image;
+    let faceAttrs = [
+      this.getAttribute("skyPX"),
+      this.getAttribute("skyNX"),
+      this.getAttribute("skyPY"),
+      this.getAttribute("skyNY"),
+      this.getAttribute("skyPZ"),
+      this.getAttribute("skyNZ")
+    ];
+
+    // Check all 6 faces are assigned
+    let allPresent = true;
+    for (let i = 0; i < 6; i++) {
+      if (!faceAttrs[i]) {
+        allPresent = false;
+        break;
+      }
+    }
+    if (!allPresent) return;
+
+    // Load all 6 face textures in parallel
+    let promises = [];
+    for (let i = 0; i < 6; i++) {
+      promises.push(imgApi.createTexture(faceAttrs[i]));
+    }
+
+    Promise.all(promises).then(function(textures) {
+      behaviorInstance._skyTextures = textures;
+
+      // Extract Image data from each loaded texture to build CubeTexture
+      // CubeTexture expects [+x, -x, +y, -y, +z, -z] order
+      let images = [];
+      for (let i = 0; i < textures.length; i++) {
+        images.push(textures[i].image);
+      }
+
+      let cubeTexture = new THREE.CubeTexture(images);
+      cubeTexture.needsUpdate = true;
+      behaviorInstance._cubeTexture = cubeTexture;
+
+      // Set as scene background
+      if (game && game.scene) {
+        game.scene.background = cubeTexture;
+      }
+    }).catch(function(err) {
+      console.warn("[hgl.cameraChase] Skybox load failed:", err);
+    });
+  };
+
+  this.update = function(deltaTime) {
+    let ship = this.gameObject._internal.three;
+    if (!ship) return;
+
+    let camera = game.camera;
+    if (!camera) return;
+
+    // Read speed ratio from shared store (set by hglShipController)
+    let ratio = this.erth.store.get("hgl_speedRatio") || 0;
+
+    // dt in the source is raw seconds, deltaTime here is also seconds
+    let dt = deltaTime;
+
+    // Reset direction and up vectors each frame
+    let dir = this._dir;
+    let up = this._up;
+    let lookTarget = this._lookTarget;
+
+    dir.set(0, 0, 1);
+    up.set(0, 1, 0);
+
+    // Rotate dir and up by the ship's world matrix rotation
+    // Source: targetObject.matrix.rotateAxis(up/dir)
+    // Modern: transformDirection applies only rotation from a Matrix4
+    dir.transformDirection(ship.matrixWorld);
+    up.transformDirection(ship.matrixWorld);
+
+    // Update speed-based look-ahead offset
+    // Source: speedOffset += (speedOffsetMax*ratio - speedOffset) * min(1, 0.3*dt)
+    let targetSpeedOffset = this._speedOffsetMax * ratio;
+    let alpha = Math.min(1, 0.3 * dt);
+    this._speedOffset += (targetSpeedOffset - this._speedOffset) * alpha;
+
+    // Compute look-at target: ship position + dir * (viewOffset + speedOffset)
+    lookTarget.copy(ship.position);
+    this._followDir.copy(dir).multiplyScalar(this._viewOffset + this._speedOffset);
+    lookTarget.add(this._followDir);
+
+    // Compute camera position: ship position + up * yOffset - dir_normalized * zOffset
+    // Note: dir was already scaled above for lookTarget, so re-derive normalized direction
+    let dirNorm = this._dirNorm.set(0, 0, 1);
+    dirNorm.transformDirection(ship.matrixWorld);
+    dirNorm.normalize();
+
+    this._desiredCamPos.copy(ship.position);
+    this._desiredCamPos.y += -up.y + this._yOffset;
+    this._desiredCamPos.add(dirNorm.multiplyScalar(-this._zOffset));
+
+    let followAlpha = 1 - Math.exp(-(2 + this._lerp * 10) * dt);
+    if (!this._cameraReady) {
+      this._camPos.copy(this._desiredCamPos);
+      this._smoothedLookTarget.copy(lookTarget);
+      this._cameraReady = true;
+    } else {
+      this._camPos.lerp(this._desiredCamPos, followAlpha);
+      this._smoothedLookTarget.lerp(lookTarget, followAlpha);
+    }
+
+    camera.position.copy(this._camPos);
+    camera.lookAt(this._smoothedLookTarget);
+  };
+
+  this.dispose = function() {
+    // Dispose skybox textures
+    if (this._skyTextures) {
+      for (let i = 0; i < this._skyTextures.length; i++) {
+        if (this._skyTextures[i]) {
+          this._skyTextures[i].dispose();
+        }
+      }
+    }
+    if (this._cubeTexture) {
+      this._cubeTexture.dispose();
+    }
+
+    // Clear scene background if we set it
+    if (game && game.scene && game.scene.background === this._cubeTexture) {
+      game.scene.background = null;
+    }
+
+    this._skyTextures = null;
+    this._cubeTexture = null;
+    this._cameraReady = false;
+  };

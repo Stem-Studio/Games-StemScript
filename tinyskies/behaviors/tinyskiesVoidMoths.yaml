@@ -1,0 +1,420 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Void Moths"
+  id: "tinyskies.voidMoths"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Cosmic-void enemy swarm + capybara defender. Moths spawn in a ring around the eternal flame and fly toward the shield; capybara at the flame auto-fires flame orbs at the nearest moth. Source-faithful merge of VoidMoths.ts (971 LOC) + CapybaraFlameShots.ts (382 LOC) into one behavior, with elder moths / gradient ribbon trails / per-moth HP bars deferred to a follow-up pass."
+  documentation: "Active when `tinyskies/inVoid` is true and `tinyskies/voidPlane` has been published by the eternal flame world. Reads voidPlane to obtain flamePos + planeN + planeE + planeUp; spawns moths in a ring at distance [VOID_SPAWN_RING_MIN..MIN+SPAN]=[2.6..4.8] around the flame on the void plane. Each moth navigates toward the shield (flamePos), constrained to the plane via planeUp projection. On contact with shield (within shieldRadius=0.55), the moth dies and writes `tinyskies/damageShield: 1`. Capybara: emissive orange sphere parented to the flame, autofires a flame orb at the nearest moth on COOLDOWN_MS=900ms. Each orb travels at SHOT_SPEED=2.4 u/s; on contact within MOTH_HIT_RADIUS the moth takes damage. Wave config simplified to: max 8 concurrent moths, 1.5-3.0s spawn interval, unlimited total. Source's per-moth gradient ribbons + HP bars + elder variant are deferred — these are the visual layers, not the gameplay."
+  tags:
+    - gameplay
+    - vfx
+    - void
+  priority: 0
+  throttleConfig:
+    throttlePriority: "HIGH"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    maxConcurrent:
+      name: "Max Concurrent Moths"
+      type: "number"
+      default: 8
+      min: 0
+      max: 30
+    spawnIntervalMin:
+      name: "Spawn Interval Min (s)"
+      type: "number"
+      default: 1.5
+      min: 0.1
+      max: 10
+    spawnIntervalMax:
+      name: "Spawn Interval Max (s)"
+      type: "number"
+      default: 3.0
+      min: 0.1
+      max: 10
+    capybaraEnabled:
+      name: "Capybara Enabled"
+      type: "boolean"
+      default: true
+    capybaraCooldownMs:
+      name: "Capybara Cooldown (ms)"
+      type: "number"
+      default: 900
+      min: 50
+      max: 5000
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  const LOG_TAG = "[tinyskies.voidMoths]";
+
+  // Source VoidMoths.ts:31-45 — verbatim.
+  const WING_SPEED = 18;
+  const FLIGHT_SPEED = 0.18;
+  const TURN_SPEED = 0.9;
+  const VOID_SPAWN_RING_MIN = 2.6;
+  const VOID_SPAWN_RING_SPAN = 2.2;
+  const JITTER_AMP = 0.62;
+  const MOTH_MAX_HP = 3;
+  const MOTH_VISUAL_SCALE = 1.3;
+  const MOTH_HIT_RADIUS = 0.028 * MOTH_VISUAL_SCALE;
+  const MOTH_POST_HIT_SLOW_MULT = 0.26;
+  const MOTH_POST_HIT_SLOW_SEC = 1.0;
+  // Shield contact range (matches source VoidFlameShield.ts COLLISION_RADIUS=0.17 +
+  // moth hitRadius). Use a slightly forgiving 0.55 so contact registers consistently
+  // against our larger shield in Pass 12.
+  const SHIELD_CONTACT_RADIUS = 0.55;
+  // Capybara constants (source CapybaraFlameShots.ts).
+  const SHOT_SPEED = 2.4;
+  const SHOT_LIFETIME = 2.5;
+  const SHOT_HIT_RADIUS = 0.06;
+
+  this.init = function (_game) {
+    this._game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+
+    this._time = 0;
+    this._spawnTimer = 1.5;
+    this._moths = [];
+    this._shots = [];
+
+    this._group = new THREE.Group();
+    this._group.userData.isRuntimeOnly = true;
+    this._group.visible = false;
+    const sceneParent = this.gameObject._internal.three.parent || this.gameObject._internal.three;
+    sceneParent.add(this._group);
+
+    // Shared geometries.
+    this._mothBodyGeo = new THREE.SphereGeometry(0.012, 8, 6); // @check-ok no editor preview — moths only spawn in void
+    this._mothWingGeo = new THREE.PlaneGeometry(0.04, 0.025);
+    this._mothBodyMat = new THREE.MeshStandardNodeMaterial({
+      color: 0x112244, emissive: 0x051122, emissiveIntensity: 0.4, flatShading: true,
+    });
+    this._mothWingMat = new THREE.MeshStandardNodeMaterial({
+      color: 0x6688cc, transparent: true, opacity: 0.55,
+      side: THREE.DoubleSide, depthWrite: false,
+    });
+
+    this._shotGeo = new THREE.SphereGeometry(0.04, 8, 6);
+    this._shotMat = new THREE.MeshBasicNodeMaterial({
+      color: 0xffaa44, transparent: true, opacity: 0.95,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+    });
+
+    // Capybara visual — clone CapybaraModel template if available, fall
+    // back to emissive sphere otherwise.
+    const capybaraTpl = (this._game && this._game.scene && typeof this._game.scene.getObjectByName === "function")
+      ? this._game.scene.getObjectByName("CapybaraModel")
+      : null;
+    if (capybaraTpl) {
+      this._capybara = capybaraTpl.clone(true);
+      this._capybara.traverse((c) => { c.userData.isRuntimeOnly = true; c.visible = true; });
+      // Fit to ~0.36 world units max dim.
+      const box = new THREE.Box3().setFromObject(this._capybara);
+      const size = new THREE.Vector3();
+      box.getSize(size);
+      const max = Math.max(size.x, size.y, size.z, 1e-4);
+      this._capybara.scale.setScalar(0.36 / max);
+      const ctr = new THREE.Vector3();
+      box.getCenter(ctr);
+      this._capybara.position.copy(ctr.multiplyScalar(-(0.36 / max)));
+    } else {
+      this._capybaraGeo = new THREE.SphereGeometry(0.18, 12, 8); // @check-ok no editor preview
+      this._capybaraMat = new THREE.MeshStandardNodeMaterial({
+        color: 0x9a5a2a, emissive: 0x4a2810, emissiveIntensity: 0.4,
+      });
+      this._capybara = new THREE.Mesh(this._capybaraGeo, this._capybaraMat);
+    }
+    this._capybara.userData.isRuntimeOnly = true;
+    this._capybara.visible = false;
+    this._group.add(this._capybara);
+
+    this._lastCapybaraShotMs = 0;
+
+    this._tmpV = new THREE.Vector3();
+    this._tmpV2 = new THREE.Vector3();
+    this._tmpV3 = new THREE.Vector3();
+    this._tmpPlayerPos = new THREE.Vector3();
+
+    this._log("init");
+  };
+
+  this._readVoidPlane = function () {
+    const data = this.erth.store.get("tinyskies/voidPlane");
+    if (!data || !data.flame || !data.up) return null;
+    return {
+      flamePos: { x: data.flame[0], y: data.flame[1], z: data.flame[2] },
+      up: { x: data.up[0], y: data.up[1], z: data.up[2] },
+      north: { x: data.north[0], y: data.north[1], z: data.north[2] },
+      east: { x: data.east[0], y: data.east[1], z: data.east[2] },
+    };
+  };
+
+  this._spawnMoth = function (plane) {
+    const angle = Math.random() * Math.PI * 2;
+    const ring = VOID_SPAWN_RING_MIN + Math.random() * VOID_SPAWN_RING_SPAN;
+    const cosA = Math.cos(angle);
+    const sinA = Math.sin(angle);
+    const verticalJitter = (Math.random() - 0.5) * 0.4;
+    const px = plane.flamePos.x + plane.north.x * cosA * ring + plane.east.x * sinA * ring + plane.up.x * verticalJitter;
+    const py = plane.flamePos.y + plane.north.y * cosA * ring + plane.east.y * sinA * ring + plane.up.y * verticalJitter;
+    const pz = plane.flamePos.z + plane.north.z * cosA * ring + plane.east.z * sinA * ring + plane.up.z * verticalJitter;
+
+    const mothGroup = new THREE.Group();
+    mothGroup.userData.isRuntimeOnly = true;
+    mothGroup.position.set(px, py, pz);
+    mothGroup.scale.setScalar(MOTH_VISUAL_SCALE);
+
+    const body = new THREE.Mesh(this._mothBodyGeo, this._mothBodyMat);
+    body.userData.isRuntimeOnly = true;
+    mothGroup.add(body);
+
+    const leftWing = new THREE.Mesh(this._mothWingGeo, this._mothWingMat);
+    leftWing.position.set(-0.018, 0, 0);
+    leftWing.userData.isRuntimeOnly = true;
+    mothGroup.add(leftWing);
+
+    const rightWing = new THREE.Mesh(this._mothWingGeo, this._mothWingMat);
+    rightWing.position.set(0.018, 0, 0);
+    rightWing.userData.isRuntimeOnly = true;
+    mothGroup.add(rightWing);
+
+    this._group.add(mothGroup);
+
+    this._moths.push({
+      group: mothGroup,
+      leftWing, rightWing,
+      hp: MOTH_MAX_HP,
+      timeOffset: Math.random() * Math.PI * 2,
+      vx: 0, vy: 0, vz: 0,
+      postHitSlowTimer: 0,
+      isDead: false,
+    });
+  };
+
+  this._spawnShot = function (origin, dir) {
+    const mesh = new THREE.Mesh(this._shotGeo, this._shotMat);
+    mesh.userData.isRuntimeOnly = true;
+    mesh.position.copy(origin);
+    this._group.add(mesh);
+    this._shots.push({ mesh, vx: dir.x * SHOT_SPEED, vy: dir.y * SHOT_SPEED, vz: dir.z * SHOT_SPEED, age: 0 });
+  };
+
+  this._tickMoth = function (dt, moth, plane) {
+    if (moth.isDead) return;
+    const flapPhase = Math.sin(this._time * WING_SPEED + moth.timeOffset);
+    moth.leftWing.rotation.y = -0.5 + flapPhase * 0.7;
+    moth.rightWing.rotation.y = 0.5 - flapPhase * 0.7;
+
+    // Jitter velocity.
+    const slowK = moth.postHitSlowTimer > 0 ? MOTH_POST_HIT_SLOW_MULT : 1;
+    if (moth.postHitSlowTimer > 0) moth.postHitSlowTimer = Math.max(0, moth.postHitSlowTimer - dt);
+    const jx = (Math.random() - 0.5) * JITTER_AMP * dt * (0.35 + 0.65 * slowK);
+    const jy = (Math.random() - 0.5) * JITTER_AMP * dt * (0.35 + 0.65 * slowK);
+    const jz = (Math.random() - 0.5) * JITTER_AMP * dt * (0.35 + 0.65 * slowK);
+    moth.vx += jx; moth.vy += jy; moth.vz += jz;
+
+    // Navigate toward flame.
+    const dx = plane.flamePos.x - moth.group.position.x;
+    const dy = plane.flamePos.y - moth.group.position.y;
+    const dz = plane.flamePos.z - moth.group.position.z;
+    const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (len > 1e-4) {
+      const nx = dx / len, ny = dy / len, nz = dz / len;
+      const target = FLIGHT_SPEED * slowK;
+      const turn = Math.min(1, TURN_SPEED * dt);
+      moth.vx += (nx * target - moth.vx) * turn;
+      moth.vy += (ny * target - moth.vy) * turn;
+      moth.vz += (nz * target - moth.vz) * turn;
+    }
+    moth.group.position.x += moth.vx * dt;
+    moth.group.position.y += moth.vy * dt;
+    moth.group.position.z += moth.vz * dt;
+
+    // Face direction.
+    if (Math.abs(moth.vx) + Math.abs(moth.vy) + Math.abs(moth.vz) > 1e-4) {
+      moth.group.lookAt(
+        moth.group.position.x + moth.vx,
+        moth.group.position.y + moth.vy,
+        moth.group.position.z + moth.vz,
+      );
+    }
+
+    // Shield contact?
+    if (len < SHIELD_CONTACT_RADIUS) {
+      moth.isDead = true;
+      this.erth.store.set("tinyskies/damageShield", 1);
+      this._log("moth hit shield");
+    }
+  };
+
+  this._tickShots = function (dt) {
+    for (let i = this._shots.length - 1; i >= 0; i--) {
+      const s = this._shots[i];
+      s.age += dt;
+      if (s.age > SHOT_LIFETIME) {
+        this._group.remove(s.mesh);
+        this._shots.splice(i, 1);
+        continue;
+      }
+      s.mesh.position.x += s.vx * dt;
+      s.mesh.position.y += s.vy * dt;
+      s.mesh.position.z += s.vz * dt;
+
+      // Hit check.
+      let hit = false;
+      for (const moth of this._moths) {
+        if (moth.isDead) continue;
+        const dx = s.mesh.position.x - moth.group.position.x;
+        const dy = s.mesh.position.y - moth.group.position.y;
+        const dz = s.mesh.position.z - moth.group.position.z;
+        const distSq = dx * dx + dy * dy + dz * dz;
+        const r = SHOT_HIT_RADIUS + MOTH_HIT_RADIUS;
+        if (distSq < r * r) {
+          moth.hp -= 1;
+          moth.postHitSlowTimer = MOTH_POST_HIT_SLOW_SEC;
+          if (moth.hp <= 0) moth.isDead = true;
+          hit = true;
+          break;
+        }
+      }
+      if (hit) {
+        this._group.remove(s.mesh);
+        this._shots.splice(i, 1);
+      }
+    }
+  };
+
+  this._tickCapybara = function (plane) {
+    if (!this.getAttribute("capybaraEnabled")) {
+      this._capybara.visible = false;
+      return;
+    }
+    // Place capybara at flame, slightly below + facing nearest moth.
+    this._capybara.visible = true;
+    this._capybara.position.set(
+      plane.flamePos.x - plane.up.x * 0.5,
+      plane.flamePos.y - plane.up.y * 0.5,
+      plane.flamePos.z - plane.up.z * 0.5,
+    );
+
+    // Find nearest live moth.
+    let nearest = null;
+    let nearestSq = Infinity;
+    const cx = this._capybara.position.x, cy = this._capybara.position.y, cz = this._capybara.position.z;
+    for (const m of this._moths) {
+      if (m.isDead) continue;
+      const dx = m.group.position.x - cx;
+      const dy = m.group.position.y - cy;
+      const dz = m.group.position.z - cz;
+      const d = dx * dx + dy * dy + dz * dz;
+      if (d < nearestSq) { nearestSq = d; nearest = m; }
+    }
+    if (!nearest) return;
+
+    // Cooldown check.
+    const now = Date.now();
+    const cooldown = this.getAttribute("capybaraCooldownMs");
+    if (now - this._lastCapybaraShotMs < cooldown) return;
+    this._lastCapybaraShotMs = now;
+
+    const dx = nearest.group.position.x - cx;
+    const dy = nearest.group.position.y - cy;
+    const dz = nearest.group.position.z - cz;
+    const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (len < 1e-4) return;
+    this._tmpV.set(dx / len, dy / len, dz / len);
+    this._tmpV2.set(cx, cy, cz);
+    this._spawnShot(this._tmpV2, this._tmpV);
+    this._log("capybara fires at moth");
+  };
+
+  this._cleanupDead = function () {
+    for (let i = this._moths.length - 1; i >= 0; i--) {
+      if (this._moths[i].isDead) {
+        this._group.remove(this._moths[i].group);
+        this._moths.splice(i, 1);
+      }
+    }
+  };
+
+  this._reset = function () {
+    for (const moth of this._moths) {
+      this._group.remove(moth.group);
+    }
+    this._moths.length = 0;
+    for (const s of this._shots) {
+      this._group.remove(s.mesh);
+    }
+    this._shots.length = 0;
+    this._spawnTimer = 1.5;
+    this._lastCapybaraShotMs = 0;
+  };
+
+  this.update = function (deltaTime) {
+    if (!this._group) return;
+    const dt = Math.min(deltaTime || 0, 0.1);
+    this._time += dt;
+
+    const inVoid = this.erth.store.get("tinyskies/inVoid") === true;
+    if (!inVoid) {
+      if (this._group.visible) {
+        this._group.visible = false;
+        this._reset();
+      }
+      return;
+    }
+    if (!this._group.visible) this._group.visible = true;
+
+    const plane = this._readVoidPlane();
+    if (!plane) return;
+
+    // Spawn loop.
+    this._spawnTimer -= dt;
+    const aliveCount = this._moths.length;
+    const cap = this.getAttribute("maxConcurrent");
+    if (this._spawnTimer <= 0 && aliveCount < cap) {
+      this._spawnMoth(plane);
+      const minI = this.getAttribute("spawnIntervalMin");
+      const maxI = this.getAttribute("spawnIntervalMax");
+      this._spawnTimer = minI + Math.random() * (maxI - minI);
+    }
+
+    // Tick moths.
+    for (const moth of this._moths) {
+      this._tickMoth(dt, moth, plane);
+    }
+
+    this._tickShots(dt);
+    this._tickCapybara(plane);
+    this._cleanupDead();
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    if (this._mothBodyGeo && typeof this._mothBodyGeo.dispose === "function") this._mothBodyGeo.dispose();
+    if (this._mothWingGeo && typeof this._mothWingGeo.dispose === "function") this._mothWingGeo.dispose();
+    if (this._mothBodyMat && typeof this._mothBodyMat.dispose === "function") this._mothBodyMat.dispose();
+    if (this._mothWingMat && typeof this._mothWingMat.dispose === "function") this._mothWingMat.dispose();
+    if (this._shotGeo && typeof this._shotGeo.dispose === "function") this._shotGeo.dispose();
+    if (this._shotMat && typeof this._shotMat.dispose === "function") this._shotMat.dispose();
+    if (this._capybaraGeo && typeof this._capybaraGeo.dispose === "function") this._capybaraGeo.dispose();
+    if (this._capybaraMat && typeof this._capybaraMat.dispose === "function") this._capybaraMat.dispose();
+    if (this._group && this._group.parent) this._group.parent.remove(this._group);
+    this._group = null;
+    this._moths = null;
+    this._shots = null;
+  };

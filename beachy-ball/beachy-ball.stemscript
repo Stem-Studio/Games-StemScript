@@ -1,0 +1,122 @@
+# Beachy Beachy Ball — StemStudio Conversion
+# Source: https://github.com/michaelkolesidis/beachy-beachy-ball
+# A beach ball obstacle course — roll past spinning, sliding, and limbo
+# obstacles to reach the star at the end!
+
+# Set project title
+project title "Beachy Beachy Ball"
+
+# ── Import assets ──────────────────────────────────────────────
+import model name="Star" filepath="models/star.glb" comment="Goal star at end of course"
+import image name="BeachBallTexture" filepath="textures/beach_ball_texture.png" comment="Beach ball texture map"
+import audio name="BackgroundMusic" filepath="audio/background.mp3" comment="Background music loop"
+import audio name="SuccessSound" filepath="audio/success.mp3" comment="Level completion jingle"
+
+# ── Import behaviors ───────────────────────────────────────────
+import behavior name="BallController" filepath="behaviors/bbBallController.yaml" comment="Ball movement, camera, game state"
+import behavior name="ObstacleAnimator" filepath="behaviors/bbObstacleAnimator.yaml" comment="Kinematic obstacle animation"
+import behavior name="HUD" filepath="behaviors/bbHud.yaml" comment="Timer and game state display"
+
+# ── Scene settings ─────────────────────────────────────────────
+scene background type=Color color=#00bfff
+game settings enabled=true showHUD=false
+render settings useShadows=true
+
+# ── Lighting (source: Lights.jsx) ──────────────────────────────
+light "AmbientLight" intensity=0.5
+light "Directional Light" intensity=1.5 castShadow=true shadowMapSize=512
+update "Directional Light" position=4,4,1
+delete "HemisphereLight"
+
+# ── Course platform ────────────────────────────────────────────
+# One long orange box covers the entire Copacabana course (22 segments × 4 units)
+# Top surface at y=0, matching source ground collider
+add box name="Platform" position=0,-0.15,-42 scale=4.2,0.3,88
+material Platform color=#FFA500
+physics enable Platform
+physics set Platform config={shape:"box",mass:0,ctype:"static",friction:1,restitution:0.2}
+
+# ── Player (beach ball) ───────────────────────────────────────
+# Sphere radius 0.3 (scale 0.3 on default radius-1 sphere)
+add sphere name="Player" position=0,1,0 scale=0.3,0.3,0.3
+update Player tag=Player
+physics enable Player
+physics set Player config={shape:"sphere",mass:1,ctype:"dynamic",friction:1,restitution:0.2,rollingFriction:0.1}
+
+# ── Star (end goal) ───────────────────────────────────────────
+# Position at end of course, rotated 90° on Y (source: Star.jsx)
+update Star position=0,1.05,-84 scale=0.012,0.012,0.012 rotation=0,1.5708,0
+
+# ── Obstacles — Copacabana level layout ───────────────────────
+# Source: Levels.jsx — 19 blocks with 6 obstacle segments
+
+# Block 3 (z=-12): Spinner — rotating bar
+add box name="Spinner1" position=0,0.4,-12 scale=4.5,0.3,0.3
+material Spinner1 color=#FF6347
+physics enable Spinner1
+physics set Spinner1 config={shape:"box",mass:0,ctype:"kinematic",friction:0,restitution:0.2}
+behavior attach Spinner1 behaviorId=bb.obstacleAnimator config={animationType:"spinner",speed:1.5}
+
+# Block 6 (z=-24): Sliding Wall — wall sweeping left/right
+add box name="SliderWall1" position=0,0.75,-24 scale=1.7,1.8,0.3
+material SliderWall1 color=#FF6347
+physics enable SliderWall1
+physics set SliderWall1 config={shape:"box",mass:0,ctype:"kinematic",friction:0,restitution:0.2}
+behavior attach SliderWall1 behaviorId=bb.obstacleAnimator config={animationType:"slider",frequency:1.5,amplitude:1.25,baseOffset:0}
+
+# Block 9 (z=-36): Limbo — bar moving up/down
+add box name="Limbo1" position=0,1.3,-36 scale=4,0.3,0.3
+material Limbo1 color=#FF6347
+physics enable Limbo1
+physics set Limbo1 config={shape:"box",mass:0,ctype:"kinematic",friction:0,restitution:0.2}
+behavior attach Limbo1 behaviorId=bb.obstacleAnimator config={animationType:"limbo",frequency:1.5,amplitude:1,baseOffset:1.3}
+
+# Block 12 (z=-48): Double Spinner — two counter-rotating bars
+add box name="DblSpinner1" position=1.05,0.4,-48 scale=2.25,0.3,0.3
+material DblSpinner1 color=#FF6347
+physics enable DblSpinner1
+physics set DblSpinner1 config={shape:"box",mass:0,ctype:"kinematic",friction:0,restitution:0.2}
+behavior attach DblSpinner1 behaviorId=bb.obstacleAnimator config={animationType:"spinner",speed:2}
+
+add box name="DblSpinner2" position=-1.05,0.4,-48 scale=1.8,0.3,0.3
+material DblSpinner2 color=#FF6347
+physics enable DblSpinner2
+physics set DblSpinner2 config={shape:"box",mass:0,ctype:"kinematic",friction:0,restitution:0.2}
+behavior attach DblSpinner2 behaviorId=bb.obstacleAnimator config={animationType:"spinner",speed:-2}
+
+# Block 15 (z=-60): Double Limbo — two bars oscillating inversely
+add box name="DblLimbo1" position=0,1.5,-60 scale=4,0.3,0.3
+material DblLimbo1 color=#FF6347
+physics enable DblLimbo1
+physics set DblLimbo1 config={shape:"box",mass:0,ctype:"kinematic",friction:0,restitution:0.2}
+behavior attach DblLimbo1 behaviorId=bb.obstacleAnimator config={animationType:"limbo",frequency:1.5,amplitude:0.3,baseOffset:1.5}
+
+add box name="DblLimbo2" position=0,0.5,-60 scale=4,0.3,0.3
+material DblLimbo2 color=#FF6347
+physics enable DblLimbo2
+physics set DblLimbo2 config={shape:"box",mass:0,ctype:"kinematic",friction:0,restitution:0.2}
+behavior attach DblLimbo2 behaviorId=bb.obstacleAnimator config={animationType:"limbo",frequency:1.5,amplitude:-0.3,baseOffset:0.5}
+
+# Block 18 (z=-72): Double Sliding Wall — two walls closing in
+add box name="DblSlider1" position=1,0.75,-72 scale=1,1.8,0.3
+material DblSlider1 color=#FF6347
+physics enable DblSlider1
+physics set DblSlider1 config={shape:"box",mass:0,ctype:"kinematic",friction:0,restitution:0.2}
+behavior attach DblSlider1 behaviorId=bb.obstacleAnimator config={animationType:"slider",frequency:2,amplitude:0.5,baseOffset:1}
+
+add box name="DblSlider2" position=-1,0.75,-72 scale=1,1.8,0.3
+material DblSlider2 color=#FF6347
+physics enable DblSlider2
+physics set DblSlider2 config={shape:"box",mass:0,ctype:"kinematic",friction:0,restitution:0.2}
+behavior attach DblSlider2 behaviorId=bb.obstacleAnimator config={animationType:"slider",frequency:2,amplitude:-0.5,baseOffset:-1}
+
+# ── Camera ─────────────────────────────────────────────────────
+# Disable built-in camera; custom chase camera in ball controller
+camera "DefaultCamera" cameraType=NONE fov=45 near=0.01 far=200
+
+# ── Attach main behaviors ─────────────────────────────────────
+behavior attach Player behaviorId=bb.ballController config={ballTexture:BeachBallTexture}
+behavior attach "Default Scene" behaviorId=bb.hud config={}
+
+# ── Touch controls (Platformer: Joystick + Jump) ──────────────
+behavior attach "Default Scene" behaviorId=touchControls config={mobileEnabled:true,tabletEnabled:true,desktopEnabled:false,mobileHorizontalLayout:{joystick:{joystickEnabled:true,joystickPosition:[0.15,0.2],joystickSize:120,joystickDeadzone:0.1,joystickRunThreshold:0.7},buttons:[{buttonId:"jumpBtn",buttonType:"jump",buttonEnabled:true,buttonPosition:[0.85,0.2],buttonSize:70}]},mobileVerticalLayout:{joystick:{joystickEnabled:true,joystickPosition:[0.15,0.12],joystickSize:100,joystickDeadzone:0.1,joystickRunThreshold:0.7},buttons:[{buttonId:"jumpBtn",buttonType:"jump",buttonEnabled:true,buttonPosition:[0.85,0.12],buttonSize:60}]},tabletHorizontalLayout:{joystick:{joystickEnabled:true,joystickPosition:[0.12,0.2],joystickSize:140,joystickDeadzone:0.08,joystickRunThreshold:0.7},buttons:[{buttonId:"jumpBtn",buttonType:"jump",buttonEnabled:true,buttonPosition:[0.88,0.2],buttonSize:80}]}}

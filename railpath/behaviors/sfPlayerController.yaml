@@ -1,0 +1,477 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "SF Player Controller"
+  id: "sf.playerController"
+  author: "starfox"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Rail shooter player controller: constrained XY movement, camera
+    follow, barrel roll, viewfinder crosshairs, and engine glow."
+  tags:
+    - gameplay
+  priority: 0
+  attributes:
+    moveSpeed:
+      name: "Move Speed"
+      type: "number"
+      default: 18
+    doubleTapMs:
+      name: "Barrel Roll Double-Tap (ms)"
+      type: "number"
+      default: 200
+    arwingModel:
+      name: "Arwing Model"
+      type: "modelAsset"
+      description: "Player ship model (Arwing). If not set, falls back to first child
+        group/mesh."
+    viewfinderTexture:
+      name: "Viewfinder Texture"
+      type: "imageAsset"
+      description: "Crosshair/viewfinder alpha-map sprite. If not set, uses plain
+        emissive material."
+  inputs:
+    sf_Up:    { action: true, bindings: [{ keyboard: ArrowUp }, { keyboard: KeyW }] }
+    sf_Down:  { action: true, bindings: [{ keyboard: ArrowDown }, { keyboard: KeyS }] }
+    sf_Left:  { action: true, bindings: [{ keyboard: ArrowLeft }, { keyboard: KeyA }] }
+    sf_Right: { action: true, bindings: [{ keyboard: ArrowRight }, { keyboard: KeyD }] }
+    sf_Shoot: { action: true, bindings: [{ keyboard: KeyE }, { keyboard: KeyF }] }
+    sf_Boost: { action: true, bindings: [{ keyboard: Space }] }
+  documentation: "Rail shooter player controller: constrained XY movement, camera follow,
+    barrel roll, viewfinder crosshairs, and engine glow. Configure attributes in
+    the editor to tune gameplay behavior."
+
+code: |
+  // SF Player Controller — movement, camera, barrel roll, visuals
+  // Source: PlayerController.jsx + Arwing.jsx from Starfox-railpath-2.0
+
+  let game;
+
+  // Pre-allocated vectors for hot-path reuse
+  const _rollAxis = new THREE.Vector3(0, 0, 1);
+  const _tmpVec = new THREE.Vector3();
+
+  function markRuntimeOnly(obj) {
+    if (!obj) return;
+    obj.userData = obj.userData || {};
+    obj.userData.isRuntimeOnly = true;
+    for (let i = 0; i < obj.children.length; i++) {
+      markRuntimeOnly(obj.children[i]);
+    }
+  }
+
+  this._setupCommonState = function() {
+    if (this._commonStateReady) return;
+    this._commonStateReady = true;
+
+    this.lookAtPos = { x: 0, y: 0 };
+    const moveSpeedAttr = this.getAttribute('moveSpeed');
+    this.moveFactor = moveSpeedAttr == null ? 18 : moveSpeedAttr;
+
+    this.lastKeyPress = { left: 0, right: 0 };
+    this.prevKeyState = { left: false, right: false };
+    this.rollState = { direction: null, elapsed: 0 };
+    this.rollDuration = 0.6;
+    const doubleTapAttr = this.getAttribute('doubleTapMs');
+    this.doubleTapMs = doubleTapAttr == null ? 200 : doubleTapAttr;
+
+    this.modelBaseQ = new THREE.Quaternion().setFromAxisAngle(
+      new THREE.Vector3(0, 1, 0), -Math.PI / 2
+    );
+
+    this.arwing = null;
+    this._loadedArwingFromAttr = false;
+    this._parentPos = new THREE.Vector3();
+    this._parentQuat = new THREE.Quaternion();
+    this._camOffset = new THREE.Vector3();
+    this._camTarget = new THREE.Vector3();
+    this._rollQ = new THREE.Quaternion();
+    this._modelQuat = new THREE.Quaternion();
+    this._cameraWorldPos = new THREE.Vector3();
+    this._clock = 0;
+  };
+
+  this._loadArwingReference = function() {
+    if (!this.gameObject) return;
+    const arwingAttr = this.getAttribute("arwingModel");
+    if (arwingAttr) {
+      this.erth.asset.model.createInstance(arwingAttr).then((model) => {
+        if (!model) return;
+        let loadedTarget = model && model.target ? model.target : model;
+        if (!loadedTarget || this.arwing) return;
+        this.arwing = loadedTarget;
+        this._loadedArwingFromAttr = true;
+        this.arwing.name = 'Arwing';
+        markRuntimeOnly(this.arwing);
+        this.gameObject._internal.three.add(this.arwing);
+        this.arwing.quaternion.copy(this.modelBaseQ);
+      });
+      return;
+    }
+
+    const obj = this.gameObject._internal.three;
+    for (let i = 0; i < obj.children.length; i++) {
+      const child = obj.children[i];
+      if (child.name === 'Arwing' || child.type === 'Group' || child.type === 'Mesh') {
+        this.arwing = child;
+        break;
+      }
+    }
+    if (this.arwing) {
+      this.arwing.quaternion.copy(this.modelBaseQ);
+    }
+  };
+
+  this._cleanupLoadedArwing = function() {
+    if (!this.gameObject) return;
+    const obj = this.gameObject._internal.three;
+    if (this._loadedArwingFromAttr && this.arwing && this.arwing.parent === obj) {
+      obj.remove(this.arwing);
+    }
+    this.arwing = null;
+    this._loadedArwingFromAttr = false;
+  };
+
+  this._cleanupVisuals = function() {
+    if (!this.gameObject) return;
+    const obj = this.gameObject._internal.three;
+    if (this._viewfinderNear) {
+      obj.remove(this._viewfinderNear);
+      this._viewfinderNear.geometry.dispose();
+      this._viewfinderNear.material.dispose();
+      this._viewfinderNear = null;
+    }
+    if (this._viewfinderFar) {
+      obj.remove(this._viewfinderFar);
+      this._viewfinderFar.geometry.dispose();
+      this._viewfinderFar.material.dispose();
+      this._viewfinderFar = null;
+    }
+    if (this._viewfinderTexture) {
+      this._viewfinderTexture.dispose();
+      this._viewfinderTexture = null;
+    }
+    if (this._glowMesh) {
+      obj.remove(this._glowMesh);
+      this._glowMesh.geometry.dispose();
+      this._glowMesh.material.dispose();
+      this._glowMesh = null;
+    }
+    this._glowMat = null;
+  };
+
+  this.init = function(_game) {
+      game = _game;
+    this._setupCommonState();
+
+    // --- Input state — polled per-frame via InputManager ---
+    this.keys = { up: false, down: false, left: false, right: false, shoot: false, boost: false };
+
+    // --- Arwing model reference ---
+    this._loadArwingReference();
+
+    // --- Create viewfinder crosshairs ---
+    this._createViewfinder();
+    // --- Create engine glow ---
+    this._createEngineGlow();
+
+    // Share shoot state via erth.store for the laser system
+    this.erth.store.set('sf.shoot', false);
+  };
+
+  // --- Viewfinder crosshair meshes ---
+  this._createViewfinder = function() {
+    if (!this.gameObject) return;
+    if (this._viewfinderNear || this._viewfinderFar) return;
+    const viewfinderMat = new THREE.MeshStandardNodeMaterial({
+      emissive: 0x20fa5a,
+      emissiveIntensity: 4,
+      transparent: true,
+      depthWrite: false,
+      depthTest: false,
+      opacity: 0.7,
+      side: THREE.DoubleSide
+    });
+
+    // Apply viewfinder alpha-map texture if attribute is set
+    const texAttr = this.getAttribute("viewfinderTexture");
+    if (texAttr) {
+      this.erth.asset.image.createTexture(texAttr).then((texture) => {
+        this._viewfinderTexture = texture;
+        viewfinderMat.alphaMap = texture;
+        viewfinderMat.needsUpdate = true;
+        // Also apply to the far crosshair clone
+        if (this._viewfinderFar) {
+          this._viewfinderFar.material.alphaMap = texture;
+          this._viewfinderFar.material.needsUpdate = true;
+        }
+      });
+    }
+
+    // Near crosshair at z = -6 (6 units forward in -Z = forward direction)
+    const nearGeo = new THREE.PlaneGeometry(1.5, 1.5);
+    const nearMesh = new THREE.Mesh(nearGeo, viewfinderMat);
+    nearMesh.position.set(0, 0, -6);
+    nearMesh.name = 'ViewfinderNear';
+    markRuntimeOnly(nearMesh);
+    const obj = this.gameObject._internal.three;
+    obj.add(nearMesh);
+    this._viewfinderNear = nearMesh;
+
+    // Far crosshair at z = -15
+    const farGeo = new THREE.PlaneGeometry(1.2, 1.2);
+    const farMesh = new THREE.Mesh(farGeo, viewfinderMat.clone());
+    farMesh.position.set(0, 0, -15);
+    farMesh.name = 'ViewfinderFar';
+    markRuntimeOnly(farMesh);
+    obj.add(farMesh);
+    this._viewfinderFar = farMesh;
+
+    this._viewfinderMat = viewfinderMat;
+  };
+
+  // --- Engine glow TSL NodeMaterial billboard ---
+  this._createEngineGlow = function() {
+    if (!this.gameObject) return;
+    if (this._glowMesh) return;
+    const { Fn, uniform, uv, vec2, vec3, vec4, float, sin, mul, add, sub, smoothstep, length, positionLocal } = THREE.TSL;
+
+    const uGlowTime = uniform(0);
+
+    // Vertex scale pulsation via positionNode
+    const glowPositionNode = Fn(() => {
+      const scale = add(1.0, mul(0.1, sin(mul(uGlowTime, 99.0))));
+      return mul(positionLocal, scale);
+    })();
+
+    // Fragment: radial gradient from center with pink-purple color
+    const glowColorNode = Fn(() => {
+      const lightColor = vec3(0.937, 0.2, 1.0);
+      const center = vec2(0.5, 0.5);
+      const dist = length(sub(uv(), center));
+      const fade = smoothstep(0.5, 0.2, dist);
+      return vec4(mul(lightColor, mul(6.0, fade)), mul(fade, 0.9));
+    })();
+
+    const glowMat = new THREE.MeshBasicNodeMaterial({
+      transparent: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      positionNode: glowPositionNode,
+      colorNode: glowColorNode
+    });
+    glowMat._uGlowTime = uGlowTime;
+
+    const glowGeo = new THREE.PlaneGeometry(0.6, 0.6);
+    const glowMesh = new THREE.Mesh(glowGeo, glowMat);
+    // Engine position: behind the ship (source: [0, 0, 2.7] in playerRef space)
+    // In our frame -Z = forward, so engine exhaust is at +Z (behind)
+    glowMesh.position.set(0, 0, 2.7);
+    glowMesh.name = 'EngineGlow';
+    markRuntimeOnly(glowMesh);
+    this.gameObject._internal.three.add(glowMesh);
+    this._glowMesh = glowMesh;
+    this._glowMat = glowMat;
+    this._clock = 0;
+  };
+
+  this._updatePreviewVisuals = function(dt, camera) {
+    if (this.arwing) {
+      this.arwing.quaternion.copy(this.modelBaseQ);
+    }
+    if (camera && this._viewfinderNear && this._viewfinderFar) {
+      camera.getWorldPosition(this._cameraWorldPos);
+      this._viewfinderNear.lookAt(this._cameraWorldPos);
+      this._viewfinderFar.lookAt(this._cameraWorldPos);
+    }
+    if (this._glowMat) {
+      this._clock += dt;
+      this._glowMat._uGlowTime.value = this._clock;
+      if (camera && this._glowMesh) {
+        camera.getWorldPosition(this._cameraWorldPos);
+        this._glowMesh.lookAt(this._cameraWorldPos);
+      }
+    }
+  };
+
+  function ensureEditorPreview(owner, editor) {
+    owner._editorCamera = editor.camera;
+    owner._setupCommonState();
+    owner._loadArwingReference();
+    owner._createViewfinder();
+    owner._createEngineGlow();
+    owner._updatePreviewVisuals(0, editor.camera);
+  }
+
+  function refreshEditorPreview(owner) {
+    owner._updatePreviewVisuals(0.016, owner._editorCamera);
+  }
+
+  function rebuildEditorPreview(owner) {
+    owner._cleanupVisuals();
+    owner._cleanupLoadedArwing();
+    owner._setupCommonState();
+    owner._loadArwingReference();
+    owner._createViewfinder();
+    owner._createEngineGlow();
+    owner._updatePreviewVisuals(0, owner._editorCamera);
+  }
+
+  function disposeEditorPreview(owner) {
+    owner._cleanupVisuals();
+    owner._cleanupLoadedArwing();
+  }
+
+  this.onEditorAdded = function(editor) {
+    ensureEditorPreview(this, editor);
+  };
+
+  this.onEditorUpdate = function() {
+    refreshEditorPreview(this);
+  };
+
+  this.onEditorAttributesUpdated = function() {
+    rebuildEditorPreview(this);
+  };
+
+  this.onEditorDispose = function() {
+    disposeEditorPreview(this);
+  };
+
+  // --- Easing function for barrel roll (approximates GSAP power3.out) ---
+  this._easeOutCubic = function(t) {
+    return 1 - Math.pow(1 - t, 3);
+  };
+
+  this.update = function(dt) {
+    const clamp = THREE.MathUtils.clamp;
+    const damp = THREE.MathUtils.damp;
+    const obj = this.gameObject._internal.three;
+
+    // Poll keys via InputManager
+    const im = game && game.inputManager;
+    if (im) {
+      this.keys.up    = !!im.getAction('sf_Up');
+      this.keys.down  = !!im.getAction('sf_Down');
+      this.keys.left  = !!im.getAction('sf_Left');
+      this.keys.right = !!im.getAction('sf_Right');
+      this.keys.shoot = !!im.getAction('sf_Shoot');
+      this.keys.boost = !!im.getAction('sf_Boost');
+    }
+
+    // --- 1. Player movement ---
+    const moveX = (Number(this.keys.right) - Number(this.keys.left)) * dt * this.moveFactor;
+    const moveY = (Number(this.keys.up) - Number(this.keys.down)) * dt * this.moveFactor;
+
+    this.lookAtPos.x = clamp(this.lookAtPos.x + moveX, -15, 15);
+    this.lookAtPos.y = clamp(this.lookAtPos.y + moveY, -12, 15);
+
+    // Ship position damps toward lookAt target
+    obj.position.x = damp(obj.position.x, this.lookAtPos.x, 3, dt);
+    obj.position.y = damp(obj.position.y, this.lookAtPos.y, 3, dt);
+
+    // --- 2. Ship tilt from movement lag ---
+    const distX = obj.position.x - this.lookAtPos.x;
+    const angleX = Math.atan2(distX, 6);
+    const distY = obj.position.y - this.lookAtPos.y;
+    const angleY = Math.atan2(distY, 6);
+
+    obj.rotation.x = damp(obj.rotation.x, -angleY, 9, dt);
+    obj.rotation.y = damp(obj.rotation.y, angleX, 9, dt);
+    obj.rotation.z = damp(obj.rotation.z, angleX, 9, dt);
+
+    // --- 3. Barrel roll detection (double-tap left/right) ---
+    const now = performance.now();
+    if (!this.rollState.direction) {
+      if (this.keys.left && !this.prevKeyState.left) {
+        if (now - this.lastKeyPress.left < this.doubleTapMs) {
+          this.rollState.direction = 'left';
+          this.rollState.elapsed = 0;
+        }
+        this.lastKeyPress.left = now;
+      }
+      if (this.keys.right && !this.prevKeyState.right) {
+        if (now - this.lastKeyPress.right < this.doubleTapMs) {
+          this.rollState.direction = 'right';
+          this.rollState.elapsed = 0;
+        }
+        this.lastKeyPress.right = now;
+      }
+    }
+    this.prevKeyState.left = this.keys.left;
+    this.prevKeyState.right = this.keys.right;
+
+    // --- 4. Barrel roll animation ---
+    let rollAngle = 0;
+    if (this.rollState.direction) {
+      this.rollState.elapsed += dt;
+      let t = clamp(this.rollState.elapsed / this.rollDuration, 0, 1);
+      const eased = this._easeOutCubic(t);
+      const fullTurn = Math.PI * 2;
+      rollAngle = this.rollState.direction === 'left' ? eased * fullTurn : -eased * fullTurn;
+      if (t >= 1) {
+        this.rollState.direction = null;
+        this.rollState.elapsed = 0;
+        rollAngle = 0;
+      }
+    }
+
+    // Apply barrel roll + model base rotation to Arwing
+    if (this.arwing) {
+      this._rollQ.setFromAxisAngle(_rollAxis, rollAngle);
+      this._modelQuat.copy(this.modelBaseQ);
+      this.arwing.quaternion.copy(this._rollQ.multiply(this._modelQuat));
+    }
+
+    // --- 5. Camera control ---
+    const parent = obj.parent;
+    if (parent && game.camera) {
+      parent.getWorldPosition(this._parentPos);
+      parent.getWorldQuaternion(this._parentQuat);
+
+      // Camera offset in parent's local space:
+      // (clamped player XY offset, 15 units behind in +Z)
+      this._camOffset.set(
+        clamp(this.lookAtPos.x, -5, 5),
+        clamp(this.lookAtPos.y, -5, 5),
+        15
+      );
+      // Transform to world space
+      this._camTarget.copy(this._camOffset).applyQuaternion(this._parentQuat).add(this._parentPos);
+
+      // Smooth camera follow (source rate: 4)
+      game.camera.position.lerp(this._camTarget, Math.min(4 * dt, 1));
+      game.camera.quaternion.copy(this._parentQuat);
+      game.camera.updateProjectionMatrix();
+    }
+
+    // --- 6. Billboard viewfinders toward camera ---
+    if (this._viewfinderNear && game.camera) {
+      game.camera.getWorldPosition(_tmpVec);
+      this._viewfinderNear.lookAt(_tmpVec);
+      this._viewfinderFar.lookAt(_tmpVec);
+    }
+
+    // --- 7. Update engine glow ---
+    if (this._glowMat) {
+      this._clock += dt;
+      this._glowMat._uGlowTime.value = this._clock;
+      // Billboard the glow toward camera
+      if (game.camera) {
+        game.camera.getWorldPosition(_tmpVec);
+        this._glowMesh.lookAt(_tmpVec);
+      }
+    }
+
+    // --- 8. Share shoot state for laser system ---
+    this.erth.store.set('sf.shoot', this.keys.shoot);
+  };
+
+  this.dispose = function() {
+    this._cleanupVisuals();
+    this._cleanupLoadedArwing();
+  };

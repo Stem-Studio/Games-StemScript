@@ -1,0 +1,53 @@
+# Scene: Procedural Terrain — Infinite Flight Experience
+# Description: Zen fly-over with infinite procedural terrain, biome coloring,
+#              instanced trees, instanced clouds, GLTF airplane model,
+#              mouse/touch flight controls, and background music
+# Source: procedural-terrain-generation (Three.js + simplex-noise)
+
+project title "Procedural Terrain"
+
+# =============================================================================
+# Step 1: Import Assets
+# =============================================================================
+import audio name="EpicSoundtrack" filepath="audio/epic-soundtrack.mp3" comment="Background soundtrack for infinite flight experience"
+import model name="Airplane" filepath="models/airplane/scene.glb" comment="Low-poly airplane model for player vehicle"
+update "Airplane" objectSettings={gameVisibility:false}
+import image name="NormalMap" filepath="textures/normal.jpg" comment="Normal map texture for terrain, trees, and clouds"
+
+# =============================================================================
+# Step 2: Import Behaviors
+# =============================================================================
+import behavior name="TerrainManager" filepath="behaviors/ptgTerrainManager.yaml" comment="Infinite terrain chunks with biome colors, trees, and clouds"
+import behavior name="AirplaneController" filepath="behaviors/ptgAirplaneController.yaml" comment="GLTF airplane, mouse/touch flight, vapor trails, audio"
+import behavior name="CameraController" filepath="behaviors/ptgCameraController.yaml" comment="Follow camera with cursor side offset and start zoom"
+
+# =============================================================================
+# Step 3: Scene Settings (matching source: fog color #191362, linear fog 250-900)
+# =============================================================================
+scene background type=Color color=#191362
+scene lighting ambient={color:"#ffffff",intensity:1.5}
+scene lighting shadows={enabled:true}
+scene fog type=linear color=#191362 near=250 far=900
+light "Directional Light" intensity=6 castShadow=true
+update "Directional Light" position=1,1,1
+camera "DefaultCamera" fov=60 near=0.1 far=10000
+
+# =============================================================================
+# Step 4: Game Settings
+# =============================================================================
+game settings enabled=true showHUD=false
+
+# =============================================================================
+# Step 5: World (procedural terrain, instanced trees, instanced clouds)
+# =============================================================================
+add group name="World" position=0,0,0
+behavior attach World behaviorId=ptg.terrainManager config={normalTexture:"NormalMap"}
+
+# =============================================================================
+# Step 6: Player (GLTF airplane + flight controls + camera)
+# =============================================================================
+add group name="Player" position=0,60,0
+update Player tag=Player
+behavior attach Player behaviorId=ptg.airplaneController config={airplaneModel:"Airplane",soundtrack:"EpicSoundtrack"}
+camera "DefaultCamera" cameraType=NONE
+behavior attach Player behaviorId=ptg.cameraController

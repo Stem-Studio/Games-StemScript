@@ -1,0 +1,460 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  priority: 0
+  name: "FP3 Combat System"
+  id: "fp3.combatSystem"
+  author: "flight-sim"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Missiles, health, damage, kills/deaths, respawn"
+  tags:
+    - gameplay
+  attributes: {}
+  documentation: Handles missile firing, collision detection against players and balloons,
+    health with runway healing, death/respawn with wasted screen, crash detection,
+    and kill/death tracking. Reads flight state and input from store, writes combat
+    state back for HUD and multiplayer sync.
+
+code: |
+  let game;
+  // Procedural wasted sound (low drone + dissonant chord)
+  function playWastedSound() {
+    try {
+      let ctx = new AudioContext();
+      let now = ctx.currentTime;
+      let master = ctx.createGain();
+      master.gain.setValueAtTime(0.15, now);
+      if (Number.isFinite((now + 2.0))) master.gain.linearRampToValueAtTime(0, now + 2.0);
+      master.connect(ctx.destination);
+
+      // Low drone
+      let osc1 = ctx.createOscillator();
+      osc1.type = 'sawtooth';
+      osc1.frequency.value = 55;
+      osc1.connect(master);
+      osc1.start(now);
+      osc1.stop(now + 2.0);
+
+      // Dissonant minor second
+      let osc2 = ctx.createOscillator();
+      osc2.type = 'sawtooth';
+      osc2.frequency.value = 58;
+      let g2 = ctx.createGain();
+      g2.gain.value = 0.08;
+      osc2.connect(g2);
+      g2.connect(master);
+      osc2.start(now);
+      osc2.stop(now + 2.0);
+
+      // Cleanup
+      setTimeout(function() { ctx.close(); }, 2500);
+    } catch (e) { /* audio not available */ }
+  }
+
+  // --- Constants ---
+  let PROJECTILE_SPEED = 3;
+  let MISSILE_LIFETIME = 3;
+  let MAX_MISSILES = 10;
+  let FIRE_DELAY = 0.3;
+  let MAX_HEALTH = 100;
+  let GROUND_LEVEL = 10;
+  let SEA_LEVEL = 0;
+  let RUNWAY_SHOOT_DISTANCE = 100;
+  let PLAYER_HIT_RADIUS = 5;
+  let DAMAGE_PER_HIT = 25;
+  let HEAL_RATE = 1;
+  let CRASH_SPEED_THRESHOLD = 0.5;
+  let RESPAWN_FREEZE_TIME = 3;
+
+  // --- Pre-allocated vectors ---
+  let _missileDir = null;
+  let _toTarget = null;
+  let _spawnPos = null;
+  let _tmpVec = null;
+
+  // --- State ---
+  let missiles = [];
+  let missileGeomBody = null;
+  let missileGeomTip = null;
+  let missileMaterial = null;
+  let currentHealth = MAX_HEALTH;
+  let kills = 0;
+  let deaths = 0;
+  let balloonsHit = 0;
+  let lastFireTime = 0;
+  let isDead = false;
+  let deathTimer = 0;
+  let spawnPoint = null;
+  let allGeometries = [];
+  let allMaterials = [];
+
+  let CRASH_MESSAGES = [
+    "Lawn dart impression!",
+    "Terrain: 1, You: 0",
+    "Nice crater!",
+    "That's not a landing strip...",
+    "Gravity wins again!",
+    "Splashdown! (wrong vehicle)",
+    "Fish food!",
+    "Submarines need a hatch..."
+  ];
+
+  function createMissilePool() {
+    missileGeomBody = new THREE.CylinderGeometry(0.1, 0.1, 0.5, 8);
+    missileGeomTip = new THREE.ConeGeometry(0.1, 0.2, 8);
+    missileMaterial = new THREE.MeshStandardNodeMaterial({ color: 0xff0000, emissive: 0x660000 });
+    allGeometries.push(missileGeomBody, missileGeomTip);
+    allMaterials.push(missileMaterial);
+  }
+
+  function spawnMissile(position, direction, ownerVelocity, context) {
+    if (missiles.length >= MAX_MISSILES) {
+      removeMissile(missiles[0], context);
+    }
+
+    let group = new THREE.Group();
+    let body = new THREE.Mesh(missileGeomBody, missileMaterial);
+    body.rotation.x = Math.PI / 2;
+    group.add(body);
+
+    let tip = new THREE.Mesh(missileGeomTip, missileMaterial);
+    tip.position.z = -0.35;
+    tip.rotation.x = -Math.PI / 2;
+    group.add(tip);
+
+    group.position.copy(position);
+    group.lookAt(
+      position.x + direction.x,
+      position.y + direction.y,
+      position.z + direction.z
+    );
+    group.userData.isRuntimeOnly = true;
+
+    let velocity = direction.clone().multiplyScalar(PROJECTILE_SPEED);
+    if (ownerVelocity) {
+      velocity.add(ownerVelocity);
+    }
+
+    let missile = {
+      mesh: group,
+      velocity: velocity,
+      spawnTime: Date.now() / 1000,
+      ownerId: 'local'
+    };
+
+    game.scene.add(group); // @check-ok — transient runtime-only projectile
+    missiles.push(missile);
+
+    context.erth.store.set('fp3_missiles', missiles.map(function(m) {
+      return { x: m.mesh.position.x, y: m.mesh.position.y, z: m.mesh.position.z };
+    }));
+
+    return missile;
+  }
+
+  function removeMissile(missile, context) {
+    let idx = missiles.indexOf(missile);
+    if (idx !== -1) {
+      missiles.splice(idx, 1);
+    }
+    if (missile.mesh.parent) {
+      missile.mesh.parent.remove(missile.mesh);
+    }
+
+    context.erth.store.set('fp3_missiles', missiles.map(function(m) {
+      return { x: m.mesh.position.x, y: m.mesh.position.y, z: m.mesh.position.z };
+    }));
+  }
+
+  function checkMissileCollisions(context) {
+    let remotePlayers = context.erth.store.get('fp3_remotePlayers') || {};
+    let balloons = context.erth.store.get('fp3_balloons') || [];
+    let toRemove = [];
+
+    for (let i = 0; i < missiles.length; i++) {
+      let missile = missiles[i];
+      let mPos = missile.mesh.position;
+
+      // Check against remote players
+      let playerIds = Object.keys(remotePlayers);
+      for (let p = 0; p < playerIds.length; p++) {
+        let pid = playerIds[p];
+        let rp = remotePlayers[pid];
+        if (!rp || !rp.position) continue;
+
+        _toTarget.set(
+          rp.position.x - mPos.x,
+          rp.position.y - mPos.y,
+          rp.position.z - mPos.z
+        );
+        let dist = _toTarget.length();
+
+        if (dist < PLAYER_HIT_RADIUS) {
+          context.erth.store.set('fp3_hitPlayer', {
+            targetId: pid,
+            damage: DAMAGE_PER_HIT
+          });
+          context.erth.store.set('fp3_combatMessage', 'Hit ' + (rp.name || pid) + '!');
+          toRemove.push(missile);
+          break;
+        }
+      }
+
+      // Check against balloons
+      for (let b = 0; b < balloons.length; b++) {
+        let balloon = balloons[b];
+        if (!balloon || !balloon.position) continue;
+
+        _toTarget.set(
+          balloon.position.x - mPos.x,
+          balloon.position.y - mPos.y,
+          balloon.position.z - mPos.z
+        );
+        let bDist = _toTarget.length();
+        let bRadius = balloon.size || 3;
+
+        if (bDist < bRadius) {
+          balloon.destroyed = true;
+          balloonsHit++;
+          context.erth.store.set('fp3_balloonsHit', balloonsHit);
+          context.erth.store.set('fp3_balloons', balloons);
+          context.erth.store.set('fp3_combatMessage', 'Balloon popped!');
+          toRemove.push(missile);
+          break;
+        }
+      }
+    }
+
+    for (let r = 0; r < toRemove.length; r++) {
+      removeMissile(toRemove[r], context);
+    }
+  }
+
+  function handleDeath(context, message) {
+    if (isDead) return;
+    isDead = true;
+    deathTimer = RESPAWN_FREEZE_TIME;
+    deaths++;
+
+    let playerPos = context.gameObject._internal.three.position;
+
+    context.erth.store.set('fp3_createExplosion', {
+      x: playerPos.x,
+      y: playerPos.y,
+      z: playerPos.z
+    });
+    context.erth.store.set('fp3_showWasted', true);
+    context.erth.store.set('fp3_deaths', deaths);
+    context.erth.store.set('fp3_combatMessage', message || 'Wasted!');
+
+    // Play wasted sound (procedural)
+    playWastedSound();
+  }
+
+  function handleRespawn(context) {
+    isDead = false;
+    currentHealth = MAX_HEALTH;
+
+    context.erth.store.set('fp3_health', currentHealth);
+    context.erth.store.set('fp3_showWasted', false);
+
+    if (spawnPoint) {
+      let three = context.gameObject._internal.three;
+      three.position.copy(spawnPoint);
+    }
+  }
+
+  function checkCrash(context) {
+    let flightState = context.erth.store.get('fp3_flightState');
+    if (!flightState) return;
+
+    let pos = context.gameObject._internal.three.position;
+    let speed = flightState.speed || 0;
+
+    // Water crash
+    if (pos.y < SEA_LEVEL) {
+      let msg = CRASH_MESSAGES[Math.floor(Math.random() * 4) + 4];
+      handleDeath(context, msg);
+      return;
+    }
+
+    // Ground crash
+    if (flightState.isAirborne && speed > CRASH_SPEED_THRESHOLD) {
+      if (pos.y <= GROUND_LEVEL + 0.5) {
+        let msg2 = CRASH_MESSAGES[Math.floor(Math.random() * 4)];
+        handleDeath(context, msg2);
+      }
+    }
+  }
+
+  this.init = function(_game) {
+    game = _game;
+
+    _missileDir = new THREE.Vector3();
+    _toTarget = new THREE.Vector3();
+    _spawnPos = new THREE.Vector3();
+    _tmpVec = new THREE.Vector3();
+
+    createMissilePool();
+  };
+
+  this.onStart = function() {
+    spawnPoint = this.gameObject._internal.three.position.clone();
+
+    currentHealth = MAX_HEALTH;
+    this.erth.store.set('fp3_health', currentHealth);
+    this.erth.store.set('fp3_kills', kills);
+    this.erth.store.set('fp3_deaths', deaths);
+    this.erth.store.set('fp3_balloonsHit', balloonsHit);
+
+  };
+
+  this.update = function(delta) {
+    const dt = Math.min(delta, 0.1);
+    if (isDead) {
+      deathTimer -= delta;
+      if (deathTimer <= 0) {
+        handleRespawn(this);
+      }
+      return;
+    }
+
+    let flightState = this.erth.store.get('fp3_flightState') || {};
+    let playerPos = this.gameObject._internal.three.position;
+
+    // --- Healing near runway ---
+    if (playerPos.y <= GROUND_LEVEL + 1.5 && currentHealth < MAX_HEALTH) {
+      currentHealth = Math.min(MAX_HEALTH, currentHealth + HEAL_RATE);
+      this.erth.store.set('fp3_health', currentHealth);
+    }
+
+    // --- Firing ---
+    let shouldShoot = this.erth.store.get('fp3_shootMissile');
+    if (shouldShoot) {
+      this.erth.store.set('fp3_shootMissile', false);
+    }
+
+    let inputState = this.erth.store.get('fp3_inputState') || {};
+    if (shouldShoot || inputState.space) {
+      let now = Date.now() / 1000;
+      let distToRunway = Math.sqrt(
+        playerPos.x * playerPos.x + playerPos.z * playerPos.z
+      );
+
+      if (now - lastFireTime >= FIRE_DELAY && distToRunway > RUNWAY_SHOOT_DISTANCE) {
+        lastFireTime = now;
+
+        let vehicleName = this.erth.store.get('fp3_vehicleName') || 'cessna';
+        let three = this.gameObject._internal.three;
+
+        _spawnPos.copy(playerPos);
+
+        if (vehicleName === 'tank') {
+          _spawnPos.y += 2;
+          let vehicleParts = this.erth.store.get('fp3_vehicleParts') || {};
+          if (vehicleParts.turret) {
+            _missileDir.set(0, 0, -1);
+            _missileDir.applyQuaternion(vehicleParts.turret.quaternion || three.quaternion);
+          } else {
+            _missileDir.set(0, 0, -1);
+            _missileDir.applyQuaternion(three.quaternion);
+          }
+          spawnMissile(_spawnPos, _missileDir, null, this);
+        } else {
+          // Planes: forward direction + current velocity
+          _missileDir.set(0, 0, -1);
+          _missileDir.applyQuaternion(three.quaternion);
+
+          let ownerVel = null;
+          if (flightState.speed) {
+            ownerVel = _tmpVec.set(0, 0, -1)
+              .applyQuaternion(three.quaternion)
+              .multiplyScalar(flightState.speed);
+          }
+
+          spawnMissile(_spawnPos, _missileDir, ownerVel, this);
+        }
+      }
+    }
+
+    // --- Update missiles ---
+    let now2 = Date.now() / 1000;
+    let expiredMissiles = [];
+    for (let i = 0; i < missiles.length; i++) {
+      let m = missiles[i];
+      m.mesh.position.x += m.velocity.x * delta;
+      m.mesh.position.y += m.velocity.y * delta;
+      m.mesh.position.z += m.velocity.z * delta;
+
+      if (now2 - m.spawnTime > MISSILE_LIFETIME) {
+        expiredMissiles.push(m);
+      }
+    }
+    for (let e = 0; e < expiredMissiles.length; e++) {
+      removeMissile(expiredMissiles[e], this);
+    }
+
+    // --- Collision detection ---
+    checkMissileCollisions(this);
+
+    // --- Incoming damage (from multiplayer) ---
+    let incomingHit = this.erth.store.get('fp3_incomingHit');
+    if (incomingHit) {
+      currentHealth -= incomingHit.damage || DAMAGE_PER_HIT;
+      this.erth.store.set('fp3_incomingHit', null);
+      this.erth.store.set('fp3_health', currentHealth);
+
+      if (currentHealth <= 0) {
+        if (incomingHit.attackerId) {
+          this.erth.store.set('fp3_combatMessage',
+            'Killed by ' + (incomingHit.attackerName || incomingHit.attackerId));
+        }
+        handleDeath(this, 'Shot down!');
+      }
+    }
+
+    // --- Crash detection ---
+    checkCrash(this);
+
+    // --- Health check ---
+    if (currentHealth <= 0 && !isDead) {
+      handleDeath(this, 'Wasted!');
+    }
+  };
+
+  this.onEvent = function(eventName, data) {
+    if (eventName === 'fp3_kill_confirmed') {
+      kills++;
+      this.erth.store.set('fp3_kills', kills);
+      this.erth.store.set('fp3_combatMessage', 'Kill confirmed!');
+    }
+  };
+
+  this.onEditorAdded = function() {
+    // No editor preview geometry needed for combat system
+  };
+
+  this.onEditorDispose = function() {
+    // Nothing to clean up in editor
+  };
+
+  this.dispose = function() {
+    // Remove all active missiles from scene
+    for (let i = 0; i < missiles.length; i++) {
+      if (missiles[i].mesh.parent) {
+        missiles[i].mesh.parent.remove(missiles[i].mesh);
+      }
+    }
+    missiles = [];
+
+    // Dispose shared geometries and materials
+    allGeometries.forEach(function(g) { g.dispose(); });
+    allMaterials.forEach(function(m) { m.dispose(); });
+    allGeometries = [];
+    allMaterials = [];
+  };

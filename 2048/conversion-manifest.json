@@ -1,0 +1,32 @@
+{
+  "project": "2048",
+  "source": "https://github.com/gabrielecirulli/2048",
+  "convertedAt": "2026-03-30",
+  "converter": "script-wizard",
+  "files": {
+    "2048.stemscript": { "owner": "agent", "role": "entrypoint" },
+    "behaviors/game2048.yaml": { "owner": "agent", "role": "behavior" },
+    "README.md": { "owner": "agent", "role": "documentation" },
+    "conversion-plan.md": { "owner": "agent", "role": "artifact" },
+    "conversion-notes.md": { "owner": "agent", "role": "artifact" },
+    "conversion-manifest.json": { "owner": "agent", "role": "artifact" },
+    "source-map.md": { "owner": "agent", "role": "artifact" },
+    "source-analysis.json": { "owner": "agent", "role": "artifact" }
+  },
+  "behaviors": [
+    {
+      "id": "g2048.game",
+      "name": "2048 Game",
+      "file": "behaviors/game2048.yaml",
+      "attachedTo": "GameBoard",
+      "attributes": {
+        "gridSize": { "default": 4, "description": "Grid dimension (3-8)" },
+        "winTile": { "default": 2048, "description": "Target tile value to win" },
+        "spawnChance4": { "default": 0.1, "description": "Probability of spawning 4 vs 2" }
+      }
+    }
+  ],
+  "lambdas": [],
+  "assets": [],
+  "manualFollowups": []
+}

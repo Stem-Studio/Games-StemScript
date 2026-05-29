@@ -1,0 +1,138 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+config:
+  priority: 0
+  name: "FP3-Portals"
+  id: "fp3.portals"
+  author: "flight-sim"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Glowing portal ring with orbiting particle effects"
+  tags:
+    - gameplay
+  attributes: {}
+  documentation: "Creates a portal ring using TorusGeometry with emissive blue material and orbiting particle boxes near the runway start."
+code: |
+  const SEA_LEVEL = 0;
+  const GROUND_LEVEL = 10;
+  const PARTICLE_COUNT = 20;
+
+  let game;
+  const disposables = [];
+  let portalGroup = null;
+  let portalRing = null;
+  const particles = [];
+
+  function trackGeo(geo) { disposables.push(geo); return geo; }
+  function trackMat(mat) { disposables.push(mat); return mat; }
+
+  this.init = function(_game) {
+    game = _game;
+
+    portalGroup = new THREE.Group();
+    portalGroup.userData.isRuntimeOnly = true;
+    portalGroup.position.set(0, GROUND_LEVEL + 4, 110);
+
+    // Portal ring
+    const torusGeo = trackGeo(new THREE.TorusGeometry(3, 0.3, 8, 32));
+    const torusMat = trackMat(new THREE.MeshStandardNodeMaterial({
+      color: 0x0066FF,
+      emissive: 0x0066FF,
+      emissiveIntensity: 0.8,
+      transparent: true,
+      opacity: 0.9
+    }));
+    portalRing = new THREE.Mesh(torusGeo, torusMat);
+    portalRing.userData.isRuntimeOnly = true;
+    portalGroup.add(portalRing);
+
+    // Inner glow disc
+    const discGeo = trackGeo(new THREE.CircleGeometry(2.7, 32));
+    const discMat = trackMat(new THREE.MeshStandardNodeMaterial({
+      color: 0x0044CC,
+      emissive: 0x0033AA,
+      emissiveIntensity: 0.6,
+      transparent: true,
+      opacity: 0.3,
+      side: THREE.DoubleSide
+    }));
+    const disc = new THREE.Mesh(discGeo, discMat);
+    disc.userData.isRuntimeOnly = true;
+    portalGroup.add(disc);
+
+    // Orbiting particles
+    const particleGeo = trackGeo(new THREE.BoxGeometry(0.15, 0.15, 0.15));
+    const particleMat = trackMat(new THREE.MeshStandardNodeMaterial({
+      color: 0x66AAFF,
+      emissive: 0x3388FF,
+      emissiveIntensity: 1.0
+    }));
+
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+      const mesh = new THREE.Mesh(particleGeo, particleMat);
+      mesh.userData.isRuntimeOnly = true;
+      portalGroup.add(mesh);
+
+      particles.push({
+        mesh,
+        angle: (i / PARTICLE_COUNT) * Math.PI * 2,
+        radius: 2.8 + Math.random() * 0.6,
+        speed: 1.5 + Math.random() * 1.0,
+        wobblePhase: Math.random() * Math.PI * 2,
+        wobbleSpeed: 2 + Math.random() * 2
+      });
+    }
+
+    this.gameObject._internal.three.add(portalGroup);
+  };
+
+  this.update = function(deltaTime) {
+    if (!game || !portalGroup) return;
+    const dt = Math.min(deltaTime, 0.1);
+
+    const time = Date.now() * 0.001;
+
+    // Rotate portal ring
+    portalRing.rotation.y += 0.5 * dt;
+
+    // Pulse glow
+    const pulse = 0.7 + Math.sin(time * 2) * 0.2;
+    portalRing.material.emissiveIntensity = pulse;
+
+    // Update particles
+    for (const p of particles) {
+      p.angle += p.speed * dt;
+      const wobble = Math.sin(time * p.wobbleSpeed + p.wobblePhase) * 0.2;
+
+      p.mesh.position.x = Math.cos(p.angle) * (p.radius + wobble);
+      p.mesh.position.y = Math.sin(p.angle) * (p.radius + wobble);
+      p.mesh.position.z = Math.sin(time * 1.5 + p.wobblePhase) * 0.3;
+
+      p.mesh.rotation.x += 3 * dt;
+      p.mesh.rotation.y += 2 * dt;
+    }
+  };
+
+  this.dispose = function() {
+    if (portalGroup && portalGroup.parent) {
+      portalGroup.parent.remove(portalGroup);
+    }
+    for (const d of disposables) {
+      if (d.dispose) d.dispose();
+    }
+    disposables.length = 0;
+    particles.length = 0;
+    portalGroup = null;
+    portalRing = null;
+  };
+
+  this.onEditorAdded = function() {
+    // No editor preview for runtime-only procedural geometry
+  };
+
+  this.onEditorDispose = function() {
+    // Nothing to clean up in editor
+  };

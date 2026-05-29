@@ -1,0 +1,157 @@
+# HexGL — Futuristic Anti-Gravity Racing
+# Ported from BKcore/HexGL (Three.js) to StemStudio
+
+project title "HexGL"
+
+# --- Models ---
+import model name="Ship" filepath="models/feisar.glb" comment="Feisar anti-gravity ship"
+import model name="TrackCityscape" filepath="models/track-cityscape.glb" comment="Cityscape track"
+import model name="Scrapers1" filepath="models/scrapers1.glb" comment="City buildings set 1"
+import model name="Scrapers2" filepath="models/scrapers2.glb" comment="City buildings set 2"
+import model name="StartLine" filepath="models/start-line.glb" comment="Start/finish line"
+import model name="StartBanner" filepath="models/start-banner.glb" comment="Start banner"
+import model name="BonusSpeed" filepath="models/bonus-speed.glb" comment="Speed boost pads"
+import model name="BonusBase" filepath="models/bonus-base.glb" comment="Bonus base pads"
+import model name="Booster" filepath="models/booster.glb" comment="Ship booster exhaust mesh"
+
+# --- Behaviors ---
+import behavior name="HGL Ship Controller" filepath="behaviors/hglShipController.yaml" comment="Ship physics, collision/height map, boost, shield"
+import behavior name="HGL Camera Chase" filepath="behaviors/hglCameraChase.yaml" comment="Speed-responsive chase camera with skybox"
+import behavior name="HGL Ship Effects" filepath="behaviors/hglShipEffects.yaml" comment="Booster flame, collision sparks/clouds"
+import behavior name="HGL HUD Overlay" filepath="behaviors/hglHudOverlay.yaml" comment="Canvas HUD: speed, shield, time, laps, messages"
+import behavior name="HGL Race Manager" filepath="behaviors/hglRaceManager.yaml" comment="Countdown, lap tracking, checkpoints, finish"
+import behavior name="HGL Launch Overlay" filepath="behaviors/hglLaunchOverlay.yaml" comment="UIKit launch overlay — HEXGL title, controls legend, PLAY button"
+import behavior name="HGL Hex Vignette" filepath="behaviors/hglHexVignette.yaml" comment="TSL port of the cyan-blue hex vignette post effect"
+
+# --- Images (for behaviors via attributes) ---
+import image name="CollisionMap" filepath="textures/collision.png" comment="Track collision map"
+import image name="HeightMap" filepath="textures/height.png" comment="Track height map"
+import image name="HudBg" filepath="textures/hud-bg.png" comment="HUD background overlay"
+import image name="HudSpeed" filepath="textures/hud-speed.png" comment="HUD speed bar foreground"
+import image name="HudShield" filepath="textures/hud-shield.png" comment="HUD shield bar foreground"
+import image name="SparkTex" filepath="textures/spark.png" comment="Spark particle texture"
+import image name="CloudTex" filepath="textures/cloud.png" comment="Cloud particle texture"
+import image name="BoosterTex" filepath="textures/booster.png" comment="Booster flame texture"
+import image name="BoosterSprite" filepath="textures/boostersprite.jpg" comment="Booster sprite glow"
+import image name="TrackDiffuse" filepath="textures/track-diffuse.jpg" comment="Track cityscape base color"
+import image name="TrackNormal" filepath="textures/track-normal.jpg" comment="Track cityscape normal map"
+import image name="TrackSpecular" filepath="textures/track-specular.jpg" comment="Track cityscape specular map"
+import image name="Scrapers1Diffuse" filepath="textures/scrapers1-diffuse.jpg" comment="Scrapers set 1 base color"
+import image name="Scrapers1Normal" filepath="textures/scrapers1-normal.jpg" comment="Scrapers set 1 normal map"
+import image name="Scrapers1Specular" filepath="textures/scrapers1-specular.jpg" comment="Scrapers set 1 specular map"
+import image name="Scrapers2Diffuse" filepath="textures/scrapers2-diffuse.jpg" comment="Scrapers set 2 base color"
+import image name="Scrapers2Normal" filepath="textures/scrapers2-normal.jpg" comment="Scrapers set 2 normal map"
+import image name="Scrapers2Specular" filepath="textures/scrapers2-specular.jpg" comment="Scrapers set 2 specular map"
+import image name="StartLineDiffuse" filepath="textures/start-diffuse.jpg" comment="Start line base color"
+import image name="StartLineNormal" filepath="textures/start-normal.jpg" comment="Start line normal map"
+import image name="StartLineSpecular" filepath="textures/start-specular.jpg" comment="Start line specular map"
+import image name="StartBannerTex" filepath="textures/start-banner.jpg" comment="Start banner texture"
+import image name="BonusBaseDiffuse" filepath="textures/bonus-diffuse.jpg" comment="Bonus base color"
+import image name="BonusBaseNormal" filepath="textures/bonus-normal.jpg" comment="Bonus base normal map"
+import image name="BonusBaseSpecular" filepath="textures/bonus-specular.jpg" comment="Bonus base specular map"
+import image name="ShipDiffuse" filepath="textures/ship-diffuse.jpg" comment="Ship base color"
+import image name="ShipNormal" filepath="textures/ship-normal.jpg" comment="Ship normal map"
+import image name="ShipSpecular" filepath="textures/ship-specular.jpg" comment="Ship specular map"
+import image name="SkyPX" filepath="textures/skybox/px.jpg" comment="Skybox +X face"
+import image name="SkyNX" filepath="textures/skybox/nx.jpg" comment="Skybox -X face"
+import image name="SkyPY" filepath="textures/skybox/py.jpg" comment="Skybox +Y face"
+import image name="SkyNY" filepath="textures/skybox/ny.jpg" comment="Skybox -Y face"
+import image name="SkyPZ" filepath="textures/skybox/pz.jpg" comment="Skybox +Z face"
+import image name="SkyNZ" filepath="textures/skybox/nz.jpg" comment="Skybox -Z face"
+
+# --- Audio ---
+import audio name="BGMusic" filepath="audio/bg.ogg" comment="Background music loop"
+import audio name="WindAmbient" filepath="audio/wind.ogg" comment="Wind ambient loop"
+import audio name="CrashSFX" filepath="audio/crash.ogg" comment="Collision impact sound"
+import audio name="BoostSFX" filepath="audio/boost.ogg" comment="Boost activation sound"
+import audio name="DestroyedSFX" filepath="audio/destroyed.ogg" comment="Ship destroyed sound"
+
+# --- Scene Settings ---
+scene background type=Cubemap cubemap=["SkyPX","SkyNX","SkyPY","SkyNY","SkyPZ","SkyNZ"] intensity=1.0 blurriness=0
+light "Directional Light" intensity=0.8 castShadow=true
+update "Directional Light" position=100,200,100
+scene lighting ambient={color:"#ffffff",intensity:0.4}
+scene postprocessing bloom={enabled:true,strength:0.5,radius:0.4,threshold:0.6}
+render settings useShadows=true
+
+# --- Game Settings ---
+game settings enabled=true showHUD=false
+
+# --- Track placement (source: all at world-space origin) ---
+update TrackCityscape position=0,0,0
+update Scrapers1 position=0,0,0
+update Scrapers2 position=0,0,0
+update StartLine position=0,-5,0
+update StartBanner position=0,-5,0
+update BonusSpeed position=0,0,0
+update BonusBase position=0,-5,0
+
+# --- Apply PBR textures to track meshes ---
+texture TrackCityscape imageAsset=TrackDiffuse
+texture TrackCityscape imageAsset=TrackNormal textureType=normalMap
+texture TrackCityscape imageAsset=TrackSpecular textureType=metalnessMap
+material TrackCityscape metalness=0.6 roughness=0.4 tileAmountX=1 tileAmountY=1 panningSpeedX=1 panningSpeedY=1
+
+texture Scrapers1 imageAsset=Scrapers1Diffuse
+texture Scrapers1 imageAsset=Scrapers1Normal textureType=normalMap
+material Scrapers1 tileAmountX=1 tileAmountY=1 panningSpeedX=1 panningSpeedY=1
+texture Scrapers2 imageAsset=Scrapers2Diffuse
+texture Scrapers2 imageAsset=Scrapers2Normal textureType=normalMap
+material Scrapers2 tileAmountX=1 tileAmountY=1 panningSpeedX=1 panningSpeedY=1
+
+texture StartLine imageAsset=StartLineDiffuse
+texture StartLine imageAsset=StartLineNormal textureType=normalMap
+material StartLine tileAmountX=1 tileAmountY=1 panningSpeedX=1 panningSpeedY=1
+texture StartBanner imageAsset=StartBannerTex
+material StartBanner tileAmountX=1 tileAmountY=1 panningSpeedX=1 panningSpeedY=1
+
+texture BonusBase imageAsset=BonusBaseDiffuse
+texture BonusBase imageAsset=BonusBaseNormal textureType=normalMap
+material BonusBase tileAmountX=1 tileAmountY=1 panningSpeedX=1 panningSpeedY=1
+material BonusSpeed color=#0096ff metalness=0.2 roughness=0.3
+
+# --- Ship textures ---
+texture Ship imageAsset=ShipDiffuse
+texture Ship imageAsset=ShipNormal textureType=normalMap
+texture Ship imageAsset=ShipSpecular textureType=metalnessMap
+material Ship metalness=0.7 roughness=0.3 tileAmountX=1 tileAmountY=1 panningSpeedX=1 panningSpeedY=1
+
+# --- Player setup ---
+# Source spawn: x=-1134*2=-2268, y=387, z=-443*2=-886
+add group name="Player" position=-2268,387,-886
+update Player tag=Player
+
+# Parent ship model and booster to player group
+move Ship parent=Player
+update Ship position=0,0,0
+move Booster parent=Ship
+
+# --- Attach behaviors ---
+# Ship controller (physics, collision/height map, boost, shield)
+behavior attach Player behaviorId=hgl.shipController config={collisionMapAsset:"CollisionMap",heightMapAsset:"HeightMap"}
+
+# Custom chase camera (disable built-in camera)
+camera "DefaultCamera" cameraType=NONE fov=75 near=0.1 far=70000
+behavior attach Player behaviorId=hgl.cameraChase config={skyPX:"SkyPX",skyNX:"SkyNX",skyPY:"SkyPY",skyNY:"SkyNY",skyPZ:"SkyPZ",skyNZ:"SkyNZ"}
+
+# Ship visual effects (booster flame, collision particles)
+behavior attach Player behaviorId=hgl.shipEffects config={sparkTexture:"SparkTex",cloudTexture:"CloudTex",boosterTexture:"BoosterTex",boosterSpriteTexture:"BoosterSprite"}
+
+# HUD overlay (canvas-based speed/shield/time/lap display)
+behavior attach "Default Scene" behaviorId=hgl.hudOverlay config={hudBgAsset:"HudBg",hudSpeedAsset:"HudSpeed",hudShieldAsset:"HudShield"}
+
+# Race manager (countdown, checkpoints, laps, finish)
+behavior attach "Default Scene" behaviorId=hgl.raceManager config={collisionMapAsset:"CollisionMap",bgMusicAsset:"BGMusic",windAsset:"WindAmbient",crashAsset:"CrashSFX",boostAsset:"BoostSFX",destroyedAsset:"DestroyedSFX"}
+
+# Launch overlay (UIKit). Shows HEXGL title + controls + PLAY button.
+# Clicking PLAY emits `hgl_startRace` which the race manager picks up.
+behavior attach "Default Scene" behaviorId=hgl.launchOverlay config={}
+
+# Hex vignette — TSL port of the source's cyan-blue HexVignette shader.
+# Attaches a fullscreen NodeMaterial plane to the main camera.
+behavior attach "Default Scene" behaviorId=hgl.hexVignette config={}
+
+# Mobile / tablet touch controls. Joystick drives forward/lateral motion
+# (throttle + steering). Left/right buttons emit hgl_touch*Down/Up events
+# consumed by hglShipController.onEvent and OR'd into the air-brake inputs.
+behavior attach "Default Scene" behaviorId=touchControls config={mobileEnabled:true,tabletEnabled:true,desktopEnabled:false,mobileHorizontalLayout:{joystick:{joystickEnabled:true,joystickPosition:[0.15,0.2],joystickSize:120,joystickDeadzone:0.1,joystickRunThreshold:0.5},buttons:[{buttonId:"brakeL",buttonType:"customEvent",buttonEnabled:true,buttonPosition:[0.15,0.75],buttonSize:70,onButtonPress:"hgl_touchLeftDown",onButtonRelease:"hgl_touchLeftUp"},{buttonId:"brakeR",buttonType:"customEvent",buttonEnabled:true,buttonPosition:[0.85,0.75],buttonSize:70,onButtonPress:"hgl_touchRightDown",onButtonRelease:"hgl_touchRightUp"}]},mobileVerticalLayout:{joystick:{joystickEnabled:true,joystickPosition:[0.15,0.15],joystickSize:100,joystickDeadzone:0.1,joystickRunThreshold:0.5},buttons:[{buttonId:"brakeL",buttonType:"customEvent",buttonEnabled:true,buttonPosition:[0.15,0.55],buttonSize:60,onButtonPress:"hgl_touchLeftDown",onButtonRelease:"hgl_touchLeftUp"},{buttonId:"brakeR",buttonType:"customEvent",buttonEnabled:true,buttonPosition:[0.85,0.55],buttonSize:60,onButtonPress:"hgl_touchRightDown",onButtonRelease:"hgl_touchRightUp"}]},tabletHorizontalLayout:{joystick:{joystickEnabled:true,joystickPosition:[0.12,0.2],joystickSize:140,joystickDeadzone:0.08,joystickRunThreshold:0.5},buttons:[{buttonId:"brakeL",buttonType:"customEvent",buttonEnabled:true,buttonPosition:[0.12,0.75],buttonSize:80,onButtonPress:"hgl_touchLeftDown",onButtonRelease:"hgl_touchLeftUp"},{buttonId:"brakeR",buttonType:"customEvent",buttonEnabled:true,buttonPosition:[0.88,0.75],buttonSize:80,onButtonPress:"hgl_touchRightDown",onButtonRelease:"hgl_touchRightUp"}]}}

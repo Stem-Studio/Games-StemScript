@@ -1,0 +1,282 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+config:
+  priority: 0
+  name: "FP3-Runway"
+  id: "fp3.runway"
+  author: "flight-sim"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Builds runway with markings, ATC tower, approach lights, and windsock base"
+  tags:
+    - gameplay
+  attributes: {}
+  documentation: "Creates the main runway with center stripes, threshold markings, number 42 display, ATC control tower, and approach lighting system."
+code: |
+  const GROUND_LEVEL = 10;
+
+  let game;
+  const disposables = [];
+
+  function trackGeo(geo) { disposables.push(geo); return geo; }
+  function trackMat(mat) { disposables.push(mat); return mat; }
+
+  function createDigitSegments(THREE, digit, offsetX, offsetZ) {
+    // 7-segment display using small box meshes
+    // Segments: top, top-right, bottom-right, bottom, bottom-left, top-left, middle
+    const segW = 1.2;
+    const segH = 0.3;
+    const segD = 0.001;
+    const halfW = segW / 2;
+    const halfH = 0.8;
+
+    const segments = [];
+    const segGeo = trackGeo(new THREE.BoxGeometry(segW, segD, segH));
+    const segGeoVert = trackGeo(new THREE.BoxGeometry(segH, segD, segW));
+    const segMat = trackMat(new THREE.MeshStandardNodeMaterial({ color: 0xFFFFFF }));
+
+    // Segment map: [active segments for each digit 0-9]
+    // Order: top, topRight, bottomRight, bottom, bottomLeft, topLeft, middle
+    const digitMap = {
+      0: [1,1,1,1,1,1,0],
+      1: [0,1,1,0,0,0,0],
+      2: [1,1,0,1,1,0,1],
+      3: [1,1,1,1,0,0,1],
+      4: [0,1,1,0,0,1,1],
+      5: [1,0,1,1,0,1,1],
+      6: [1,0,1,1,1,1,1],
+      7: [1,1,1,0,0,0,0],
+      8: [1,1,1,1,1,1,1],
+      9: [1,1,1,1,0,1,1]
+    };
+
+    const active = digitMap[digit] || digitMap[0];
+
+    // Top horizontal
+    if (active[0]) {
+      const s = new THREE.Mesh(segGeo, segMat);
+      s.position.set(offsetX, GROUND_LEVEL + 0.12, offsetZ + halfH);
+      s.userData.isRuntimeOnly = true;
+      segments.push(s);
+    }
+    // Top-right vertical
+    if (active[1]) {
+      const s = new THREE.Mesh(segGeoVert, segMat);
+      s.position.set(offsetX + halfW, GROUND_LEVEL + 0.12, offsetZ + halfH / 2);
+      s.userData.isRuntimeOnly = true;
+      segments.push(s);
+    }
+    // Bottom-right vertical
+    if (active[2]) {
+      const s = new THREE.Mesh(segGeoVert, segMat);
+      s.position.set(offsetX + halfW, GROUND_LEVEL + 0.12, offsetZ - halfH / 2);
+      s.userData.isRuntimeOnly = true;
+      segments.push(s);
+    }
+    // Bottom horizontal
+    if (active[3]) {
+      const s = new THREE.Mesh(segGeo, segMat);
+      s.position.set(offsetX, GROUND_LEVEL + 0.12, offsetZ - halfH);
+      s.userData.isRuntimeOnly = true;
+      segments.push(s);
+    }
+    // Bottom-left vertical
+    if (active[4]) {
+      const s = new THREE.Mesh(segGeoVert, segMat);
+      s.position.set(offsetX - halfW, GROUND_LEVEL + 0.12, offsetZ - halfH / 2);
+      s.userData.isRuntimeOnly = true;
+      segments.push(s);
+    }
+    // Top-left vertical
+    if (active[5]) {
+      const s = new THREE.Mesh(segGeoVert, segMat);
+      s.position.set(offsetX - halfW, GROUND_LEVEL + 0.12, offsetZ + halfH / 2);
+      s.userData.isRuntimeOnly = true;
+      segments.push(s);
+    }
+    // Middle horizontal
+    if (active[6]) {
+      const s = new THREE.Mesh(segGeo, segMat);
+      s.position.set(offsetX, GROUND_LEVEL + 0.12, offsetZ);
+      s.userData.isRuntimeOnly = true;
+      segments.push(s);
+    }
+
+    return segments;
+  }
+
+  function createATCTower(THREE) {
+    const group = new THREE.Group();
+    group.userData.isRuntimeOnly = true;
+
+    // Tower base
+    const baseGeo = trackGeo(new THREE.BoxGeometry(4, 12.5, 4));
+    const baseMat = trackMat(new THREE.MeshStandardNodeMaterial({ color: 0xcccccc }));
+    const base = new THREE.Mesh(baseGeo, baseMat);
+    base.position.y = 6.25;
+    base.castShadow = true;
+    base.receiveShadow = true;
+    base.userData.isRuntimeOnly = true;
+    group.add(base);
+
+    // Control room
+    const roomGeo = trackGeo(new THREE.BoxGeometry(6, 3, 6));
+    const roomMat = trackMat(new THREE.MeshStandardNodeMaterial({ color: 0xaaaaaa }));
+    const room = new THREE.Mesh(roomGeo, roomMat);
+    room.position.y = 14;
+    room.castShadow = true;
+    room.userData.isRuntimeOnly = true;
+    group.add(room);
+
+    // Windows (transparent blue)
+    const windowGeo = trackGeo(new THREE.BoxGeometry(5.8, 2.5, 5.8));
+    const windowMat = trackMat(new THREE.MeshStandardNodeMaterial({
+      color: 0x87CEEB,
+      transparent: true,
+      opacity: 0.5
+    }));
+    const windows = new THREE.Mesh(windowGeo, windowMat);
+    windows.position.y = 14;
+    windows.userData.isRuntimeOnly = true;
+    group.add(windows);
+
+    // Roof
+    const roofGeo = trackGeo(new THREE.BoxGeometry(7, 0.5, 7));
+    const roofMat = trackMat(new THREE.MeshStandardNodeMaterial({ color: 0x888888 }));
+    const roof = new THREE.Mesh(roofGeo, roofMat);
+    roof.position.y = 15.5;
+    roof.castShadow = true;
+    roof.userData.isRuntimeOnly = true;
+    group.add(roof);
+
+    // Antenna
+    const antennaGeo = trackGeo(new THREE.CylinderGeometry(0.1, 0.1, 3, 8));
+    const antennaMat = trackMat(new THREE.MeshStandardNodeMaterial({ color: 0x333333 }));
+    const antenna = new THREE.Mesh(antennaGeo, antennaMat);
+    antenna.position.y = 19;
+    antenna.userData.isRuntimeOnly = true;
+    group.add(antenna);
+
+    // Red light on roof
+    const lightGeo = trackGeo(new THREE.CylinderGeometry(0.3, 0.3, 0.4, 8));
+    const lightMat = trackMat(new THREE.MeshStandardNodeMaterial({
+      color: 0xFF0000,
+      emissive: 0xFF0000,
+      emissiveIntensity: 0.8
+    }));
+    const redLight = new THREE.Mesh(lightGeo, lightMat);
+    redLight.position.y = 16;
+    redLight.userData.isRuntimeOnly = true;
+    group.add(redLight);
+
+    group.position.set(15, GROUND_LEVEL, 0);
+    return group;
+  }
+
+  this.init = function(_game) {
+    game = _game;
+    const root = this.gameObject._internal.three;
+
+    // === RUNWAY SURFACE ===
+    const runwayGeo = trackGeo(new THREE.BoxGeometry(10, 0.001, 200));
+    const runwayMat = trackMat(new THREE.MeshStandardNodeMaterial({ color: 0x404040 }));
+    const runway = new THREE.Mesh(runwayGeo, runwayMat);
+    runway.position.set(0, GROUND_LEVEL + 0.1, 0);
+    runway.receiveShadow = true;
+    runway.userData.isRuntimeOnly = true;
+    root.add(runway);
+
+    // === CENTER STRIPES ===
+    const stripeGeo = trackGeo(new THREE.BoxGeometry(1, 0.001, 5));
+    const stripeMat = trackMat(new THREE.MeshStandardNodeMaterial({ color: 0xFFFFFF }));
+    for (let z = -90; z <= 85; z += 10) {
+      const stripe = new THREE.Mesh(stripeGeo, stripeMat);
+      stripe.position.set(0, GROUND_LEVEL + 0.11, z);
+      stripe.userData.isRuntimeOnly = true;
+      root.add(stripe);
+    }
+
+    // === START (THRESHOLD) STRIPES ===
+    const startStripeGeo = trackGeo(new THREE.BoxGeometry(0.5, 0.001, 7));
+    const startStripeMat = trackMat(new THREE.MeshStandardNodeMaterial({ color: 0xFFFFFF }));
+    for (let x = -4; x <= 4; x++) {
+      if (x === 0) continue;
+      const stripe = new THREE.Mesh(startStripeGeo, startStripeMat);
+      stripe.position.set(x, GROUND_LEVEL + 0.11, 95);
+      stripe.userData.isRuntimeOnly = true;
+      root.add(stripe);
+    }
+
+    // === NUMBER "42" ===
+    const digit4Segments = createDigitSegments(THREE, 4, -1, 88);
+    const digit2Segments = createDigitSegments(THREE, 2, 1, 88);
+    for (const seg of digit4Segments) root.add(seg);
+    for (const seg of digit2Segments) root.add(seg);
+
+    // === ATC TOWER ===
+    const tower = createATCTower(THREE);
+    root.add(tower);
+
+    // Concrete pad under tower
+    const padGeo = trackGeo(new THREE.BoxGeometry(8, 0.25, 8));
+    const padMat = trackMat(new THREE.MeshStandardNodeMaterial({ color: 0x999999 }));
+    const pad = new THREE.Mesh(padGeo, padMat);
+    pad.position.set(15, GROUND_LEVEL + 0.1, 0);
+    pad.receiveShadow = true;
+    pad.userData.isRuntimeOnly = true;
+    root.add(pad);
+
+    // === APPROACH LIGHTS ===
+    const approachLightGeo = trackGeo(new THREE.BoxGeometry(0.5, 0.5, 0.5));
+    const approachLightMat = trackMat(new THREE.MeshStandardNodeMaterial({
+      color: 0xFFAA00,
+      emissive: 0xFFAA00,
+      emissiveIntensity: 1.0
+    }));
+    for (let z = 100; z <= 120; z += 5) {
+      const light = new THREE.Mesh(approachLightGeo, approachLightMat);
+      light.position.set(0, GROUND_LEVEL + 0.5, z);
+      light.userData.isRuntimeOnly = true;
+      root.add(light);
+    }
+
+    // === WINDSOCK BASE ===
+    const windsockBaseGeo = trackGeo(new THREE.CylinderGeometry(0.15, 0.15, 4, 8));
+    const windsockBaseMat = trackMat(new THREE.MeshStandardNodeMaterial({ color: 0x666666 }));
+    const windsockBase = new THREE.Mesh(windsockBaseGeo, windsockBaseMat);
+    windsockBase.position.set(-8, GROUND_LEVEL + 2, 90);
+    windsockBase.userData.isRuntimeOnly = true;
+    root.add(windsockBase);
+
+    // Windsock cone
+    const windsockGeo = trackGeo(new THREE.ConeGeometry(0.5, 2, 6));
+    const windsockMat = trackMat(new THREE.MeshStandardNodeMaterial({
+      color: 0xFF6600,
+      side: THREE.DoubleSide
+    }));
+    const windsock = new THREE.Mesh(windsockGeo, windsockMat);
+    windsock.position.set(-8, GROUND_LEVEL + 4.5, 90);
+    windsock.rotation.z = Math.PI / 2;
+    windsock.userData.isRuntimeOnly = true;
+    root.add(windsock);
+  };
+
+  this.dispose = function() {
+    for (const item of disposables) {
+      if (item && typeof item.dispose === 'function') {
+        item.dispose();
+      }
+    }
+    disposables.length = 0;
+  };
+
+  this.onEditorAdded = function() {
+    // No editor preview for runtime-only procedural geometry
+  };
+
+  this.onEditorDispose = function() {
+    // Nothing to clean up in editor
+  };

@@ -1,0 +1,259 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Meteor Shower"
+  id: "tinyskies.meteorShower"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Periodic falling meteor streaks at night. Capped MVP — source has 673 lines (sparks, advanced trails, rare-shower events); this port ships only the basic falling streak (sphere head + line tail)."
+  documentation: "Pool of `meteorPool` meteors. Each meteor: a small bright sphere head + a 2-vertex line tail offset along its travel direction. Spawn at a random point on the celestial sphere (radius `spawnRadius`) with a random tangent velocity, fly outward-tangent for up to `meteorLifetime` seconds, then recycle. Spawn rate proportional to `tinyskies/nightWeight` (0 by day → full at night). Source MeteorShower.ts uses ShaderMaterial + sparks; the WebGPU port replaces it with MeshBasicNodeMaterial + LineBasicNodeMaterial (no sparks). Documented in tinyskies-fidelity-decision-record.md."
+  tags:
+    - environment
+    - vfx
+  priority: 0
+  throttleConfig:
+    throttlePriority: "LOW"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    spawnRadius:
+      name: "Spawn Radius (units)"
+      type: "number"
+      default: 30
+      min: 10
+      max: 200
+    meteorPool:
+      name: "Meteor Pool Size"
+      type: "number"
+      default: 12
+      min: 2
+      max: 60
+    spawnRatePerSec:
+      name: "Spawn Rate (per sec at full night)"
+      type: "number"
+      default: 0.6
+      min: 0.05
+      max: 5
+    meteorSpeed:
+      name: "Meteor Speed (units/sec)"
+      type: "number"
+      default: 8
+      min: 1
+      max: 40
+    meteorLifetime:
+      name: "Meteor Lifetime (sec)"
+      type: "number"
+      default: 2.5
+      min: 0.5
+      max: 10
+    trailLength:
+      name: "Trail Length (units)"
+      type: "number"
+      default: 1.5
+      min: 0.2
+      max: 6
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  const LOG_TAG = "[tinyskies.meteorShower]";
+
+  function seededRandom(seed) {
+    let s = seed >>> 0;
+    if (s === 0) s = 1;
+    return function () {
+      s = (s * 16807) % 2147483647;
+      return (s - 1) / 2147483646;
+    };
+  }
+
+  let game;
+
+  this.init = function (_game) {
+    game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._tmp = new THREE.Vector3();
+    this._tmp2 = new THREE.Vector3();
+    this._buildPool(this.gameObject._internal.three);
+    this._rand = seededRandom(Date.now() & 0xffff);
+    this._spawnAccum = 0;
+    const pool = this._pool;
+    this._log("init pool=", pool ? pool.length : 0);
+  };
+
+  this.update = function (deltaTime) {
+    const pool = this._pool;
+    if (!pool) return;
+    const dt = Math.min(deltaTime, 0.1);
+
+    // Step active meteors.
+    for (let i = 0; i < pool.length; i++) {
+      const m = pool[i];
+      if (!m.alive) continue;
+      m.life += dt;
+      m.head.position.addScaledVector(m.vel, dt);
+      // Tail follows head, offset opposite to velocity.
+      const trailLen = this.getAttribute("trailLength");
+      this._tmp.copy(m.vel).normalize().multiplyScalar(-trailLen);
+      const tailEnd = this._tmp.add(m.head.position);
+      // Update line vertices (index 0 = head, 1 = tail end).
+      const arr = m.line.geometry.attributes.position.array;
+      arr[0] = m.head.position.x;
+      arr[1] = m.head.position.y;
+      arr[2] = m.head.position.z;
+      arr[3] = tailEnd.x;
+      arr[4] = tailEnd.y;
+      arr[5] = tailEnd.z;
+      m.line.geometry.attributes.position.needsUpdate = true;
+      // Fade with life.
+      const lifetime = this.getAttribute("meteorLifetime");
+      const fade = Math.max(0, 1 - m.life / lifetime);
+      if (m.headMat.opacity !== undefined) m.headMat.opacity = fade;
+      if (m.lineMat.opacityNode && m.lineOpacityUniform) m.lineOpacityUniform.value = fade;
+      // Despawn?
+      if (m.life >= lifetime) {
+        m.alive = false;
+        m.head.visible = false;
+        m.line.visible = false;
+      }
+    }
+
+    // Spawn new meteors based on nightWeight × spawnRate.
+    const nightW = this.erth.store.get("tinyskies/nightWeight");
+    const nightWeight = typeof nightW === "number" ? nightW : 0;
+    const spawnRate = this.getAttribute("spawnRatePerSec") * nightWeight;
+    if (spawnRate > 0) {
+      this._spawnAccum += dt * spawnRate;
+      while (this._spawnAccum >= 1) {
+        this._spawnAccum -= 1;
+        this._spawnOneMeteor();
+      }
+    } else {
+      this._spawnAccum = 0;
+    }
+  };
+
+  this._spawnOneMeteor = function () {
+    const pool = this._pool;
+    if (!pool) return;
+    let slot = -1;
+    for (let i = 0; i < pool.length; i++) {
+      if (!pool[i].alive) { slot = i; break; }
+    }
+    if (slot === -1) return; // pool exhausted; drop the spawn
+
+    const rand = this._rand;
+    const spawnRadius = this.getAttribute("spawnRadius");
+    const meteorSpeed = this.getAttribute("meteorSpeed");
+    const m = pool[slot];
+
+    // Random spawn point on a sphere (uniform).
+    const theta = rand() * Math.PI * 2;
+    const phi = Math.acos(2 * rand() - 1);
+    const sx = Math.sin(phi) * Math.cos(theta);
+    const sy = Math.sin(phi) * Math.sin(theta);
+    const sz = Math.cos(phi);
+    m.head.position.set(sx * spawnRadius, sy * spawnRadius, sz * spawnRadius);
+
+    // Velocity = tangent direction (pick a random vector perpendicular to spawn radial).
+    this._tmp.set(sx, sy, sz);
+    // arbitrary perpendicular: use cross with one of the basis vectors.
+    const refAxis = Math.abs(sy) < 0.95 ? this._tmp2.set(0, 1, 0) : this._tmp2.set(1, 0, 0);
+    const tangent = new THREE.Vector3().crossVectors(this._tmp, refAxis).normalize();
+    // Rotate the tangent randomly around the radial so meteors fall in varied
+    // directions across the same spawn point.
+    const rotAngle = rand() * Math.PI * 2;
+    const radialQ = new THREE.Quaternion().setFromAxisAngle(this._tmp, rotAngle);             // @check-ok one-shot per spawn (cooldown-bounded by spawnRate)
+    tangent.applyQuaternion(radialQ);
+    m.vel.copy(tangent).multiplyScalar(meteorSpeed);
+
+    m.life = 0;
+    m.alive = true;
+    m.head.visible = true;
+    m.line.visible = true;
+  };
+
+  this._buildPool = function (parent) {
+    const TSL = THREE.TSL;
+    const poolSize = this.getAttribute("meteorPool");
+
+    const root = new THREE.Group();
+    root.name = "tinyskiesMeteorShowerRoot";
+    root.userData.isRuntimeOnly = true;
+
+    const pool = [];
+    const headGeoTemplate = new THREE.SphereGeometry(0.08, 8, 6);                 // @check-ok runtime VFX, no editor preview
+    for (let i = 0; i < poolSize; i++) {
+      const headMat = new THREE.MeshBasicNodeMaterial({
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      });
+      headMat.colorNode = TSL.vec3(TSL.float(1.0), TSL.float(0.95), TSL.float(0.8));
+      const head = new THREE.Mesh(headGeoTemplate, headMat);
+      head.frustumCulled = false;
+      head.visible = false;
+      head.userData.isRuntimeOnly = true;
+      root.add(head);
+
+      const lineGeo = new THREE.BufferGeometry();
+      const lineArr = new Float32Array(6); // 2 vertices × xyz
+      lineGeo.setAttribute("position", new THREE.BufferAttribute(lineArr, 3));
+      const lineOpacityUniform = TSL.uniform(0);
+      const lineMat = new THREE.LineBasicNodeMaterial({
+        transparent: true,
+        depthWrite: false,
+        toneMapped: false,
+      });
+      lineMat.colorNode = TSL.vec4(TSL.float(0.95), TSL.float(0.92), TSL.float(0.75), lineOpacityUniform);
+      const line = new THREE.Line(lineGeo, lineMat);
+      line.frustumCulled = false;
+      line.visible = false;
+      line.userData.isRuntimeOnly = true;
+      root.add(line);
+
+      pool.push({
+        head: head,
+        line: line,
+        headMat: headMat,
+        lineMat: lineMat,
+        lineOpacityUniform: lineOpacityUniform,
+        vel: new THREE.Vector3(),
+        life: 0,
+        alive: false,
+      });
+    }
+    parent.add(root);
+
+    this._root = root;
+    this._pool = pool;
+    this._headGeoTemplate = headGeoTemplate;
+  };
+
+  // No editor preview — meteors only spawn at runtime under nightWeight.
+
+  this.dispose = function () {
+    this._log("dispose");
+    if (this._pool) {
+      for (const m of this._pool) {
+        if (m.line.geometry) m.line.geometry.dispose();
+        if (m.headMat) m.headMat.dispose();
+        if (m.lineMat) m.lineMat.dispose();
+      }
+      this._pool = null;
+    }
+    if (this._headGeoTemplate) this._headGeoTemplate.dispose();
+    if (this._root && this._root.parent) this._root.parent.remove(this._root);
+    this._root = null;
+    this._headGeoTemplate = null;
+  };

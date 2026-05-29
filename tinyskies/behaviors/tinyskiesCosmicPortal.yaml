@@ -1,0 +1,282 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Cosmic Portal"
+  id: "tinyskies.cosmicPortal"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Fixed-position cosmic portal in the overworld. Carpet flying through it sets `tinyskies/voidEntryRequested:true` and teleports the player above the eternal flame, replacing the altitude-trigger placeholder from Pass 12. Source-faithful port of CosmicWorldPortal.ts (363 LOC) — visual + flythrough trigger only; the source's COSMIC_VOID_PORTAL_COUNT=2 multi-portal placement is collapsed to a single fixed portal."
+  documentation: "Built once at init (no first-activation pause), parented to scene root. Visual: 5-mesh stack mirroring the carpet portal — torus ring + glow disc + sway-shader inner + 2 swirl rings — at COSMIC_WORLD_PORTAL_SCALE=1.3 (slightly larger than the carpet portal). Position published via three world-space attributes; default places the portal at (0, 0, 5.6) (near the equator, just outside globe surface). On carpet flythrough (segment-disc hit using prev/current player position), sets `tinyskies/voidEntryRequested:true` + writes `tinyskies/teleportTo` to an entry pose above the flame world (in voidPlane terms: flame + planeUp * 1.2 with heading toward planeN). The flame world consumes the request and shows; descending past entryAltitudeRatio or switching off carpet exits void and clears the request."
+  tags:
+    - vfx
+    - gameplay
+    - void
+  priority: 0
+  throttleConfig:
+    throttlePriority: "HIGH"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    portalWorldX:
+      name: "Portal World X"
+      type: "number"
+      default: 0
+    portalWorldY:
+      name: "Portal World Y"
+      type: "number"
+      default: 0
+    portalWorldZ:
+      name: "Portal World Z"
+      type: "number"
+      default: 5.6
+      description: "Default places portal slightly above equator on +Z hemisphere of globe (radius 5)."
+    triggerRadius:
+      name: "Trigger Disc Radius"
+      type: "number"
+      default: 0.32
+      min: 0.1
+      max: 1
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  const LOG_TAG = "[tinyskies.cosmicPortal]";
+
+  // Source CosmicWorldPortal.ts:11-15 — verbatim.
+  const BASE_PORTAL_RADIUS = 0.15;
+  const BASE_TUBE_RADIUS = 0.022;
+  const COSMIC_SCALE = 1.3;
+  const R = BASE_PORTAL_RADIUS * COSMIC_SCALE;
+  const T = BASE_TUBE_RADIUS * COSMIC_SCALE;
+  const PORTAL_COLOR = 0x66aaff;
+
+  this.init = function (_game) {
+    this._game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+
+    this._time = 0;
+    this._lastPlayerWorldPos = null;
+    this._cooldown = 0;
+
+    this._group = new THREE.Group();
+    this._group.userData.isRuntimeOnly = true;
+    const sceneParent = this.gameObject._internal.three.parent || this.gameObject._internal.three;
+    sceneParent.add(this._group);
+
+    this._scaledGroup = new THREE.Group();
+    this._scaledGroup.scale.set(0.65, 1.25, 1.0);
+    this._scaledGroup.userData.isRuntimeOnly = true;
+    this._group.add(this._scaledGroup);
+
+    // Materials.
+    this._ringMat = new THREE.MeshBasicNodeMaterial({
+      color: PORTAL_COLOR, transparent: true, opacity: 0.95,
+      blending: THREE.AdditiveBlending, side: THREE.DoubleSide, depthWrite: false,
+    });
+    this._glowMat = new THREE.MeshBasicNodeMaterial({
+      color: PORTAL_COLOR, transparent: true, opacity: 0.35,
+      blending: THREE.AdditiveBlending, side: THREE.DoubleSide, depthWrite: false,
+    });
+    this._innerMat = new THREE.MeshBasicNodeMaterial({
+      color: 0x000814, transparent: true, opacity: 0.92,
+      side: THREE.DoubleSide, depthWrite: false,
+    });
+    this._swirlMat = new THREE.MeshBasicNodeMaterial({
+      color: PORTAL_COLOR, transparent: true, opacity: 0.7,
+      blending: THREE.AdditiveBlending, side: THREE.DoubleSide, depthWrite: false,
+    });
+    this._swirl2Mat = new THREE.MeshBasicNodeMaterial({
+      color: PORTAL_COLOR, transparent: true, opacity: 0.6,
+      blending: THREE.AdditiveBlending, side: THREE.DoubleSide, depthWrite: false,
+    });
+
+    // Geometries.
+    this._ring = new THREE.Mesh(new THREE.TorusGeometry(R, T * 0.6, 18, 56), this._ringMat); // @check-ok no editor preview — cosmic portal renders during play
+    this._glow = new THREE.Mesh(new THREE.CircleGeometry(R * 1.3, 40), this._glowMat);
+    this._inner = new THREE.Mesh(new THREE.CircleGeometry(R * 0.95, 40), this._innerMat);
+    this._swirl = new THREE.Mesh(new THREE.TorusGeometry(R * 0.95, T * 0.4, 12, 36), this._swirlMat);
+    this._swirl2 = new THREE.Mesh(new THREE.TorusGeometry(R * 0.98, T * 0.6, 12, 36), this._swirl2Mat);
+
+    [this._ring, this._glow, this._inner, this._swirl, this._swirl2].forEach((m) => {
+      m.userData.isRuntimeOnly = true;
+    });
+
+    this._glow.position.z = -0.012;
+    this._inner.position.z = -0.004;
+    this._swirl.position.z = 0.008;
+    this._swirl2.position.z = 0.012;
+
+    this._scaledGroup.add(this._glow);
+    this._scaledGroup.add(this._inner);
+    this._scaledGroup.add(this._swirl);
+    this._scaledGroup.add(this._swirl2);
+    this._scaledGroup.add(this._ring);
+
+    // Place at fixed world position. Orient so the disc faces outward
+    // along the radial-up axis at that point.
+    const wx = this.getAttribute("portalWorldX");
+    const wy = this.getAttribute("portalWorldY");
+    const wz = this.getAttribute("portalWorldZ");
+    this._group.position.set(wx, wy, wz);
+
+    const radialUp = new THREE.Vector3(wx, wy, wz).normalize();
+    // Build a basis: up = radialUp, forward = arbitrary tangent.
+    const tangent = new THREE.Vector3(0, 1, 0).cross(radialUp);
+    if (tangent.lengthSq() < 1e-6) tangent.set(1, 0, 0).cross(radialUp);
+    tangent.normalize();
+    const right = new THREE.Vector3().crossVectors(radialUp, tangent).normalize();
+    // Forward = tangent (the direction you fly through the portal).
+    const m = new THREE.Matrix4().makeBasis(right, radialUp, tangent);
+    m.setPosition(new THREE.Vector3(wx, wy, wz));
+    this._group.matrixAutoUpdate = false;
+    this._group.matrix.copy(m);
+    this._group.matrixWorldNeedsUpdate = true;
+
+    this._portalUp = radialUp;
+    this._portalRight = right;
+    this._portalForward = tangent;
+    this._portalCenter = new THREE.Vector3(wx, wy, wz);
+
+    this._tmpQ = new THREE.Quaternion();
+    this._tmpPos = new THREE.Vector3();
+    this._tmpSeg = new THREE.Vector3();
+    this._tmpRel = new THREE.Vector3();
+
+    this._log("init at", wx, wy, wz);
+  };
+
+  this._readPlayerPos = function () {
+    const store = this.erth.store;
+    const qx = store.get("tinyskies/qx");
+    const qy = store.get("tinyskies/qy");
+    const qz = store.get("tinyskies/qz");
+    const qw = store.get("tinyskies/qw");
+    const altitude = store.get("tinyskies/altitude");
+    if (qx === undefined || qy === undefined || qz === undefined || qw === undefined || altitude === undefined) return null;
+    this._tmpQ.set(qx, qy, qz, qw);
+    // World pos = (radial-up of qPosition) * altitude.
+    const ux = 2 * (qx * qy + qz * qw);
+    const uy = 1 - 2 * (qx * qx + qz * qz);
+    const uz = 2 * (qy * qz - qx * qw);
+    return { x: ux * altitude, y: uy * altitude, z: uz * altitude };
+  };
+
+  this._segmentHitPortal = function (start, end) {
+    // Plane crossing along portalForward.
+    this._tmpSeg.set(end.x - start.x, end.y - start.y, end.z - start.z);
+    const denom = this._portalForward.dot(this._tmpSeg);
+    if (Math.abs(denom) < 1e-5) return false;
+    this._tmpRel.set(start.x - this._portalCenter.x, start.y - this._portalCenter.y, start.z - this._portalCenter.z);
+    const startDepth = this._portalForward.dot(this._tmpRel);
+    this._tmpRel.set(end.x - this._portalCenter.x, end.y - this._portalCenter.y, end.z - this._portalCenter.z);
+    const endDepth = this._portalForward.dot(this._tmpRel);
+    if (startDepth * endDepth > 0) return false;
+    const t = startDepth / (startDepth - endDepth);
+    if (t < 0 || t > 1) return false;
+    // Hit point relative to portal center.
+    const hx = start.x + this._tmpSeg.x * t - this._portalCenter.x;
+    const hy = start.y + this._tmpSeg.y * t - this._portalCenter.y;
+    const hz = start.z + this._tmpSeg.z * t - this._portalCenter.z;
+    const rDot = hx * this._portalRight.x + hy * this._portalRight.y + hz * this._portalRight.z;
+    const uDot = hx * this._portalUp.x + hy * this._portalUp.y + hz * this._portalUp.z;
+    const radial = Math.sqrt(rDot * rDot + uDot * uDot);
+    const triggerR = this.getAttribute("triggerRadius");
+    return radial <= triggerR;
+  };
+
+  this._enterVoid = function () {
+    this._log("portal entered → void");
+    // Teleport above flame: read voidPlane.
+    const planeData = this.erth.store.get("tinyskies/voidPlane");
+    if (planeData && planeData.flame && planeData.up && planeData.north) {
+      const fx = planeData.flame[0], fy = planeData.flame[1], fz = planeData.flame[2];
+      const ux = planeData.up[0], uy = planeData.up[1], uz = planeData.up[2];
+      const nx = planeData.north[0], ny = planeData.north[1], nz = planeData.north[2];
+      // Position 1.2 above flame along planeUp.
+      const ENTRY_DIST = 1.2;
+      const entryX = fx + ux * ENTRY_DIST;
+      const entryY = fy + uy * ENTRY_DIST;
+      const entryZ = fz + uz * ENTRY_DIST;
+      // Convert to (qPosition, altitude). Altitude = magnitude of entry pos.
+      const altitude = Math.sqrt(entryX * entryX + entryY * entryY + entryZ * entryZ);
+      const upX = entryX / altitude, upY = entryY / altitude, upZ = entryZ / altitude;
+      // Build qPosition that sets local +Y to (upX,upY,upZ) — same trick used
+      // by spherical-math.quaternionFromSurfaceNormal.
+      const qPos = this._tmpQ;
+      qPos.setFromUnitVectors(new THREE.Vector3(0, 1, 0), new THREE.Vector3(upX, upY, upZ));
+      this.erth.store.set("tinyskies/teleportTo", {
+        qx: qPos.x, qy: qPos.y, qz: qPos.z, qw: qPos.w,
+        altitude,
+        speed: 0.4,
+      });
+    }
+    this.erth.store.set("tinyskies/voidEntryRequested", true);
+    this._cooldown = 1.5;
+  };
+
+  this.update = function (deltaTime) {
+    if (!this._group) return;
+    const dt = Math.min(deltaTime || 0, 0.1);
+    this._time += dt;
+    if (this._cooldown > 0) this._cooldown = Math.max(0, this._cooldown - dt);
+
+    // Visual pulse + swirl spin.
+    const pulse = 1 + Math.sin(this._time * 8.0) * 0.02;
+    this._ring.scale.setScalar(pulse);
+    this._glow.scale.setScalar(0.95 + Math.sin(this._time * 4.0) * 0.05);
+    this._swirl.rotation.z = -this._time * 3.5;
+    this._swirl2.rotation.z = this._time * 2.8;
+    this._swirl.scale.setScalar(1 + Math.sin(this._time * 12.0) * 0.03);
+    this._swirl2.scale.setScalar(1 + Math.cos(this._time * 9.0) * 0.04);
+
+    // Hide while in void (player has crossed; no need to show).
+    const inVoid = this.erth.store.get("tinyskies/inVoid") === true;
+    if (this._group.visible !== !inVoid) this._group.visible = !inVoid;
+    if (inVoid || this._cooldown > 0) {
+      this._lastPlayerWorldPos = null;
+      return;
+    }
+
+    const store = this.erth.store;
+    const vt = store.get("tinyskies/vehicleType") || "plane";
+    if (vt !== "carpet") {
+      this._lastPlayerWorldPos = null;
+      return;
+    }
+
+    const cur = this._readPlayerPos();
+    if (!cur) return;
+    if (!this._lastPlayerWorldPos) {
+      this._lastPlayerWorldPos = { x: cur.x, y: cur.y, z: cur.z };
+      return;
+    }
+
+    if (this._segmentHitPortal(this._lastPlayerWorldPos, cur)) {
+      this._enterVoid();
+    }
+    this._lastPlayerWorldPos.x = cur.x;
+    this._lastPlayerWorldPos.y = cur.y;
+    this._lastPlayerWorldPos.z = cur.z;
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    [this._ring, this._glow, this._inner, this._swirl, this._swirl2].forEach((m) => {
+      if (m && m.geometry && typeof m.geometry.dispose === "function") m.geometry.dispose();
+    });
+    [this._ringMat, this._glowMat, this._innerMat, this._swirlMat, this._swirl2Mat].forEach((m) => {
+      if (m && typeof m.dispose === "function") m.dispose();
+    });
+    if (this._group && this._group.parent) this._group.parent.remove(this._group);
+    this._group = null;
+  };

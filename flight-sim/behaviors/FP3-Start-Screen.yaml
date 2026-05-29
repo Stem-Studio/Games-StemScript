@@ -1,0 +1,279 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+config:
+  priority: 0
+  name: FP3 Start Screen
+  id: fp3.startScreen
+  author: flight-sim
+  isScript: true
+  main: script.js
+  version: 1.0.0
+  description: "Start screen with username input and vehicle selection grid. Stores fp3_username, fp3_vehicleName, fp3_gameState."
+  tags:
+    - gameplay
+    - ui
+  attributes: {}
+  documentation: "Fullscreen start screen overlay. Title, subtitle, username input (UIKit.Input), 5 vehicle selection cards (Cessna, F-16, Apache, Tank, Cyberpink) with click selection via UIKitPointerEvents, and a green Start button. Defaults to Cessna and a random callsign. On start, writes fp3_username, fp3_vehicleName, sets fp3_gameState to playing, hides overlay, and requests pointer lock."
+code: |
+  // ============================================================
+  // FP3 Start Screen
+  // Username input + vehicle selection + start button.
+  // Writes fp3_username, fp3_vehicleName, fp3_gameState.
+  // ============================================================
+
+  let game;
+  let store;
+  let fullscreen = null;
+  let rootParented = false;
+  let selectedVehicle = 'cessna';
+  let vehicleCards = [];
+  let usernameInput = null;
+  let defaultUsername = 'Pilot_' + String(Math.floor(1000 + Math.random() * 9000));
+
+  let VEHICLES = [
+    { name: 'cessna',   label: 'Cessna',   color: '#ffffff', stats: 'SPD:3 ARM:1 AGI:4' },
+    { name: 'f16',      label: 'F-16',     color: '#888888', stats: 'SPD:5 ARM:3 AGI:5' },
+    { name: 'apache',   label: 'Apache',   color: '#556b2f', stats: 'SPD:2 ARM:5 AGI:3' },
+    { name: 'tank',     label: 'Tank',     color: '#556b2f', stats: 'SPD:1 ARM:5 AGI:1' },
+    { name: 'cyberpink',label: 'Cyberpink', color: '#ff69b4', stats: 'SPD:4 ARM:2 AGI:5' }
+  ];
+
+  function parentToCamera() {
+    if (rootParented || !fullscreen) return;
+    if (game.uiCamera) {
+      game.uiCamera.add(fullscreen);
+      rootParented = true;
+    }
+  }
+
+  function updateCardHighlights() {
+    for (let i = 0; i < vehicleCards.length; i++) {
+      let card = vehicleCards[i];
+      let isSelected = (card.vehicleName === selectedVehicle);
+      card.container.setProperties({
+        borderColor: isSelected ? '#00ff00' : 'rgba(255,255,255,0.3)',
+        borderWidth: isSelected ? 3 : 1
+      });
+    }
+  }
+
+  this.init = function(_game) {
+    game = _game;
+    store = this.erth.store;
+  };
+
+  this.onStart = function() {
+    // Initialize pointer events for click handling
+    UIKitPointerEvents.initialize(game);
+
+    fullscreen = new UIKit.Fullscreen(game.renderer, { visibility: 'visible' });
+    parentToCamera();
+
+    // ── Main overlay container ──
+    let overlay = new UIKit.Container({
+      width: '100%',
+      height: '100%',
+      backgroundColor: 'rgba(0,0,0,0.85)',
+      flexDirection: 'column',
+      justifyContent: 'center',
+      alignItems: 'center',
+      gap: 20,
+      padding: 30,
+      visibility: 'visible'
+    });
+    fullscreen.add(overlay);
+
+    // ── Title ──
+    let title = new UIKit.Text({
+      text: 'FLY PIETER 3',
+      fontSize: 48,
+      fontWeight: 'bold',
+      color: '#ffffff',
+      visibility: 'visible'
+    });
+    overlay.add(title);
+
+    // ── Subtitle ──
+    let subtitle = new UIKit.Text({
+      text: 'A multiplayer flight simulator',
+      fontSize: 18,
+      color: 'rgba(255,255,255,0.6)',
+      visibility: 'visible'
+    });
+    overlay.add(subtitle);
+
+    // ── Username input ──
+    let inputRow = new UIKit.Container({
+      flexDirection: 'column',
+      alignItems: 'center',
+      gap: 8,
+      visibility: 'visible'
+    });
+    overlay.add(inputRow);
+
+    let inputLabel = new UIKit.Text({
+      text: 'CALLSIGN',
+      fontSize: 12,
+      color: 'rgba(255,255,255,0.5)',
+      fontWeight: 'bold',
+      visibility: 'visible'
+    });
+    inputRow.add(inputLabel);
+
+    usernameInput = new UIKit.Input({
+      width: 250,
+      height: 36,
+      fontSize: 16,
+      color: '#ffffff',
+      backgroundColor: 'rgba(255,255,255,0.1)',
+      borderRadius: 6,
+      borderWidth: 1,
+      borderColor: 'rgba(255,255,255,0.3)',
+      padding: 8,
+      placeholder: 'Enter callsign...',
+      value: defaultUsername,
+      visibility: 'visible'
+    });
+    inputRow.add(usernameInput);
+
+    // ── Vehicle selection label ──
+    let vehicleLabel = new UIKit.Text({
+      text: 'SELECT VEHICLE',
+      fontSize: 12,
+      color: 'rgba(255,255,255,0.5)',
+      fontWeight: 'bold',
+      visibility: 'visible'
+    });
+    overlay.add(vehicleLabel);
+
+    // ── Vehicle grid ──
+    let vehicleGrid = new UIKit.Container({
+      flexDirection: 'row',
+      justifyContent: 'center',
+      alignItems: 'center',
+      gap: 12,
+      flexWrap: 'wrap',
+      visibility: 'visible'
+    });
+    overlay.add(vehicleGrid);
+
+    for (let i = 0; i < VEHICLES.length; i++) {
+      (function(v) {
+        let isSelected = (v.name === selectedVehicle);
+        let card = new UIKit.Container({
+          width: 120,
+          height: 90,
+          backgroundColor: 'rgba(255,255,255,0.08)',
+          borderRadius: 8,
+          borderWidth: isSelected ? 3 : 1,
+          borderColor: isSelected ? '#00ff00' : 'rgba(255,255,255,0.3)',
+          flexDirection: 'column',
+          justifyContent: 'center',
+          alignItems: 'center',
+          gap: 6,
+          padding: 8,
+          pointerEvents: 'auto',
+          cursor: 'pointer',
+          visibility: 'visible',
+          onClick: function() {
+            selectedVehicle = v.name;
+            updateCardHighlights();
+          }
+        });
+
+        let colorSwatch = new UIKit.Container({
+          width: 20,
+          height: 20,
+          backgroundColor: v.color,
+          borderRadius: 10,
+          visibility: 'visible'
+        });
+        card.add(colorSwatch);
+
+        let nameText = new UIKit.Text({
+          text: v.label,
+          fontSize: 14,
+          fontWeight: 'bold',
+          color: '#ffffff',
+          visibility: 'visible'
+        });
+        card.add(nameText);
+
+        let statsText = new UIKit.Text({
+          text: v.stats,
+          fontSize: 9,
+          color: 'rgba(255,255,255,0.5)',
+          visibility: 'visible'
+        });
+        card.add(statsText);
+
+        vehicleGrid.add(card);
+        vehicleCards.push({ container: card, vehicleName: v.name });
+      })(VEHICLES[i]);
+    }
+
+    // ── Start button ──
+    let startBtn = new UIKit.Container({
+      width: 200,
+      height: 50,
+      backgroundColor: '#00aa44',
+      borderRadius: 10,
+      justifyContent: 'center',
+      alignItems: 'center',
+      pointerEvents: 'auto',
+      cursor: 'pointer',
+      visibility: 'visible',
+      onClick: function() {
+        let username = defaultUsername;
+        if (usernameInput && usernameInput.value && usernameInput.value.trim().length > 0) {
+          username = usernameInput.value.trim();
+        }
+        store.set('fp3_username', username);
+        store.set('fp3_vehicleName', selectedVehicle);
+        store.set('fp3_gameState', 'playing');
+
+        // Hide overlay
+        fullscreen.setProperties({ visibility: 'hidden' });
+
+        // Request pointer lock
+        let canvas = game.renderer && game.renderer.domElement;
+        if (canvas && canvas.requestPointerLock) {
+          canvas.requestPointerLock();
+        }
+      }
+    });
+    let startText = new UIKit.Text({
+      text: 'START',
+      fontSize: 22,
+      fontWeight: 'bold',
+      color: '#ffffff',
+      visibility: 'visible'
+    });
+    startBtn.add(startText);
+    overlay.add(startBtn);
+
+    UIKitPointerEvents.registerRoot(fullscreen);
+
+    // Set initial game state
+    store.set('fp3_gameState', 'menu');
+  };
+
+  this.update = function(deltaTime) {
+    if (!rootParented) parentToCamera();
+    UIKitPointerEvents.update(deltaTime);
+  };
+
+  this.dispose = function() {
+    UIKitPointerEvents.unregisterRoot(fullscreen);
+    UIKitPointerEvents.deinitialize();
+    if (fullscreen && fullscreen.parent) {
+      fullscreen.parent.remove(fullscreen);
+    }
+    fullscreen = null;
+    vehicleCards = [];
+    usernameInput = null;
+    game = null;
+    store = null;
+  };

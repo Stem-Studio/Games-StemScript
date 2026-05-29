@@ -1,0 +1,222 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Carpet Trail"
+  id: "tinyskies.carpetTrail"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Twin golden ribbon trails streaming from the rear corners of the magic carpet. Opacity fades in with speed. Source-faithful port of CarpetTrail.ts (204 LOC) — additive-blended billboard ribbons in scene space."
+  documentation: "Active only while vehicleType==='carpet'. Each frame: reads player matrixWorld from `this.gameObject._internal.three.matrixWorld`, applies leftOffset/rightOffset, pushes the world point to a 35-segment FIFO. Each ribbon is a triangle strip (BufferGeometry + indexed triangles) with per-vertex alpha (vertexColors RGBA). Speed alpha = clamp(speedRatio*1.5, 0..1) multiplied into vertex alpha each frame. Source uses raw GLSL ShaderMaterial; replaced with MeshBasicNodeMaterial + RGBA vertexColors for WebGPU compat. Trail group is parented to the gameObject's parent (scene root) so world-space positions are not double-transformed."
+  tags:
+    - vehicle
+    - vfx
+  priority: 0
+  throttleConfig:
+    throttlePriority: "HIGH"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  const LOG_TAG = "[tinyskies.carpetTrail]";
+
+  // Source CarpetTrail.ts:1-21 — verbatim constants.
+  const TRAIL_LENGTH = 35;
+  const WIDTH = 0.004;
+  const TRAIL_COLOR_R = 0.95;
+  const TRAIL_COLOR_G = 0.82;
+  const TRAIL_COLOR_B = 0.30;
+  // Source CarpetTrail.ts:91-93 — offsets in local carpet space.
+  const LEFT_OFFSET_X = -0.026, LEFT_OFFSET_Y = -0.015, LEFT_OFFSET_Z = 0.01;
+  const RIGHT_OFFSET_X = 0.026, RIGHT_OFFSET_Y = -0.015, RIGHT_OFFSET_Z = 0.01;
+
+  function buildRibbon() {
+    const vertCount = TRAIL_LENGTH * 2;
+    const posArray = new Float32Array(vertCount * 3);
+    const colArray = new Float32Array(vertCount * 4);
+
+    const posAttr = new THREE.BufferAttribute(posArray, 3);
+    const colAttr = new THREE.BufferAttribute(colArray, 4);
+
+    const geometry = new THREE.BufferGeometry(); // @check-ok no editor preview — trail only renders during play
+    geometry.setAttribute("position", posAttr);
+    geometry.setAttribute("color", colAttr);
+
+    const indices = [];
+    for (let i = 0; i < TRAIL_LENGTH - 1; i++) {
+      const a = i * 2;
+      indices.push(a, a + 2, a + 1, a + 1, a + 2, a + 3);
+    }
+    geometry.setIndex(indices);
+
+    const material = new THREE.MeshBasicNodeMaterial({
+      transparent: true,
+      depthWrite: false,
+      vertexColors: true,
+      side: THREE.DoubleSide,
+      blending: THREE.AdditiveBlending,
+    });
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.frustumCulled = false;
+    mesh.userData.isRuntimeOnly = true;
+    return { mesh, geometry, material, posAttr, colAttr, points: [], lastCross: new THREE.Vector3(0, 1, 0) };
+  }
+
+  this.init = function (_game) {
+    this._game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+
+    this._dir = new THREE.Vector3();
+    this._toCamera = new THREE.Vector3();
+    this._cross = new THREE.Vector3();
+    this._fallback = new THREE.Vector3(0, 1, 0);
+    this._leftOffset = new THREE.Vector3(LEFT_OFFSET_X, LEFT_OFFSET_Y, LEFT_OFFSET_Z);
+    this._rightOffset = new THREE.Vector3(RIGHT_OFFSET_X, RIGHT_OFFSET_Y, RIGHT_OFFSET_Z);
+    this._tmpLeft = new THREE.Vector3();
+    this._tmpRight = new THREE.Vector3();
+    this._tmpCam = new THREE.Vector3();
+
+    this._left = buildRibbon(); // @check-ok no editor preview — trail only renders during play
+    this._right = buildRibbon();
+
+    this._group = new THREE.Group();
+    this._group.userData.isRuntimeOnly = true;
+    this._group.visible = false;
+    this._group.add(this._left.mesh);
+    this._group.add(this._right.mesh);
+
+    // Parent to scene root (gameObject's parent) so world positions are not
+    // double-transformed by the player's moving matrixWorld.
+    const sceneParent = this.gameObject._internal.three.parent || this.gameObject._internal.three;
+    sceneParent.add(this._group);
+    this._sceneParent = sceneParent;
+
+    this._log("init");
+  };
+
+  this._updateRibbon = function (ribbon, worldPos, cameraPos, speedAlpha) {
+    // FIFO push.
+    ribbon.points.unshift(worldPos.clone());
+    if (ribbon.points.length > TRAIL_LENGTH) ribbon.points.length = TRAIL_LENGTH;
+
+    const positions = ribbon.posAttr.array;
+    const colors = ribbon.colAttr.array;
+    const count = ribbon.points.length;
+
+    for (let i = 0; i < TRAIL_LENGTH; i++) {
+      const p = ribbon.points[i];
+      if (!p) {
+        positions[i * 6]     = 0; positions[i * 6 + 1] = 0; positions[i * 6 + 2] = 0;
+        positions[i * 6 + 3] = 0; positions[i * 6 + 4] = 0; positions[i * 6 + 5] = 0;
+        colors[i * 8]     = 0; colors[i * 8 + 1] = 0; colors[i * 8 + 2] = 0; colors[i * 8 + 3] = 0;
+        colors[i * 8 + 4] = 0; colors[i * 8 + 5] = 0; colors[i * 8 + 6] = 0; colors[i * 8 + 7] = 0;
+        continue;
+      }
+
+      const prevIdx = Math.max(i - 1, 0);
+      const nextIdx = Math.min(i + 1, count - 1);
+      this._dir.subVectors(ribbon.points[prevIdx], ribbon.points[nextIdx]);
+
+      if (this._dir.lengthSq() < 1e-10) {
+        this._cross.copy(ribbon.lastCross);
+      } else {
+        this._toCamera.subVectors(cameraPos, p);
+        this._cross.crossVectors(this._dir, this._toCamera);
+        if (this._cross.lengthSq() < 1e-10) {
+          this._cross.crossVectors(this._dir, this._fallback);
+        }
+        this._cross.normalize();
+        ribbon.lastCross.copy(this._cross);
+      }
+
+      const fadeIn = Math.min(1, i / 8);
+      const fadeOut = 1 - i / TRAIL_LENGTH;
+      const w = WIDTH * fadeOut;
+      const a = fadeIn * fadeOut * speedAlpha;
+
+      positions[i * 6]     = p.x + this._cross.x * w;
+      positions[i * 6 + 1] = p.y + this._cross.y * w;
+      positions[i * 6 + 2] = p.z + this._cross.z * w;
+      positions[i * 6 + 3] = p.x - this._cross.x * w;
+      positions[i * 6 + 4] = p.y - this._cross.y * w;
+      positions[i * 6 + 5] = p.z - this._cross.z * w;
+
+      const cR = TRAIL_COLOR_R * a, cG = TRAIL_COLOR_G * a, cB = TRAIL_COLOR_B * a;
+      colors[i * 8]     = cR; colors[i * 8 + 1] = cG; colors[i * 8 + 2] = cB; colors[i * 8 + 3] = a;
+      colors[i * 8 + 4] = cR; colors[i * 8 + 5] = cG; colors[i * 8 + 6] = cB; colors[i * 8 + 7] = a;
+    }
+
+    ribbon.posAttr.needsUpdate = true;
+    ribbon.colAttr.needsUpdate = true;
+  };
+
+  this._reset = function () {
+    for (const r of [this._left, this._right]) {
+      if (!r) continue;
+      r.points.length = 0;
+      r.lastCross.set(0, 1, 0);
+      r.posAttr.array.fill(0);
+      r.colAttr.array.fill(0);
+      r.posAttr.needsUpdate = true;
+      r.colAttr.needsUpdate = true;
+    }
+  };
+
+  this.update = function () {
+    if (!this._group) return;
+    const store = this.erth.store;
+    const vt = store.get("tinyskies/vehicleType") || "plane";
+    const isCarpet = (vt === "carpet");
+
+    if (!isCarpet) {
+      if (this._group.visible) {
+        this._group.visible = false;
+        this._reset();
+      }
+      return;
+    }
+
+    if (!this._group.visible) this._group.visible = true;
+
+    const camera = this._game && this._game.camera;
+    if (!camera) return;
+    const speedRatio = store.get("tinyskies/speedRatio") || 0;
+    const speedAlpha = Math.max(0, Math.min(1, speedRatio * 1.5));
+
+    // Carpet world matrix.
+    const m = this.gameObject._internal.three.matrixWorld;
+    this._tmpLeft.copy(this._leftOffset).applyMatrix4(m);
+    this._tmpRight.copy(this._rightOffset).applyMatrix4(m);
+    camera.getWorldPosition(this._tmpCam);
+
+    this._updateRibbon(this._left, this._tmpLeft, this._tmpCam, speedAlpha);
+    this._updateRibbon(this._right, this._tmpRight, this._tmpCam, speedAlpha);
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    if (this._left) {
+      this._left.geometry.dispose();
+      this._left.material.dispose();
+    }
+    if (this._right) {
+      this._right.geometry.dispose();
+      this._right.material.dispose();
+    }
+    if (this._group && this._group.parent) this._group.parent.remove(this._group);
+    this._group = null;
+    this._left = null;
+    this._right = null;
+  };

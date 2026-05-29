@@ -1,0 +1,217 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "HGL Launch Overlay"
+  id: "hgl.launchOverlay"
+  author: "stemstudio-importer"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "UIKit launch overlay — title, controls legend, PLAY button. Gates
+    hgl_startRace until the player presses PLAY."
+  priority: 0
+  documentation: |
+    Attached to the scene. Shows a fullscreen overlay on init with the HEXGL
+    title, a controls legend, and a PLAY button. Clicking PLAY sends the
+    `hgl_startRace` event to the scene behaviors (hglRaceManager handles it
+    by calling startRaceSequence). The overlay is hidden after PLAY and does
+    NOT re-appear on in-game restart (Esc/Enter); the race resumes directly.
+  tags: [ "ui", "hexgl" ]
+  attributes:
+    titleText:
+      name: "Title"
+      type: "string"
+      default: "HEXGL"
+    subtitleText:
+      name: "Subtitle"
+      type: "string"
+      default: "Futuristic Anti-Gravity Racing"
+    creditsText:
+      name: "Credits"
+      type: "string"
+      default: "Original by BKcore — ported to StemStudio"
+
+code: |
+  let game;
+
+  this.init = function(_game) {
+    game = _game;
+    this.uiRoot = null;
+    this.uiAttached = false;
+    this.pointerRegistered = false;
+    this.shown = false;
+    this._enterPrev = false;
+  };
+
+  this.onStart = function() {
+    UIKitPointerEvents.initialize(game);
+
+    const titleText = this.getAttribute("titleText") || "HEXGL";
+    const subtitleText = this.getAttribute("subtitleText") || "Futuristic Anti-Gravity Racing";
+    const creditsText = this.getAttribute("creditsText") || "Original by BKcore — ported to StemStudio";
+
+    // Fullscreen dimmer + centered column.
+    this.uiRoot = new UIKit.Fullscreen(game.app.renderer, {
+      pixelSize: 0.002,
+      flexDirection: "column",
+      justifyContent: "center",
+      alignItems: "center",
+      backgroundColor: "black",
+      backgroundOpacity: 0.75,
+      pointerEvents: "listener",
+      visibility: "visible",
+    });
+
+    this.uiRoot.add(new UIKit.Text({
+      text: titleText,
+      fontSize: 96,
+      color: "#8ff6ff",
+      fontWeight: "bold",
+      paddingBottom: 8,
+      visibility: "visible",
+    }));
+
+    this.uiRoot.add(new UIKit.Text({
+      text: subtitleText,
+      fontSize: 22,
+      color: "#c0e6ec",
+      paddingBottom: 36,
+      visibility: "visible",
+    }));
+
+    // Controls legend — two-column rows of (key, description).
+    const controls = [
+      ["W / Up", "Thrust"],
+      ["S / Down", "Brake"],
+      ["A / Left   D / Right", "Steer"],
+      ["Q   E", "Air brake (left / right drift)"],
+      ["Esc / Enter", "Restart"],
+    ];
+
+    const legend = new UIKit.Container({
+      flexDirection: "column",
+      alignItems: "center",
+      paddingBottom: 36,
+      visibility: "visible",
+    });
+    for (const [keyLabel, desc] of controls) {
+      const row = new UIKit.Container({
+        flexDirection: "row",
+        justifyContent: "center",
+        alignItems: "center",
+        paddingBottom: 6,
+        visibility: "visible",
+      });
+      row.add(new UIKit.Text({
+        text: keyLabel,
+        fontSize: 18,
+        color: "#ffffff",
+        paddingRight: 24,
+        width: 200,
+        visibility: "visible",
+      }));
+      row.add(new UIKit.Text({
+        text: desc,
+        fontSize: 18,
+        color: "#c0e6ec",
+        visibility: "visible",
+      }));
+      legend.add(row);
+    }
+    this.uiRoot.add(legend);
+
+    // PLAY button.
+    const behaviorSelf = this;
+    const playBtn = new UIKit.Container({
+      backgroundColor: "#0a3a44",
+      backgroundOpacity: 0.95,
+      borderColor: "#8ff6ff",
+      borderWidth: 2,
+      borderRadius: 6,
+      paddingTop: 14,
+      paddingBottom: 14,
+      paddingLeft: 56,
+      paddingRight: 56,
+      cursor: "pointer",
+      pointerEvents: "auto",
+      visibility: "visible",
+      onClick: function() {
+        behaviorSelf._startRace();
+      },
+    });
+    playBtn.add(new UIKit.Text({
+      text: "PLAY",
+      fontSize: 28,
+      color: "#ffffff",
+      fontWeight: "bold",
+      visibility: "visible",
+    }));
+    this.uiRoot.add(playBtn);
+
+    // Credits footer.
+    this.uiRoot.add(new UIKit.Text({
+      text: creditsText,
+      fontSize: 14,
+      color: "#7090a0",
+      paddingTop: 40,
+      visibility: "visible",
+    }));
+
+    this.shown = true;
+  };
+
+  this._startRace = function() {
+    if (!this.shown) return;
+    this.shown = false;
+    if (this.uiRoot) {
+      this.uiRoot.setProperties({ visibility: "hidden" });
+    }
+    const scene = game.scene;
+    if (scene) {
+      game.behaviorManager.sendEventToObjectBehaviors(scene, "hgl_startRace", {});
+    }
+  };
+
+  this.update = function(deltaTime) {
+    // Deferred parenting: uiCamera isn't available until after init.
+    if (!this.uiAttached && game.uiCamera && this.uiRoot) {
+      game.uiCamera.add(this.uiRoot);
+      this.uiAttached = true;
+    }
+
+    // Register pointer events AFTER the root is parented (required ordering).
+    if (this.uiAttached && !this.pointerRegistered && this.uiRoot) {
+      UIKitPointerEvents.registerRoot(this.uiRoot);
+      this.pointerRegistered = true;
+    }
+
+    UIKitPointerEvents.update(deltaTime);
+
+    // Keyboard shortcut to dismiss the overlay — Enter matches the race
+    // manager's restart binding so returning to the menu after finishing a
+    // race still feels natural.
+    if (this.shown && game.inputManager) {
+      const enterPressed = !!game.inputManager.getAction('hgl_Restart');
+      if (enterPressed && !this._enterPrev) {
+        this._startRace();
+      }
+      this._enterPrev = enterPressed;
+    }
+  };
+
+  this.dispose = function() {
+    if (this.uiRoot) {
+      if (this.pointerRegistered) {
+        UIKitPointerEvents.unregisterRoot(this.uiRoot);
+        this.pointerRegistered = false;
+      }
+      this.uiRoot.removeFromParent?.();
+      this.uiRoot.dispose();
+      this.uiRoot = null;
+    }
+    UIKitPointerEvents.deinitialize();
+    this.uiAttached = false;
+  };

@@ -1,0 +1,155 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+config:
+  priority: 0
+  name: "FP3-Ocean-Carrier"
+  id: "fp3.oceanCarrier"
+  author: "flight-sim"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Builds ocean, aircraft carrier with deck markings, and beach transition"
+  tags:
+    - gameplay
+  attributes: {}
+  documentation: "Creates the ocean plane, aircraft carrier with island superstructure and deck markings, and sandy beach connecting land to sea."
+code: |
+  const SEA_LEVEL = 0;
+  const GROUND_LEVEL = 10;
+
+  let game;
+  const disposables = [];
+
+  function trackGeo(geo) { disposables.push(geo); return geo; }
+  function trackMat(mat) { disposables.push(mat); return mat; }
+
+  function createAircraftCarrier(THREE) {
+    const group = new THREE.Group();
+    group.userData.isRuntimeOnly = true;
+
+    // Flight deck
+    const deckGeo = trackGeo(new THREE.BoxGeometry(50, 0.5, 160));
+    const deckMat = trackMat(new THREE.MeshStandardNodeMaterial({ color: 0x666666 }));
+    const deck = new THREE.Mesh(deckGeo, deckMat);
+    deck.position.y = 0;
+    deck.receiveShadow = true;
+    deck.castShadow = true;
+    deck.userData.isRuntimeOnly = true;
+    group.add(deck);
+
+    // Hull (below deck)
+    const hullGeo = trackGeo(new THREE.BoxGeometry(46, 10, 156));
+    const hullMat = trackMat(new THREE.MeshStandardNodeMaterial({ color: 0x444444 }));
+    const hull = new THREE.Mesh(hullGeo, hullMat);
+    hull.position.y = -5.25;
+    hull.userData.isRuntimeOnly = true;
+    group.add(hull);
+
+    // Island superstructure
+    const islandGeo = trackGeo(new THREE.BoxGeometry(8, 15, 20));
+    const islandMat = trackMat(new THREE.MeshStandardNodeMaterial({ color: 0x888888 }));
+    const island = new THREE.Mesh(islandGeo, islandMat);
+    island.position.set(15, 8, -20);
+    island.castShadow = true;
+    island.userData.isRuntimeOnly = true;
+    group.add(island);
+
+    // Island windows
+    const iWindowGeo = trackGeo(new THREE.BoxGeometry(7.8, 2, 19.8));
+    const iWindowMat = trackMat(new THREE.MeshStandardNodeMaterial({
+      color: 0x87CEEB,
+      transparent: true,
+      opacity: 0.4
+    }));
+    const iWindows = new THREE.Mesh(iWindowGeo, iWindowMat);
+    iWindows.position.set(15, 12, -20);
+    iWindows.userData.isRuntimeOnly = true;
+    group.add(iWindows);
+
+    // Deck center stripe
+    const centerStripeGeo = trackGeo(new THREE.BoxGeometry(1, 0.01, 140));
+    const centerStripeMat = trackMat(new THREE.MeshStandardNodeMaterial({ color: 0xFFFFFF }));
+    const centerStripe = new THREE.Mesh(centerStripeGeo, centerStripeMat);
+    centerStripe.position.set(0, 0.26, 0);
+    centerStripe.userData.isRuntimeOnly = true;
+    group.add(centerStripe);
+
+    // Landing zone circle (approximated with a ring)
+    const circleGeo = trackGeo(new THREE.RingGeometry(8, 9, 32));
+    const circleMat = trackMat(new THREE.MeshStandardNodeMaterial({
+      color: 0xFFFFFF,
+      side: THREE.DoubleSide
+    }));
+    const circle = new THREE.Mesh(circleGeo, circleMat);
+    circle.rotation.x = -Math.PI / 2;
+    circle.position.set(-5, 0.27, 30);
+    circle.userData.isRuntimeOnly = true;
+    group.add(circle);
+
+    // Side edge stripes
+    const edgeStripeGeo = trackGeo(new THREE.BoxGeometry(0.5, 0.01, 160));
+    const edgeStripeMat = trackMat(new THREE.MeshStandardNodeMaterial({ color: 0xFFFF00 }));
+    const leftEdge = new THREE.Mesh(edgeStripeGeo, edgeStripeMat);
+    leftEdge.position.set(-24, 0.26, 0);
+    leftEdge.userData.isRuntimeOnly = true;
+    group.add(leftEdge);
+
+    const rightEdge = new THREE.Mesh(edgeStripeGeo, edgeStripeMat);
+    rightEdge.position.set(24, 0.26, 0);
+    rightEdge.userData.isRuntimeOnly = true;
+    group.add(rightEdge);
+
+    // Position so deck top is at GROUND_LEVEL
+    group.position.set(-600, GROUND_LEVEL - 0.25, 0);
+    return group;
+  }
+
+  this.init = function(_game) {
+    game = _game;
+    const root = this.gameObject._internal.three;
+
+    // === OCEAN ===
+    const oceanGeo = trackGeo(new THREE.PlaneGeometry(2000, 2000));
+    const oceanMat = trackMat(new THREE.MeshStandardNodeMaterial({
+      color: 0x006994,
+      shininess: 60
+    }));
+    const ocean = new THREE.Mesh(oceanGeo, oceanMat);
+    ocean.rotation.x = -Math.PI / 2;
+    ocean.position.set(-1450, SEA_LEVEL, 0);
+    ocean.receiveShadow = true;
+    ocean.userData.isRuntimeOnly = true;
+    root.add(ocean);
+
+    // === AIRCRAFT CARRIER ===
+    const carrier = createAircraftCarrier(THREE);
+    root.add(carrier);
+
+    // === BEACH ===
+    const beachGeo = trackGeo(new THREE.BoxGeometry(100, GROUND_LEVEL, 4000));
+    const beachMat = trackMat(new THREE.MeshStandardNodeMaterial({ color: 0xC2B280 }));
+    const beach = new THREE.Mesh(beachGeo, beachMat);
+    beach.position.set(-400, GROUND_LEVEL / 2, 0);
+    beach.receiveShadow = true;
+    beach.userData.isRuntimeOnly = true;
+    root.add(beach);
+  };
+
+  this.dispose = function() {
+    for (const item of disposables) {
+      if (item && typeof item.dispose === 'function') {
+        item.dispose();
+      }
+    }
+    disposables.length = 0;
+  };
+
+  this.onEditorAdded = function() {
+    // No editor preview for runtime-only procedural geometry
+  };
+
+  this.onEditorDispose = function() {
+    // Nothing to clean up in editor
+  };

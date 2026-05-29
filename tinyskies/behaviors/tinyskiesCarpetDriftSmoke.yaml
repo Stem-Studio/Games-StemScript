@@ -1,0 +1,260 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Carpet Drift Smoke"
+  id: "tinyskies.carpetDriftSmoke"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Soft additive-blended smoke puffs emitted from the carpet's left and right edges while drifting (sharp turns). Pool of 120 particles, 0.35-0.70s lifetime, expanding-and-fading point sprites. Source-faithful port of CarpetDriftSmoke.ts (224 LOC)."
+  documentation: "Active only while vehicleType==='carpet'. driftIntensity is derived from |turnRate| (smoothed turn input published by flightController to `tinyskies/turnRate`). isDrifting = driftIntensity > 0.4. Per-particle attributes: position (vec3), alpha (float), size (float). Source uses raw GLSL ShaderMaterial with custom vertex/fragment for glow rounded quads. Replaced with PointsNodeMaterial + per-vertex size/alpha for WebGPU compat. Particles emitted in pairs (left + right) using tangent-frame at the player quaternion. Group parented to gameObject parent (scene root) so particles live in world space."
+  tags:
+    - vehicle
+    - vfx
+  priority: 0
+  throttleConfig:
+    throttlePriority: "MEDIUM"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: true
+  attributes:
+    globeRadius:
+      name: "Globe Radius"
+      type: "number"
+      default: 5
+      min: 0.1
+      max: 200
+    driftThreshold:
+      name: "Drift Activation Threshold"
+      type: "number"
+      default: 0.4
+      min: 0
+      max: 1
+      description: "|turnRate| above this counts as drifting."
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  @import "spherical-math" as S;
+
+  const LOG_TAG = "[tinyskies.carpetDriftSmoke]";
+
+  // Source CarpetDriftSmoke.ts:14-26 — verbatim.
+  const POOL_SIZE = 120;
+  const LIFETIME_MIN = 0.35;
+  const LIFETIME_MAX = 0.70;
+  const EMIT_RATE = 28;
+  const SIDE_OFFSET = 0.055;
+  const UP_SPEED = 0.06;
+  const OUT_SPEED = 0.04;
+  const SIZE_BASE = 0.06;
+  const SIZE_GROW = 0.18;
+  const START_ALPHA_MIN = 0.18;
+  const START_ALPHA_MAX = 0.32;
+
+  this.init = function (_game) {
+    this._game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+
+    // Pool.
+    this._pool = [];
+    for (let i = 0; i < POOL_SIZE; i++) {
+      this._pool.push({ alive: false, age: 0, lifetime: 1, startAlpha: 0, px: 0, py: 0, pz: 0, vx: 0, vy: 0, vz: 0 });
+    }
+
+    const positions = new Float32Array(POOL_SIZE * 3);
+    const alphas = new Float32Array(POOL_SIZE);
+    const sizes = new Float32Array(POOL_SIZE);
+
+    this._posAttr = new THREE.BufferAttribute(positions, 3);
+    this._alphaAttr = new THREE.BufferAttribute(alphas, 1);
+    this._sizeAttr = new THREE.BufferAttribute(sizes, 1);
+
+    const geo = new THREE.BufferGeometry(); // @check-ok no editor preview — drift smoke is play-only
+    geo.setAttribute("position", this._posAttr);
+    geo.setAttribute("alpha", this._alphaAttr);
+    geo.setAttribute("size", this._sizeAttr);
+    this._geo = geo;
+
+    // PointsNodeMaterial — engine-friendly WebGPU substitute for source's
+    // raw GLSL ShaderMaterial. Per-particle alpha / size driven by buffer
+    // attributes via vertexColors.
+    const colArray = new Float32Array(POOL_SIZE * 4);
+    this._colAttr = new THREE.BufferAttribute(colArray, 4);
+    geo.setAttribute("color", this._colAttr);
+
+    this._mat = new THREE.PointsNodeMaterial({
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      vertexColors: true,
+      sizeAttenuation: true,
+      size: SIZE_BASE,
+    });
+
+    this._points = new THREE.Points(geo, this._mat);
+    this._points.frustumCulled = false;
+    this._points.userData.isRuntimeOnly = true;
+
+    this._group = new THREE.Group();
+    this._group.userData.isRuntimeOnly = true;
+    this._group.visible = false;
+    this._group.add(this._points);
+    const sceneParent = this.gameObject._internal.three.parent || this.gameObject._internal.three;
+    sceneParent.add(this._group);
+
+    this._emitAccum = 0;
+    this._tmpUp = new THREE.Vector3();
+    this._tmpForward = new THREE.Vector3();
+    this._tmpRight = new THREE.Vector3();
+    this._tmpOrigin = new THREE.Vector3();
+    this._tmpQ = new THREE.Quaternion();
+
+    this._log("init");
+  };
+
+  this._emit = function (origin, up, right, sideSign, intensity) {
+    let slot = -1;
+    for (let i = 0; i < POOL_SIZE; i++) {
+      if (!this._pool[i].alive) { slot = i; break; }
+    }
+    if (slot < 0) return;
+    const p = this._pool[slot];
+    p.alive = true;
+    p.age = 0;
+    p.lifetime = LIFETIME_MIN + Math.random() * (LIFETIME_MAX - LIFETIME_MIN);
+    p.startAlpha = (START_ALPHA_MIN + Math.random() * (START_ALPHA_MAX - START_ALPHA_MIN)) * intensity;
+    p.px = origin.x + right.x * SIDE_OFFSET * sideSign;
+    p.py = origin.y + right.y * SIDE_OFFSET * sideSign;
+    p.pz = origin.z + right.z * SIDE_OFFSET * sideSign;
+    const upJitter = 0.5 + Math.random() * 0.5;
+    const outJitter = 0.5 + Math.random() * 0.6;
+    p.vx = up.x * UP_SPEED * upJitter + right.x * OUT_SPEED * outJitter * sideSign;
+    p.vy = up.y * UP_SPEED * upJitter + right.y * OUT_SPEED * outJitter * sideSign;
+    p.vz = up.z * UP_SPEED * upJitter + right.z * OUT_SPEED * outJitter * sideSign;
+  };
+
+  this._tickPool = function (dt) {
+    const positions = this._posAttr.array;
+    const colors = this._colAttr.array;
+    const sizes = this._sizeAttr.array;
+    for (let i = 0; i < POOL_SIZE; i++) {
+      const p = this._pool[i];
+      if (!p.alive) {
+        colors[i * 4] = 0; colors[i * 4 + 1] = 0; colors[i * 4 + 2] = 0; colors[i * 4 + 3] = 0;
+        sizes[i] = 0;
+        continue;
+      }
+      p.age += dt;
+      if (p.age >= p.lifetime) {
+        p.alive = false;
+        colors[i * 4] = 0; colors[i * 4 + 1] = 0; colors[i * 4 + 2] = 0; colors[i * 4 + 3] = 0;
+        sizes[i] = 0;
+        continue;
+      }
+      p.px += p.vx * dt;
+      p.py += p.vy * dt;
+      p.pz += p.vz * dt;
+      positions[i * 3]     = p.px;
+      positions[i * 3 + 1] = p.py;
+      positions[i * 3 + 2] = p.pz;
+      const t = p.age / p.lifetime;
+      const a = p.startAlpha * (1 - t) * (1 - t);
+      // Warm beige tint, additive.
+      colors[i * 4]     = 0.9 * a;
+      colors[i * 4 + 1] = 0.85 * a;
+      colors[i * 4 + 2] = 0.78 * a;
+      colors[i * 4 + 3] = a;
+      sizes[i] = SIZE_BASE + t * SIZE_GROW;
+    }
+    this._posAttr.needsUpdate = true;
+    this._colAttr.needsUpdate = true;
+    this._sizeAttr.needsUpdate = true;
+  };
+
+  this._reset = function () {
+    for (const p of this._pool) p.alive = false;
+    this._colAttr.array.fill(0);
+    this._sizeAttr.array.fill(0);
+    this._colAttr.needsUpdate = true;
+    this._sizeAttr.needsUpdate = true;
+    this._emitAccum = 0;
+  };
+
+  this.update = function (deltaTime) {
+    if (!this._group) return;
+    const dt = Math.min(deltaTime, 0.1);
+    const store = this.erth.store;
+    const vt = store.get("tinyskies/vehicleType") || "plane";
+    const isCarpet = (vt === "carpet");
+
+    if (!isCarpet) {
+      if (this._group.visible) {
+        this._group.visible = false;
+        this._reset();
+      }
+      return;
+    }
+    if (!this._group.visible) this._group.visible = true;
+
+    this._tickPool(dt);
+
+    const turnRate = store.get("tinyskies/turnRate") || 0;
+    const driftIntensity = Math.min(1, Math.abs(turnRate));
+    const isDrifting = driftIntensity > this.getAttribute("driftThreshold");
+
+    if (!isDrifting || driftIntensity < 0.05) {
+      this._emitAccum = 0;
+      return;
+    }
+
+    this._emitAccum += EMIT_RATE * driftIntensity * dt;
+    const count = Math.floor(this._emitAccum);
+    if (count < 1) return;
+    this._emitAccum -= count;
+
+    const qx = store.get("tinyskies/qx");
+    const qy = store.get("tinyskies/qy");
+    const qz = store.get("tinyskies/qz");
+    const qw = store.get("tinyskies/qw");
+    const altitude = store.get("tinyskies/altitude");
+    const heading = store.get("tinyskies/heading") || 0;
+    if (qx === undefined || qy === undefined || qz === undefined || qw === undefined || altitude === undefined) return;
+    this._tmpQ.set(qx, qy, qz, qw);
+    const radius = this.getAttribute("globeRadius");
+
+    const frame = S.tangentFrame(this._tmpQ);
+    this._tmpUp.copy(frame.up);
+    this._tmpForward.set(0, 0, 0)
+      .addScaledVector(frame.north, Math.cos(heading))
+      .addScaledVector(frame.east, Math.sin(heading))
+      .normalize();
+    this._tmpRight.crossVectors(this._tmpForward, this._tmpUp).normalize();
+    const origin = S.cartesianFromSpherical(this._tmpQ, altitude * 0.98, radius);
+    this._tmpOrigin.copy(origin);
+
+    for (let i = 0; i < count; i++) {
+      this._emit(this._tmpOrigin, this._tmpUp, this._tmpRight, -1, driftIntensity);
+      this._emit(this._tmpOrigin, this._tmpUp, this._tmpRight,  1, driftIntensity);
+    }
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    if (this._geo && typeof this._geo.dispose === "function") this._geo.dispose();
+    if (this._mat && typeof this._mat.dispose === "function") this._mat.dispose();
+    if (this._group && this._group.parent) this._group.parent.remove(this._group);
+    this._group = null;
+    this._geo = null;
+    this._mat = null;
+    this._points = null;
+    this._pool = null;
+  };

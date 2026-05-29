@@ -1,0 +1,1211 @@
+meta:
+  tool: StemStudio
+  type: behavior
+  exportVersion: 1
+
+config:
+  name: "TinySkies Globe Landmarks"
+  id: "tinyskies.globeLandmarks"
+  author: "script-wizard"
+  isScript: true
+  main: "script.js"
+  version: "1.0.0"
+  description: "Procedural landmarks on the deformed globe — 3 observatories with hemisphere domes, 4 stonehenge rings with bobbing floating stones, 5 shrine groups with torii gates + main hall + circle of trees, and 2 stepped pyramids. Source-faithful port of source Globe.ts createObservatories / buildObservatory / createStonehenges / buildStonehenge / createShrines / buildShrineGroup. Pyramid substituted procedurally because the source loads /3D/pyramid.glb which is not in our asset set; Statue and MoonstoneRuins skipped per FDR-006 (Statue gated by post-victory progression flag, MoonstoneRuins is 518 LOC of GLB-loaded ruins with cinematic effects)."
+  documentation: "Spawns four landmark systems at init in the source order so each later system's de-conflict checks see prior `_centers` arrays. All buildings are merged-bucket geometry (one mesh per material) for draw-call efficiency, mirroring the source's mergeGeometries pattern. Stonehenge stones bob and tilt in update at per-stone seeded amp/speed/phase. Shrine sparkle particles deferred (source uses raw ShaderMaterial; WebGL2 only). Source seeds: 4321+seed (observatories), 8888+seed (stonehenges), 7777+seed (shrines), 939191+seed (pyramid)."
+  tags:
+    - visual
+    - environment
+    - landmarks
+  priority: 0
+  throttleConfig:
+    throttlePriority: "HIGH"
+    enableFrustumCulling: false
+    enableDistanceThrottling: false
+    requiresConsistentUpdates: false
+  attributes:
+    radius:
+      name: "Globe Radius"
+      type: "number"
+      default: 5
+      min: 0.5
+      max: 200
+    terrainSeed:
+      name: "Terrain Seed"
+      type: "number"
+      default: 42
+      min: 1
+      max: 1000000
+    terrainType:
+      name: "Terrain Type"
+      type: "string"
+      default: "default"
+    observatoryCount:
+      name: "Observatory Count"
+      type: "number"
+      default: 3
+      min: 0
+      max: 12
+    stonehengeCount:
+      name: "Stonehenge Count"
+      type: "number"
+      default: 4
+      min: 0
+      max: 12
+    shrineCount:
+      name: "Shrine Count"
+      type: "number"
+      default: 5
+      min: 0
+      max: 12
+    pyramidCount:
+      name: "Pyramid Count"
+      type: "number"
+      default: 2
+      min: 0
+      max: 8
+    shrineNormalsStoreKey:
+      name: "Shrine Normals Store Key"
+      type: "string"
+      default: "tinyskies/shrineNormals"
+    debugLogs:
+      name: "Debug Logs"
+      type: "boolean"
+      default: false
+
+code: |-
+  @import "terrain" as T;
+  @import "spherical-math" as S;
+
+  const LOG_TAG = "[tinyskies.globeLandmarks]";
+
+  // Soft circular sprite for the shrine sparkle particle system. See
+  // tinyskiesGlobeVegetation.yaml for the same helper (intentionally
+  // duplicated rather than @imported because the @import host is asset
+  // scripts, and a shared "common-vfx" asset would have to ship as its
+  // own @import script — defer to a follow-up if more behaviors need it).
+  function buildSoftSpriteTexture() {
+    const canvas = document.createElement("canvas"); // @check-ok
+    canvas.width = 64;
+    canvas.height = 64;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+    const grad = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+    grad.addColorStop(0, "rgba(255,255,255,1)");
+    grad.addColorStop(0.4, "rgba(255,255,255,0.6)");
+    grad.addColorStop(1, "rgba(255,255,255,0)");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, 64, 64);
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }
+
+  // -----------------------------------------------------------------
+  // Helpers
+  // -----------------------------------------------------------------
+
+  function applyRimLight(mat, rimColorHex, intensity, power) {
+    const TSL = THREE.TSL;
+    const c = new THREE.Color(rimColorHex);
+    const viewDir = TSL.normalize(TSL.cameraPosition.sub(TSL.positionWorld));
+    // dFdx/dFdy-derived normal — no `normal` attribute needed, so the material compiles cleanly in shadow / AO passes that strip lighting attrs (avoids TSL "Vertex attribute 'normal' not found" warnings that pin frame budget).
+    const nW = TSL.normalize(TSL.cross(TSL.dFdx(TSL.positionWorld), TSL.dFdy(TSL.positionWorld)));
+    const fresnel = TSL.float(1.0).sub(TSL.dot(viewDir, nW).abs());
+    const rim = TSL.vec3(c.r, c.g, c.b)
+      .mul(TSL.float(intensity))
+      .mul(TSL.pow(fresnel, TSL.float(power)));
+    mat.emissiveNode = rim;
+    mat.needsUpdate = true;
+  }
+
+  function createTeardropGeo() {
+    const segments = 10;
+    const points = [];
+    for (let i = 0; i <= segments; i++) {
+      const t = i / segments;
+      const r = Math.pow(Math.sin(t * Math.PI), 0.35) * Math.pow(1 - t, 0.5);
+      points.push(new THREE.Vector2(r, t));
+    }
+    const geo = new THREE.LatheGeometry(points, 6);
+    const bottomColor = new THREE.Color(0.3, 0.55, 0.2);
+    const topColor = new THREE.Color(0.7, 0.92, 0.6);
+    const posAttr = geo.attributes.position;
+    const colors = new Float32Array(posAttr.count * 3);
+    for (let i = 0; i < posAttr.count; i++) {
+      const t = Math.max(0, Math.min(1, posAttr.getY(i)));
+      const c = bottomColor.clone().lerp(topColor, t);
+      const ao = THREE.MathUtils.lerp(0.1, 1.0, Math.min(1, t * 2.0));
+      c.multiplyScalar(ao);
+      colors[i * 3]     = c.r;
+      colors[i * 3 + 1] = c.g;
+      colors[i * 3 + 2] = c.b;
+    }
+    geo.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+    return geo;
+  }
+
+  // Generic geometry-bucket merge (replaces source's BufferGeometryUtils.mergeGeometries).
+  // All inputs share the same vertex layout we synthesize: position + normal + index.
+  function mergeGeoBucket(geos) {
+    if (geos.length === 0) return null;
+    let totalVerts = 0;
+    let totalIdx = 0;
+    let hasIndex = false;
+    for (const g of geos) {
+      if (!g.attributes.normal) g.computeVertexNormals();
+      totalVerts += g.attributes.position.count;
+      if (g.index) { totalIdx += g.index.count; hasIndex = true; }
+    }
+    const positions = new Float32Array(totalVerts * 3);
+    const normals = new Float32Array(totalVerts * 3);
+    const indices = hasIndex ? new Uint32Array(totalIdx) : null;
+    let vOffset = 0;
+    let iOffset = 0;
+    for (const g of geos) {
+      const pos = g.attributes.position;
+      const norm = g.attributes.normal;
+      for (let i = 0; i < pos.count; i++) {
+        const idx = (vOffset + i) * 3;
+        positions[idx]     = pos.getX(i);
+        positions[idx + 1] = pos.getY(i);
+        positions[idx + 2] = pos.getZ(i);
+        normals[idx]     = norm ? norm.getX(i) : 0;
+        normals[idx + 1] = norm ? norm.getY(i) : 1;
+        normals[idx + 2] = norm ? norm.getZ(i) : 0;
+      }
+      if (indices && g.index) {
+        for (let i = 0; i < g.index.count; i++) indices[iOffset + i] = g.index.getX(i) + vOffset;
+        iOffset += g.index.count;
+      } else if (indices) {
+        // Pad with sequential indices for an unindexed contributor in an indexed bucket.
+        for (let i = 0; i < pos.count; i++) indices[iOffset + i] = vOffset + i;
+        iOffset += pos.count;
+      }
+      vOffset += pos.count;
+    }
+    const merged = new THREE.BufferGeometry();
+    merged.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+    merged.setAttribute("normal", new THREE.Float32BufferAttribute(normals, 3));
+    if (indices) merged.setIndex(new THREE.BufferAttribute(indices, 1));
+    for (const g of geos) g.dispose();
+    return merged;
+  }
+
+  // -----------------------------------------------------------------
+  // Stonehenge geometry (source Globe.ts:4357 buildStonehenge)
+  // Returns { group, floatingMeshes } — floating meshes get bobbed in update.
+  // -----------------------------------------------------------------
+
+  function buildStonehenge(rand) {
+    const sarsenMat = new THREE.MeshStandardNodeMaterial({ color: 0x9a9080, flatShading: true, roughness: 0.85, metalness: 0 });
+    const lintelMat = new THREE.MeshStandardNodeMaterial({ color: 0xb0a898, flatShading: true, roughness: 0.85, metalness: 0 });
+    const altarMat  = new THREE.MeshStandardNodeMaterial({ color: 0x706860, flatShading: true, roughness: 0.85, metalness: 0 });
+    applyRimLight(sarsenMat, 0xffe8d0, 0.42, 2.8);
+    applyRimLight(lintelMat, 0xfff0dd, 0.4, 2.75);
+    applyRimLight(altarMat,  0xd8d0c4, 0.35, 2.85);
+
+    const staticBuckets = { sarsen: [], lintel: [], altar: [] };
+    const SC = 2.2;
+
+    const R_OUT = 0.095 * SC, R_IN = 0.056 * SC;
+    const OUTER_H = 0.040 * SC, OUTER_W = 0.012 * SC, OUTER_D = 0.010 * SC;
+    const INNER_H = 0.054 * SC, INNER_W = 0.014 * SC, INNER_D = 0.012 * SC;
+    const LINTEL_H = 0.009 * SC, LINTEL_D = 0.011 * SC;
+    const HALF_GAP = 0.009 * SC;
+    const OUTER_CHORD = 2 * R_OUT * Math.sin(Math.PI / 10) * 1.08;
+    const INNER_LINTEL_W = INNER_W * 2 + HALF_GAP * 2 + 0.004 * SC;
+
+    const outerFallen = []; for (let i = 0; i < 10; i++) outerFallen.push(rand() < 0.28);
+    const outerYaw = []; for (let i = 0; i < 10; i++) outerYaw.push((rand() - 0.5) * 0.35);
+    const skipLintel = []; for (let i = 0; i < 10; i++) skipLintel.push(rand() < 0.10);
+    const innerFallenTri = Math.floor(rand() * 5);
+    const innerHasFallen = rand() < 0.45;
+    const innerFallenSign = rand() < 0.5 ? -1 : 1;
+
+    const g = new THREE.Group();
+    g.userData.isRuntimeOnly = true;
+    const floatingMeshes = [];
+
+    const tagFloat = (mesh, baseY) => {
+      mesh.userData.isFloating = rand() > 0.35;
+      mesh.userData.baseY = baseY;
+      mesh.userData.amp = (0.016 + rand() * 0.022) * SC;
+      mesh.userData.speed = 0.55 + rand() * 0.55;
+      mesh.userData.phase = rand() * Math.PI * 2;
+      mesh.userData.tiltX = (rand() - 0.5) * 1.2;
+      mesh.userData.tiltZ = (rand() - 0.5) * 1.2;
+      if (mesh.userData.isFloating) floatingMeshes.push(mesh);
+    };
+
+    // Outer sarsen ring (10 uprights)
+    for (let i = 0; i < 10; i++) {
+      const a = (i / 10) * Math.PI * 2;
+      const px = Math.sin(a) * R_OUT;
+      const pz = Math.cos(a) * R_OUT;
+      if (outerFallen[i]) {
+        const geo = new THREE.BoxGeometry(OUTER_W, OUTER_H, OUTER_D);
+        geo.translate(0, OUTER_H / 2, 0);
+        geo.rotateX(Math.PI / 2);
+        geo.translate(0, OUTER_D / 2, 0);
+        geo.rotateY(a + outerYaw[i]);
+        geo.translate(px, 0, pz);
+        staticBuckets.sarsen.push(geo);
+      } else {
+        const geo = new THREE.BoxGeometry(OUTER_W, OUTER_H, OUTER_D);
+        const mesh = new THREE.Mesh(geo, sarsenMat);
+        mesh.position.set(px, OUTER_H / 2, pz);
+        mesh.userData.isRuntimeOnly = true;
+        tagFloat(mesh, OUTER_H / 2);
+        g.add(mesh);
+      }
+    }
+    // Outer lintels
+    for (let i = 0; i < 10; i++) {
+      const j = (i + 1) % 10;
+      if (outerFallen[i] || outerFallen[j] || skipLintel[i]) continue;
+      const midA = ((i + 0.5) / 10) * Math.PI * 2;
+      const baseY = OUTER_H + LINTEL_H / 2;
+      const geo = new THREE.BoxGeometry(OUTER_CHORD, LINTEL_H, LINTEL_D);
+      const mesh = new THREE.Mesh(geo, lintelMat);
+      mesh.rotation.y = midA;
+      mesh.position.set(Math.sin(midA) * R_OUT, baseY, Math.cos(midA) * R_OUT);
+      mesh.userData.isRuntimeOnly = true;
+      tagFloat(mesh, baseY);
+      g.add(mesh);
+    }
+    // Inner horseshoe — 5 trilithons
+    for (let i = 0; i < 5; i++) {
+      const a = -Math.PI * 0.8 + (i / 4) * Math.PI * 1.6;
+      const rx = Math.sin(a) * R_IN;
+      const rz = Math.cos(a) * R_IN;
+      const tx = Math.cos(a);
+      const tz = -Math.sin(a);
+      const thisFallen = innerHasFallen && i === innerFallenTri;
+      for (const sign of [-1, 1]) {
+        const px = rx + tx * sign * HALF_GAP;
+        const pz = rz + tz * sign * HALF_GAP;
+        if (thisFallen && sign === innerFallenSign) {
+          const geo = new THREE.BoxGeometry(INNER_W, INNER_H, INNER_D);
+          geo.translate(0, INNER_H / 2, 0);
+          geo.rotateX(Math.PI / 2);
+          geo.translate(0, INNER_D / 2, 0);
+          geo.rotateY(a + Math.PI);
+          geo.translate(px, 0, pz);
+          staticBuckets.sarsen.push(geo);
+        } else {
+          const geo = new THREE.BoxGeometry(INNER_W, INNER_H, INNER_D);
+          const mesh = new THREE.Mesh(geo, sarsenMat);
+          mesh.position.set(px, INNER_H / 2, pz);
+          mesh.userData.isRuntimeOnly = true;
+          tagFloat(mesh, INNER_H / 2);
+          g.add(mesh);
+        }
+      }
+      if (!thisFallen) {
+        const baseY = INNER_H + LINTEL_H / 2;
+        const geo = new THREE.BoxGeometry(INNER_LINTEL_W, LINTEL_H, LINTEL_D);
+        const mesh = new THREE.Mesh(geo, lintelMat);
+        mesh.rotation.y = a;
+        mesh.position.set(rx, baseY, rz);
+        mesh.userData.isRuntimeOnly = true;
+        tagFloat(mesh, baseY);
+        g.add(mesh);
+      }
+    }
+    // Altar
+    {
+      const baseY = 0.0025 * SC;
+      const geo = new THREE.BoxGeometry(0.022 * SC, 0.005 * SC, 0.013 * SC);
+      const mesh = new THREE.Mesh(geo, altarMat);
+      mesh.position.set(0, baseY, 0);
+      mesh.userData.isRuntimeOnly = true;
+      tagFloat(mesh, baseY);
+      g.add(mesh);
+    }
+    // Heel stone
+    {
+      const baseY = OUTER_H * 0.43;
+      const geo = new THREE.CylinderGeometry(0.005 * SC, 0.008 * SC, OUTER_H * 0.85, 5);
+      const mesh = new THREE.Mesh(geo, altarMat);
+      mesh.rotation.z = 0.13;
+      mesh.position.set(0, baseY, R_OUT + 0.032 * SC);
+      mesh.userData.isRuntimeOnly = true;
+      tagFloat(mesh, baseY);
+      g.add(mesh);
+    }
+    // Merge static (fallen / ground) geometry per material
+    const mats = { sarsen: sarsenMat, lintel: lintelMat, altar: altarMat };
+    for (const key of Object.keys(staticBuckets)) {
+      const merged = mergeGeoBucket(staticBuckets[key]);
+      if (merged) {
+        const mesh = new THREE.Mesh(merged, mats[key]);
+        mesh.userData.isRuntimeOnly = true;
+        g.add(mesh);
+      }
+    }
+    return { group: g, floatingMeshes };
+  }
+
+  // -----------------------------------------------------------------
+  // Observatory geometry (source Globe.ts:4529 buildObservatory)
+  // -----------------------------------------------------------------
+
+  function buildObservatory(rand) {
+    const stoneMat   = new THREE.MeshStandardNodeMaterial({ color: 0xd0c8b8, flatShading: true, roughness: 0.8, metalness: 0 });
+    const stoneDkMat = new THREE.MeshStandardNodeMaterial({ color: 0xa89880, flatShading: true, roughness: 0.85, metalness: 0 });
+    const domeMat    = new THREE.MeshStandardNodeMaterial({ color: 0xb0b8c4, flatShading: true, roughness: 0.5, metalness: 0.05 });
+    const slitMat    = new THREE.MeshStandardNodeMaterial({ color: 0x333340, flatShading: true });
+    const windowMat  = new THREE.MeshStandardNodeMaterial({ color: 0x5a90b8, flatShading: true });
+    const frameMat   = new THREE.MeshStandardNodeMaterial({ color: 0x555555, flatShading: true });
+    const doorMat    = new THREE.MeshStandardNodeMaterial({ color: 0x5a4030, flatShading: true });
+    const stepMat    = new THREE.MeshStandardNodeMaterial({ color: 0xb8b0a0, flatShading: true });
+    const finderMat  = new THREE.MeshStandardNodeMaterial({ color: 0x777777, flatShading: true });
+    applyRimLight(stoneMat,   0xc8d8f0, 0.42, 2.65);
+    applyRimLight(stoneDkMat, 0xb8c8e0, 0.38, 2.7);
+    applyRimLight(domeMat,    0xd0e0f8, 0.48, 2.4);
+    applyRimLight(slitMat,    0x8899aa, 0.22, 3.2);
+    applyRimLight(windowMat,  0x88c8f8, 0.45, 2.5);
+    applyRimLight(frameMat,   0xccd0dd, 0.35, 2.8);
+    applyRimLight(doorMat,    0xffccb8, 0.32, 2.75);
+    applyRimLight(stepMat,    0xd8d0c8, 0.36, 2.65);
+    applyRimLight(finderMat,  0xccd0dd, 0.38, 2.7);
+
+    const buckets = { stone: [], stoneDk: [], dome: [], slit: [], window: [], frame: [], door: [], step: [], finder: [] };
+    const SC = 2.5;
+
+    const foundW = 0.115 * SC, foundD = 0.095 * SC, foundH = 0.05 * SC;
+    const foundGeo = new THREE.BoxGeometry(foundW, foundH, foundD);
+    foundGeo.translate(0, -foundH / 2, 0);
+    buckets.stone.push(foundGeo);
+
+    const corniceGeo = new THREE.BoxGeometry(foundW + 0.005 * SC, 0.004 * SC, foundD + 0.005 * SC);
+    corniceGeo.translate(0, 0.002 * SC, 0);
+    buckets.stoneDk.push(corniceGeo);
+
+    const baseW = 0.12 * SC, baseD = 0.10 * SC, baseH = 0.03 * SC;
+    const baseGeo = new THREE.BoxGeometry(baseW, baseH, baseD);
+    baseGeo.translate(0, baseH / 2, 0);
+    buckets.stone.push(baseGeo);
+
+    const pillarW = 0.018 * SC;
+    for (const dx of [-1, 1]) for (const dz of [-1, 1]) {
+      const pillar = new THREE.BoxGeometry(pillarW, baseH + 0.004 * SC, pillarW);
+      pillar.translate(dx * (baseW / 2), baseH / 2, dz * (baseD / 2));
+      buckets.stoneDk.push(pillar);
+    }
+
+    const stairW = 0.03 * SC;
+    for (let i = 0; i < 3; i++) {
+      const step = new THREE.BoxGeometry(stairW, 0.004 * SC, 0.008 * SC);
+      step.translate(0, 0.002 * SC + i * 0.004 * SC, baseD / 2 + 0.015 * SC - i * 0.006 * SC);
+      buckets.step.push(step);
+    }
+
+    const roofGeo = new THREE.BoxGeometry(baseW + 0.01 * SC, 0.003 * SC, baseD + 0.01 * SC);
+    roofGeo.translate(0, baseH + 0.0015 * SC, 0);
+    buckets.stoneDk.push(roofGeo);
+
+    const railH = 0.008 * SC, railT = 0.002 * SC;
+    for (const dz of [-1, 1]) {
+      const rail = new THREE.BoxGeometry(baseW + 0.01 * SC, railH, railT);
+      rail.translate(0, baseH + 0.003 * SC + railH / 2, dz * (baseD / 2 + 0.004 * SC));
+      buckets.frame.push(rail);
+    }
+    for (const dx of [-1, 1]) {
+      const rail = new THREE.BoxGeometry(railT, railH, baseD + 0.01 * SC);
+      rail.translate(dx * (baseW / 2 + 0.004 * SC), baseH + 0.003 * SC + railH / 2, 0);
+      buckets.frame.push(rail);
+    }
+
+    const doorW = 0.018 * SC, doorH = 0.022 * SC;
+    const doorGeo = new THREE.BoxGeometry(doorW, doorH, 0.004 * SC);
+    doorGeo.translate(0, doorH / 2 + 0.012 * SC, baseD / 2 + 0.001 * SC);
+    buckets.door.push(doorGeo);
+    const dFrameGeo = new THREE.BoxGeometry(doorW + 0.004 * SC, doorH + 0.002 * SC, 0.002 * SC);
+    dFrameGeo.translate(0, doorH / 2 + 0.013 * SC, baseD / 2 + 0.002 * SC);
+    buckets.frame.push(dFrameGeo);
+
+    const winSize = 0.012 * SC;
+    for (const side of [-1, 1]) for (const xOff of [-0.035 * SC, 0.035 * SC]) {
+      const winGeo = new THREE.BoxGeometry(winSize, winSize, 0.003 * SC);
+      winGeo.translate(xOff, baseH * 0.55, (baseD / 2 + 0.001 * SC) * side);
+      buckets.window.push(winGeo);
+      const fr = new THREE.BoxGeometry(winSize + 0.004 * SC, winSize + 0.004 * SC, 0.002 * SC);
+      fr.translate(xOff, baseH * 0.55, (baseD / 2 + 0.002 * SC) * side);
+      buckets.frame.push(fr);
+    }
+
+    const drumR = 0.045 * SC, drumH = 0.015 * SC, drumY = baseH + 0.003 * SC;
+    const drumGeo = new THREE.CylinderGeometry(drumR, drumR + 0.002 * SC, drumH, 24);
+    drumGeo.translate(0, drumY + drumH / 2, 0);
+    buckets.stone.push(drumGeo);
+    const bandGeo = new THREE.CylinderGeometry(drumR + 0.003 * SC, drumR + 0.003 * SC, 0.003 * SC, 24);
+    bandGeo.translate(0, drumY + drumH, 0);
+    buckets.stoneDk.push(bandGeo);
+
+    const domeR = drumR + 0.001 * SC;
+    const domeY = drumY + drumH + 0.001 * SC;
+    const profile = [];
+    for (let i = 0; i <= 16; i++) {
+      const angle = (i / 16) * Math.PI * 0.5;
+      profile.push(new THREE.Vector2(Math.cos(angle) * domeR, Math.sin(angle) * domeR));
+    }
+    const domeGeo = new THREE.LatheGeometry(profile, 24);
+    domeGeo.translate(0, domeY, 0);
+    buckets.dome.push(domeGeo);
+
+    const slitAngle = rand() * Math.PI * 2;
+    const stripeW = 0.01 * SC;
+    for (let i = 0; i < 16; i++) {
+      const a0 = (i / 16) * Math.PI, a1 = ((i + 1) / 16) * Math.PI;
+      const y0 = domeY + Math.sin(a0) * domeR, y1 = domeY + Math.sin(a1) * domeR;
+      const r0 = Math.cos(a0) * (domeR + 0.001 * SC), r1 = Math.cos(a1) * (domeR + 0.001 * SC);
+      const segH = Math.sqrt((y1 - y0) ** 2 + (r1 - r0) ** 2);
+      const segGeo = new THREE.BoxGeometry(stripeW, segH, 0.003 * SC);
+      segGeo.rotateX(Math.atan2(r1 - r0, y1 - y0));
+      segGeo.translate(0, (y0 + y1) / 2, (r0 + r1) / 2);
+      segGeo.rotateY(slitAngle);
+      buckets.slit.push(segGeo);
+    }
+
+    const scopeR = 0.007 * SC;
+    const scopeGeo = new THREE.CylinderGeometry(scopeR, scopeR * 0.85, domeR * 1.2, 12);
+    scopeGeo.rotateX(-(Math.PI * 0.30));
+    scopeGeo.translate(0, domeY + domeR * 0.42, domeR * 0.22);
+    scopeGeo.rotateY(slitAngle);
+    buckets.finder.push(scopeGeo);
+    const shieldGeo = new THREE.CylinderGeometry(scopeR * 1.3, scopeR * 1.1, 0.012 * SC, 12);
+    shieldGeo.rotateX(-(Math.PI * 0.30));
+    shieldGeo.translate(0, domeY + domeR * 0.68, domeR * 0.40);
+    shieldGeo.rotateY(slitAngle);
+    buckets.slit.push(shieldGeo);
+    const mountGeo = new THREE.BoxGeometry(0.01 * SC, 0.015 * SC, 0.01 * SC);
+    mountGeo.translate(0, domeY + domeR * 0.25, domeR * 0.1);
+    mountGeo.rotateY(slitAngle);
+    buckets.frame.push(mountGeo);
+
+    const secW = 0.035 * SC;
+    const secGeo = new THREE.BoxGeometry(secW, 0.02 * SC, secW);
+    secGeo.translate(-baseW * 0.35, baseH + 0.01 * SC, -baseD * 0.35);
+    buckets.stone.push(secGeo);
+    const secDome = new THREE.SphereGeometry(secW * 0.45, 12, 8, 0, Math.PI * 2, 0, Math.PI / 2);
+    secDome.translate(-baseW * 0.35, baseH + 0.02 * SC, -baseD * 0.35);
+    buckets.dome.push(secDome);
+    const secSlit = new THREE.BoxGeometry(0.004 * SC, secW * 0.5, 0.004 * SC);
+    secSlit.translate(-baseW * 0.35, baseH + 0.025 * SC, -baseD * 0.35 + secW * 0.2);
+    buckets.slit.push(secSlit);
+
+    const ventGeo = new THREE.CylinderGeometry(0.003 * SC, 0.004 * SC, 0.015 * SC, 6);
+    ventGeo.translate(baseW * 0.35, baseH + 0.0075 * SC, baseD * 0.35);
+    buckets.stoneDk.push(ventGeo);
+
+    const g = new THREE.Group();
+    g.userData.isRuntimeOnly = true;
+    const mats = { stone: stoneMat, stoneDk: stoneDkMat, dome: domeMat, slit: slitMat, window: windowMat, frame: frameMat, door: doorMat, step: stepMat, finder: finderMat };
+    for (const key of Object.keys(buckets)) {
+      const merged = mergeGeoBucket(buckets[key]);
+      if (merged) {
+        const mesh = new THREE.Mesh(merged, mats[key]);
+        mesh.userData.isRuntimeOnly = true;
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+        g.add(mesh);
+      }
+    }
+    return g;
+  }
+
+  // -----------------------------------------------------------------
+  // Shrine geometry (source Globe.ts:3929 buildShrineGroup)
+  // Sparkle particle stream skipped per FDR-006.
+  // -----------------------------------------------------------------
+
+  function buildShrineGroup(rand) {
+    const toriiMat  = new THREE.MeshStandardNodeMaterial({ color: 0xc04428, flatShading: true, roughness: 0.7, metalness: 0 });
+    const stoneMat  = new THREE.MeshStandardNodeMaterial({ color: 0x8a8278, flatShading: true, roughness: 0.85, metalness: 0 });
+    const woodMat   = new THREE.MeshStandardNodeMaterial({ color: 0x6e4a32, flatShading: true, roughness: 0.8, metalness: 0 });
+    const roofMat   = new THREE.MeshStandardNodeMaterial({ color: 0x4a5258, flatShading: true, roughness: 0.6, metalness: 0.05 });
+    const accentMat = new THREE.MeshStandardNodeMaterial({ color: 0xc0a060, flatShading: true, roughness: 0.5, metalness: 0.3 });
+    applyRimLight(toriiMat,  0xff8866, 0.42, 2.65);
+    applyRimLight(stoneMat,  0xe8e0d8, 0.36, 2.75);
+    applyRimLight(woodMat,   0xffccaa, 0.32, 2.85);
+    applyRimLight(roofMat,   0x668877, 0.35, 2.8);
+    applyRimLight(accentMat, 0xffeebb, 0.5, 3.0);
+
+    const treeMat = new THREE.MeshStandardNodeMaterial({ vertexColors: true, flatShading: true, roughness: 0.85, metalness: 0 });
+    applyRimLight(treeMat, 0xffeeaa, 0.55, 3.0);
+
+    const SC = 1.175;
+    const g = new THREE.Group();
+    g.userData.isRuntimeOnly = true;
+
+    const toriiParts = [], stoneParts = [], woodParts = [], roofParts = [], accentParts = [];
+
+    // 1. Stone base + path
+    const platW = 0.22 * SC, platD = 0.26 * SC, platH = 0.015 * SC;
+    const plat = new THREE.BoxGeometry(platW, platH, platD); plat.translate(0, platH * 0.5, -0.02 * SC);
+    stoneParts.push(plat);
+    const path = new THREE.BoxGeometry(0.06 * SC, platH * 0.8, 0.18 * SC); path.translate(0, platH * 0.4, 0.12 * SC);
+    stoneParts.push(path);
+
+    // 2. Torii gate
+    const toriiZ = 0.14 * SC;
+    const postH = 0.11 * SC, postR = 0.007 * SC, toriiSpan = 0.045 * SC;
+    const postGeo = new THREE.CylinderGeometry(postR * 0.8, postR, postH, 8);
+    postGeo.translate(0, platH + postH * 0.5, 0);
+    const postL = postGeo.clone(); postL.translate(-toriiSpan, 0, toriiZ); postL.rotateZ(-0.04); toriiParts.push(postL);
+    const postRG = postGeo.clone(); postRG.translate(toriiSpan, 0, toriiZ); postRG.rotateZ(0.04); toriiParts.push(postRG);
+    postGeo.dispose();
+    const kasagiW = toriiSpan * 2 + 0.04 * SC, kasagiH = 0.012 * SC, kasagiD = 0.012 * SC;
+    const kasagiY = platH + postH;
+    const kasagi = new THREE.BoxGeometry(kasagiW, kasagiH, kasagiD); kasagi.translate(0, kasagiY, toriiZ);
+    toriiParts.push(kasagi);
+    const kasagiTop = new THREE.BoxGeometry(kasagiW * 1.05, kasagiH * 0.4, kasagiD * 0.8); kasagiTop.translate(0, kasagiY + kasagiH * 0.7, toriiZ);
+    toriiParts.push(kasagiTop);
+    const nukiW = toriiSpan * 2 + 0.02 * SC, nukiH = 0.008 * SC, nukiY = platH + postH * 0.75;
+    const nuki = new THREE.BoxGeometry(nukiW, nukiH, kasagiD * 0.8); nuki.translate(0, nukiY, toriiZ);
+    toriiParts.push(nuki);
+    const gakuzuka = new THREE.BoxGeometry(0.006 * SC, kasagiY - nukiY, 0.008 * SC); gakuzuka.translate(0, (kasagiY + nukiY) * 0.5, toriiZ);
+    toriiParts.push(gakuzuka);
+
+    // 3. Stone lanterns
+    const buildLantern = (lx, lz) => {
+      const base = new THREE.BoxGeometry(0.018 * SC, 0.01 * SC, 0.018 * SC); base.translate(lx, platH + 0.005 * SC, lz);
+      stoneParts.push(base);
+      const stem = new THREE.CylinderGeometry(0.005 * SC, 0.006 * SC, 0.03 * SC, 6); stem.translate(lx, platH + 0.02 * SC, lz);
+      stoneParts.push(stem);
+      const house = new THREE.BoxGeometry(0.014 * SC, 0.014 * SC, 0.014 * SC); house.translate(lx, platH + 0.042 * SC, lz);
+      stoneParts.push(house);
+      const lRoof = new THREE.CylinderGeometry(0, 0.022 * SC, 0.012 * SC, 4); lRoof.rotateY(Math.PI / 4); lRoof.translate(lx, platH + 0.055 * SC, lz);
+      stoneParts.push(lRoof);
+      const jewel = new THREE.SphereGeometry(0.004 * SC, 4, 4); jewel.translate(lx, platH + 0.063 * SC, lz);
+      stoneParts.push(jewel);
+    };
+    buildLantern(-0.05 * SC, 0.18 * SC);
+    buildLantern(0.05 * SC, 0.18 * SC);
+
+    // 4. Main hall (Honden)
+    const hallZ = -0.04 * SC;
+    const deckW = 0.14 * SC, deckD = 0.12 * SC, deckH = 0.008 * SC;
+    const deckY = platH + 0.015 * SC;
+    const deck = new THREE.BoxGeometry(deckW, deckH, deckD); deck.translate(0, deckY, hallZ);
+    woodParts.push(deck);
+    for (let i = 0; i < 3; i++) {
+      const st = new THREE.BoxGeometry(0.04 * SC, 0.005 * SC, 0.01 * SC);
+      st.translate(0, platH + 0.0025 * SC + i * 0.005 * SC, hallZ + deckD / 2 + 0.01 * SC - i * 0.008 * SC);
+      woodParts.push(st);
+    }
+    const wallW = 0.10 * SC, wallD = 0.08 * SC, wallH = 0.055 * SC;
+    const wallY = deckY + deckH * 0.5 + wallH * 0.5;
+    const walls = new THREE.BoxGeometry(wallW, wallH, wallD); walls.translate(0, wallY, hallZ);
+    woodParts.push(walls);
+    const pillarR = 0.004 * SC, pillarH = wallH + deckH;
+    const px = wallW * 0.5 + 0.002 * SC, pz = wallD * 0.5 + 0.002 * SC;
+    const pY = deckY + pillarH * 0.5 - deckH * 0.5;
+    for (const dx of [-1, 1]) for (const dz of [-1, 1]) {
+      const pil = new THREE.CylinderGeometry(pillarR, pillarR, pillarH, 6);
+      pil.translate(dx * px, pY, hallZ + dz * pz);
+      woodParts.push(pil);
+    }
+    const roofW = 0.15 * SC, roofSlopeL = 0.075 * SC, roofThick = 0.012 * SC, roofAngle = 0.6;
+    const roofYBase = wallY + wallH * 0.5 - 0.005 * SC;
+    const roofFront = new THREE.BoxGeometry(roofW, roofThick, roofSlopeL); roofFront.translate(0, 0, roofSlopeL * 0.5); roofFront.rotateX(roofAngle); roofFront.translate(0, roofYBase, hallZ);
+    roofParts.push(roofFront);
+    const roofBack = new THREE.BoxGeometry(roofW, roofThick, roofSlopeL); roofBack.translate(0, 0, -roofSlopeL * 0.5); roofBack.rotateX(-roofAngle); roofBack.translate(0, roofYBase, hallZ);
+    roofParts.push(roofBack);
+    const ridgeY = roofYBase + Math.sin(roofAngle) * roofSlopeL * 0.5 + 0.005 * SC;
+    const ridge = new THREE.CylinderGeometry(0.006 * SC, 0.006 * SC, roofW * 0.95, 6); ridge.rotateZ(Math.PI / 2); ridge.translate(0, ridgeY, hallZ);
+    accentParts.push(ridge);
+    for (const side of [-1, 1]) {
+      const cx = side * (roofW * 0.4);
+      const chigi1 = new THREE.BoxGeometry(0.004 * SC, 0.05 * SC, 0.006 * SC); chigi1.translate(0, 0.05 * SC * 0.2, 0); chigi1.rotateX(0.7); chigi1.translate(cx, ridgeY - 0.005 * SC, hallZ);
+      woodParts.push(chigi1);
+      const chigi2 = new THREE.BoxGeometry(0.004 * SC, 0.05 * SC, 0.006 * SC); chigi2.translate(0, 0.05 * SC * 0.2, 0); chigi2.rotateX(-0.7); chigi2.translate(cx, ridgeY - 0.005 * SC, hallZ);
+      woodParts.push(chigi2);
+    }
+    const kCount = 5;
+    for (let i = 0; i < kCount; i++) {
+      const kx = -roofW * 0.3 + (i / (kCount - 1)) * roofW * 0.6;
+      const kat = new THREE.CylinderGeometry(0.005 * SC, 0.005 * SC, 0.025 * SC, 8); kat.rotateX(Math.PI / 2); kat.translate(kx, ridgeY + 0.004 * SC, hallZ);
+      accentParts.push(kat);
+    }
+
+    // Merge buckets
+    const mats = { torii: toriiMat, stone: stoneMat, wood: woodMat, roof: roofMat, accent: accentMat };
+    const partsByMat = { torii: toriiParts, stone: stoneParts, wood: woodParts, roof: roofParts, accent: accentParts };
+    for (const key of Object.keys(partsByMat)) {
+      const merged = mergeGeoBucket(partsByMat[key]);
+      if (merged) {
+        const mesh = new THREE.Mesh(merged, mats[key]);
+        mesh.userData.isRuntimeOnly = true;
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+        g.add(mesh);
+      }
+    }
+
+    // Trees in arc behind hall
+    const TREE_N = 14;
+    const treeGeo = createTeardropGeo();
+    const trees = new THREE.InstancedMesh(treeGeo, treeMat, TREE_N);
+    trees.castShadow = true;
+    trees.receiveShadow = false;
+    trees.userData.isRuntimeOnly = true;
+    const dummy = new THREE.Object3D();
+    for (let i = 0; i < TREE_N; i++) {
+      const angle = -Math.PI * 0.8 + (i / (TREE_N - 1)) * Math.PI * 1.6;
+      const r = 0.12 * SC + rand() * 0.04 * SC;
+      const x = Math.sin(angle) * r;
+      const z = hallZ + Math.cos(angle) * r * 0.8;
+      const sc = (0.012 + rand() * 0.010) * SC;
+      dummy.position.set(x, platH, z);
+      dummy.scale.set(sc, sc * 2.45, sc);
+      dummy.rotation.y = rand() * Math.PI * 2;
+      dummy.updateMatrix();
+      trees.setMatrixAt(i, dummy.matrix);
+    }
+    trees.instanceMatrix.needsUpdate = true;
+    g.add(trees);
+
+    return g;
+  }
+
+  // -----------------------------------------------------------------
+  // Pyramid — procedural stepped substitute (source loads /3D/pyramid.glb
+  // which is not in our asset set). Five-tier ziggurat with sandstone
+  // material; visually a "pyramid" landmark even if not byte-faithful.
+  // -----------------------------------------------------------------
+
+  function buildPyramid() {
+    const stoneMat = new THREE.MeshStandardNodeMaterial({ color: 0xc8a474, flatShading: true, roughness: 0.85, metalness: 0 });
+    const stoneDkMat = new THREE.MeshStandardNodeMaterial({ color: 0xa48450, flatShading: true, roughness: 0.85, metalness: 0 });
+    applyRimLight(stoneMat, 0xffe8c0, 0.52, 2.75);
+    applyRimLight(stoneDkMat, 0xe8c898, 0.45, 2.75);
+
+    const g = new THREE.Group();
+    g.userData.isRuntimeOnly = true;
+
+    const TIERS = 5;
+    const baseSize = 0.32;
+    const tierH = 0.045;
+    const stoneParts = [];
+    const trimParts = [];
+    for (let t = 0; t < TIERS; t++) {
+      const f = 1 - t / TIERS;
+      const sz = baseSize * (0.55 + 0.45 * f);
+      const geo = new THREE.BoxGeometry(sz, tierH, sz);
+      geo.translate(0, tierH * 0.5 + t * tierH, 0);
+      stoneParts.push(geo);
+      // trim cornice between tiers
+      if (t < TIERS - 1) {
+        const trim = new THREE.BoxGeometry(sz * 0.98, 0.006, sz * 0.98);
+        trim.translate(0, tierH + t * tierH, 0);
+        trimParts.push(trim);
+      }
+    }
+    // capstone
+    const capH = 0.04;
+    const capGeo = new THREE.ConeGeometry(baseSize * 0.08, capH, 4);
+    capGeo.translate(0, TIERS * tierH + capH * 0.5, 0);
+    capGeo.rotateY(Math.PI / 4);
+    trimParts.push(capGeo);
+
+    const stoneMerged = mergeGeoBucket(stoneParts);
+    if (stoneMerged) {
+      const m = new THREE.Mesh(stoneMerged, stoneMat);
+      m.userData.isRuntimeOnly = true;
+      m.castShadow = true; m.receiveShadow = true;
+      g.add(m);
+    }
+    const trimMerged = mergeGeoBucket(trimParts);
+    if (trimMerged) {
+      const m = new THREE.Mesh(trimMerged, stoneDkMat);
+      m.userData.isRuntimeOnly = true;
+      m.castShadow = true; m.receiveShadow = true;
+      g.add(m);
+    }
+    return g;
+  }
+
+  // -----------------------------------------------------------------
+  // Lifecycle
+  // -----------------------------------------------------------------
+
+  let game;
+
+  this.init = function (_game) {
+    game = _game;
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._buildVisuals(this.gameObject._internal.three);
+    this._registerParticleSystemsWithBatchedRenderer();
+    this._log("init");
+  };
+
+  this.onEditorAdded = function () {
+    this._log = (...args) => {
+      if (this.getAttribute("debugLogs")) console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
+    };
+    this._buildVisuals(this.gameObject._internal.three);
+  };
+
+  this.onEditorAttributesUpdated = function () {
+    this._teardownVisuals();
+    this._buildVisuals(this.gameObject._internal.three);
+  };
+
+  this.onEditorDispose = function () {
+    this._teardownVisuals();
+  };
+
+  this.dispose = function () {
+    this._log("dispose");
+    this._teardownVisuals();
+  };
+
+  // Source Globe.ts update (5631-5731): floating stones bob along their local
+  // baseY axis with sin(time*speed + phase) * amp; tilt is applied around
+  // local X/Z. We accumulate a single time scalar and walk the floating list.
+  this.update = function (deltaTime) {
+    if (!this._floatingStones || this._floatingStones.length === 0) return;
+    this._floatTime = (this._floatTime || 0) + Math.min(deltaTime, 0.1);
+    const t = this._floatTime;
+    for (const m of this._floatingStones) {
+      const u = m.userData;
+      const wave = Math.sin(t * u.speed + u.phase);
+      m.position.y = u.baseY + wave * u.amp;
+      m.rotation.x = u.tiltX * wave;
+      m.rotation.z = u.tiltZ * wave;
+    }
+  };
+
+  // -----------------------------------------------------------------
+  // Builders
+  // -----------------------------------------------------------------
+
+  this._buildVisuals = function (parent) {
+    const radius = this.getAttribute("radius");
+    const seed = this.getAttribute("terrainSeed");
+    const terrainType = this.getAttribute("terrainType");
+
+    const root = new THREE.Group();
+    root.name = "tinyskiesGlobeLandmarks";
+    root.userData.isRuntimeOnly = true;
+
+    this._observatoryCenters = [];
+    this._stonehengeCenters = [];
+    this._shrineCenters = [];
+    this._pyramidCenters = [];
+    this._floatingStones = [];
+    this._floatTime = 0;
+
+    this._buildObservatories(root, radius, seed, terrainType, this.getAttribute("observatoryCount"));
+    this._buildStonehenges(root, radius, seed, terrainType, this.getAttribute("stonehengeCount"));
+    this._buildShrines(root, radius, seed, terrainType, this.getAttribute("shrineCount"));
+    this._buildPyramids(root, radius, seed, terrainType, this.getAttribute("pyramidCount"));
+
+    parent.add(root);
+    this._root = root;
+  };
+
+  // Source Globe.ts:1942 createObservatories — 3 observatories at
+  // 0.22 ≤ elevation ≤ 0.60 (hilltop), separation 0.90 cosine, > 0.97 cos
+  // away from villages/lighthouses/windmills.
+  this._buildObservatories = function (root, radius, seed, terrainType, count) {
+    const rand = S.seededRandom(4321 + seed);
+    const propSink = T.getPropTerrainSink();
+    const REF_UP = new THREE.Vector3(0, 1, 0);
+    const MIN_E = 0.22, MAX_E = 0.60, MIN_SEP = 0.90;
+
+    const candidates = [];
+    let attempts = 0;
+    while (attempts < 2000 && candidates.length < 40) {
+      attempts++;
+      const theta = rand() * Math.PI * 2;
+      const phi = Math.acos(2 * rand() - 1);
+      const nx = Math.sin(phi) * Math.cos(theta);
+      const ny = Math.cos(phi);
+      const nz = Math.sin(phi) * Math.sin(theta);
+      const sample = T.sampleTerrain(seed, terrainType, nx, ny, nz);
+      if (!sample.isLand) continue;
+      if (sample.elevation < MIN_E || sample.elevation > MAX_E) continue;
+      candidates.push({ normal: new THREE.Vector3(nx, ny, nz), elevation: sample.elevation });
+    }
+    candidates.sort((a, b) => b.elevation - a.elevation);
+
+    const chosen = [];
+    for (const c of candidates) {
+      if (chosen.length >= count) break;
+      let tooClose = false;
+      for (const v of chosen) { if (c.normal.dot(v) > MIN_SEP) { tooClose = true; break; } }
+      if (!tooClose) chosen.push(c.normal);
+    }
+    if (chosen.length === 0) return;
+
+    for (const normal of chosen) {
+      this._observatoryCenters.push({ normal: normal.clone() });
+      const disp = T.surfaceDisplacementAt(seed, terrainType, normal.x, normal.y, normal.z);
+      const OBS_EXTRA_SINK = 0.045;
+      const surfaceR = radius + disp - propSink - OBS_EXTRA_SINK;
+      const obs = buildObservatory(rand);
+      obs.position.copy(normal.clone().multiplyScalar(surfaceR));
+      obs.quaternion.setFromUnitVectors(REF_UP, normal);
+      root.add(obs);
+    }
+    this._log("observatories placed", chosen.length);
+  };
+
+  // Source Globe.ts:2011 createStonehenges — 4 rings at MIN_SEP 0.88 cos,
+  // MAX_WATER_RATIO 0.10. Floating stones tracked for update().
+  this._buildStonehenges = function (root, radius, seed, terrainType, count) {
+    const rand = S.seededRandom(8888 + seed);
+    const propSink = T.getPropTerrainSink();
+    const REF_UP = new THREE.Vector3(0, 1, 0);
+    const MIN_E = 0.02, MAX_E = 0.30;
+    const INLAND_CHECKS = 12, INLAND_CHECK_DIST = 0.10, MAX_WATER = 0.10;
+    const MIN_SEP = 0.88;
+
+    const candidates = [];
+    let attempts = 0;
+    while (attempts < 2000 && candidates.length < 50) {
+      attempts++;
+      const theta = rand() * Math.PI * 2;
+      const phi = Math.acos(2 * rand() - 1);
+      const nx = Math.sin(phi) * Math.cos(theta);
+      const ny = Math.cos(phi);
+      const nz = Math.sin(phi) * Math.sin(theta);
+      const sample = T.sampleTerrain(seed, terrainType, nx, ny, nz);
+      if (!sample.isLand) continue;
+      if (sample.elevation < MIN_E || sample.elevation > MAX_E) continue;
+      const cn = new THREE.Vector3(nx, ny, nz);
+      if (T.waterRatioAround(seed, terrainType, nx, ny, nz, INLAND_CHECK_DIST, INLAND_CHECKS) > MAX_WATER) continue;
+
+      let tooClose = false;
+      for (const v of this._observatoryCenters) {
+        if (cn.dot(v.normal) > 0.97) { tooClose = true; break; }
+      }
+      if (tooClose) continue;
+      candidates.push({ normal: cn, elevation: sample.elevation });
+    }
+    candidates.sort((a, b) => a.elevation - b.elevation);
+
+    const chosen = [];
+    for (const c of candidates) {
+      if (chosen.length >= count) break;
+      let tooClose = false;
+      for (const v of chosen) { if (c.normal.dot(v) > MIN_SEP) { tooClose = true; break; } }
+      if (!tooClose) chosen.push(c.normal);
+    }
+    if (chosen.length === 0) return;
+
+    for (const normal of chosen) {
+      this._stonehengeCenters.push({ normal: normal.clone() });
+      const disp = T.surfaceDisplacementAt(seed, terrainType, normal.x, normal.y, normal.z);
+      const surfaceR = radius + disp - propSink;
+      const { group: sh, floatingMeshes } = buildStonehenge(rand);
+      sh.position.copy(normal.clone().multiplyScalar(surfaceR));
+      sh.quaternion.setFromUnitVectors(REF_UP, normal);
+      sh.rotateY(rand() * Math.PI * 2);
+      root.add(sh);
+      for (const m of floatingMeshes) this._floatingStones.push(m);
+    }
+    this._log("stonehenges placed", chosen.length, "floating-stones", this._floatingStones.length);
+  };
+
+  // Source Globe.ts:2107 createShrines — 5 shrines at flat inland sites,
+  // forest density < 0.2 (open lands), MAX_ROUGHNESS 0.055.
+  this._buildShrines = function (root, radius, seed, terrainType, count) {
+    const rand = S.seededRandom(7777 + seed);
+    const propSink = T.getPropTerrainSink();
+    const REF_UP = new THREE.Vector3(0, 1, 0);
+    const MIN_E = 0.02, MAX_E = 0.28;
+    const INLAND_CHECKS = 12, INLAND_CHECK_DIST = 0.10, MAX_WATER = 0.10;
+    const ROUGH_RING_DIST = 0.09, MAX_ROUGH = 0.055;
+    const MIN_SEP = 0.88;
+    const forestNoise = T.createNoise3D(seed + 999);
+
+    const candidates = [];
+    let attempts = 0;
+    while (attempts < 2000 && candidates.length < 60) {
+      attempts++;
+      const theta = rand() * Math.PI * 2;
+      const phi = Math.acos(2 * rand() - 1);
+      const nx = Math.sin(phi) * Math.cos(theta);
+      const ny = Math.cos(phi);
+      const nz = Math.sin(phi) * Math.sin(theta);
+      const sample = T.sampleTerrain(seed, terrainType, nx, ny, nz);
+      if (!sample.isLand) continue;
+      if (sample.elevation < MIN_E || sample.elevation > MAX_E) continue;
+      if (forestNoise(nx * 2.5, ny * 2.5, nz * 2.5) > 0.2) continue;
+      const cn = new THREE.Vector3(nx, ny, nz);
+      if (T.waterRatioAround(seed, terrainType, nx, ny, nz, INLAND_CHECK_DIST, INLAND_CHECKS) > MAX_WATER) continue;
+      if (T.terrainRingElevationRoughness(seed, terrainType, nx, ny, nz, ROUGH_RING_DIST) > MAX_ROUGH) continue;
+
+      let tooClose = false;
+      for (const v of this._observatoryCenters) { if (cn.dot(v.normal) > 0.97) { tooClose = true; break; } }
+      if (tooClose) continue;
+      for (const v of this._stonehengeCenters) { if (cn.dot(v.normal) > 0.97) { tooClose = true; break; } }
+      if (tooClose) continue;
+      candidates.push({ normal: cn, elevation: sample.elevation });
+    }
+    candidates.sort((a, b) => a.elevation - b.elevation);
+
+    const chosen = [];
+    for (const c of candidates) {
+      if (chosen.length >= count) break;
+      let tooClose = false;
+      for (const v of chosen) { if (c.normal.dot(v) > MIN_SEP) { tooClose = true; break; } }
+      if (!tooClose) chosen.push(c.normal);
+    }
+    if (chosen.length === 0) return;
+
+    for (const normal of chosen) {
+      this._shrineCenters.push({ normal: normal.clone() });
+      const disp = T.surfaceDisplacementAt(seed, terrainType, normal.x, normal.y, normal.z);
+      const surfaceR = radius + disp - propSink;
+      const sh = buildShrineGroup(rand);
+      sh.position.copy(normal.clone().multiplyScalar(surfaceR));
+      sh.quaternion.setFromUnitVectors(REF_UP, normal);
+      sh.rotateY(rand() * Math.PI * 2);
+      // Shrine sparkle emitter — source Globe.ts:2169-2235 used a raw
+      // ShaderMaterial with per-instance gold sparkles. Replaced with a
+      // three.quarks ParticleSystem rising from the shrine center.
+      const sparkleEmitter = this._addShrineSparkles(normal, surfaceR);
+      if (sparkleEmitter) sh.add(sparkleEmitter);
+      root.add(sh);
+    }
+    this._log("shrines placed", chosen.length);
+
+    // Publish shrine normals for the carpet selfie quest.
+    if (this.erth && this.erth.store && this._shrineCenters) {
+      const payload = this._shrineCenters.map((c, i) => ({ index: i, normal: [c.normal.x, c.normal.y, c.normal.z] }));
+      this.erth.store.set(this.getAttribute("shrineNormalsStoreKey") || "tinyskies/shrineNormals", payload);
+    }
+  };
+
+  // Source Globe.ts:3065 createPyramid — picks the flattest 2 lowland sites.
+  // Source loads /3D/pyramid.glb; we substitute a procedural stepped pyramid.
+  this._buildPyramids = function (root, radius, seed, terrainType, count) {
+    const rand = S.seededRandom(939191 + seed);
+    const propSink = T.getPropTerrainSink();
+    const REF_UP = new THREE.Vector3(0, 1, 0);
+    const MIN_E = 0.02, MAX_E = 0.32;
+    const INLAND_CHECKS = 8, INLAND_CHECK_DIST = 0.07, MAX_WATER = 0.26;
+    const ROUGH_RING_DIST = 0.085, MAX_ROUGH = 0.26;
+    const MIN_SEP = 0.80;
+
+    const pool = [];
+    let attempts = 0;
+    while (attempts < 12000 && pool.length < 400) {
+      attempts++;
+      const theta = rand() * Math.PI * 2;
+      const phi = Math.acos(2 * rand() - 1);
+      const nx = Math.sin(phi) * Math.cos(theta);
+      const ny = Math.cos(phi);
+      const nz = Math.sin(phi) * Math.sin(theta);
+      const sample = T.sampleTerrain(seed, terrainType, nx, ny, nz);
+      if (!sample.isLand) continue;
+      if (sample.elevation < MIN_E || sample.elevation > MAX_E) continue;
+      const cn = new THREE.Vector3(nx, ny, nz);
+      if (T.waterRatioAround(seed, terrainType, nx, ny, nz, INLAND_CHECK_DIST, INLAND_CHECKS) > MAX_WATER) continue;
+      const rough = T.terrainRingElevationRoughness(seed, terrainType, nx, ny, nz, ROUGH_RING_DIST);
+      if (rough > MAX_ROUGH) continue;
+
+      let tooClose = false;
+      for (const v of this._observatoryCenters) { if (cn.dot(v.normal) > 0.97) { tooClose = true; break; } }
+      if (tooClose) continue;
+      for (const v of this._stonehengeCenters) { if (cn.dot(v.normal) > 0.97) { tooClose = true; break; } }
+      if (tooClose) continue;
+      for (const v of this._shrineCenters) { if (cn.dot(v.normal) > 0.97) { tooClose = true; break; } }
+      if (tooClose) continue;
+      pool.push({ normal: cn, elevation: sample.elevation, rough });
+    }
+    if (pool.length === 0) return;
+    pool.sort((a, b) => (a.elevation - b.elevation) || (a.rough - b.rough));
+
+    const chosen = [];
+    for (const c of pool) {
+      if (chosen.length >= count) break;
+      let tooClose = false;
+      for (const v of chosen) { if (c.normal.dot(v) > MIN_SEP) { tooClose = true; break; } }
+      if (!tooClose) chosen.push(c.normal.clone());
+    }
+    if (chosen.length === 0) return;
+
+    const spin = S.seededRandom(484848 + seed);
+
+    // GLB-template clone path. Source Globe.ts:3134-3199 loads /3D/pyramid.glb
+    // via GLTFLoader, normalizes to TARGET_MAX_DIM=0.36, grounds the lowest
+    // mesh vertex onto the surface. We replicate that with the engine's
+    // already-imported PyramidModel template (shipped via stemscript
+    // `import model` directive). Falls back to the procedural ziggurat if
+    // the template is missing (e.g. asset failed to import).
+    const TARGET_MAX_DIM = 0.36;
+    const pyramidTemplate = game?.scene?.getObjectByName?.("PyramidModel") || null;
+
+    for (const normal of chosen) {
+      this._pyramidCenters.push({ normal: normal.clone() });
+      const disp = T.surfaceDisplacementAt(seed, terrainType, normal.x, normal.y, normal.z);
+      const surfaceR = radius + disp - propSink;
+
+      let py;
+      if (pyramidTemplate) {
+        py = pyramidTemplate.clone(true);
+        py.userData = py.userData || {};
+        py.userData.isRuntimeOnly = true;
+        py.traverse((c) => {
+          if (c) {
+            c.userData = c.userData || {};
+            c.userData.isRuntimeOnly = true;
+            if (c.isMesh) {
+              c.castShadow = true;
+              c.receiveShadow = true;
+              c.visible = true;
+            }
+            c.visible = true;
+          }
+        });
+        py.visible = true;
+        // Uniform scale to target max dim
+        const box = new THREE.Box3().setFromObject(py);
+        const size = new THREE.Vector3();
+        box.getSize(size);
+        const maxDim = Math.max(size.x, size.y, size.z, 1e-4);
+        py.scale.setScalar(TARGET_MAX_DIM / maxDim);
+      } else {
+        py = buildPyramid();
+      }
+
+      py.position.copy(normal.clone().multiplyScalar(surfaceR));
+      py.quaternion.setFromUnitVectors(REF_UP, normal);
+      py.rotateY(spin() * Math.PI * 2);
+
+      // Ground the lowest mesh vertex along the surface normal so the model
+      // sits on the surface regardless of its model-space pivot.
+      if (pyramidTemplate) {
+        py.updateMatrixWorld(true);
+        const lift = surfaceR - minVertexProjectionAlongNormal(py, normal);
+        if (Number.isFinite(lift)) py.position.addScaledVector(normal, lift);
+      }
+      root.add(py);
+    }
+    this._log("pyramids placed", chosen.length, pyramidTemplate ? "(GLB)" : "(procedural fallback)");
+  };
+
+  // Walks every mesh vertex transformed to world space, returns the smallest
+  // projection along `normal` (i.e. the lowest point along the surface
+  // normal). Used by GLB grounding so the model rests on the surface
+  // regardless of its model-space pivot. Source: Globe.ts uses the same
+  // helper inline in createPyramid / createStatue / createMoonstoneRuins.
+  function minVertexProjectionAlongNormal(root, normal) {
+    let minVal = Infinity;
+    const v = new THREE.Vector3();
+    root.updateMatrixWorld(true);
+    root.traverse((child) => {
+      if (!child.isMesh) return;
+      const pos = child.geometry?.attributes?.position;
+      if (!pos) return;
+      for (let i = 0; i < pos.count; i++) {
+        v.fromBufferAttribute(pos, i);
+        v.applyMatrix4(child.matrixWorld);
+        const d = v.dot(normal);
+        if (d < minVal) minVal = d;
+      }
+    });
+    return minVal;
+  }
+
+  // -----------------------------------------------------------------
+  // Teardown
+  // -----------------------------------------------------------------
+
+  this._addShrineSparkles = function (normal, surfaceR) {
+    if (typeof ParticleSystem === "undefined") return null;
+    if (!this._spriteTexture) this._spriteTexture = buildSoftSpriteTexture();
+    if (!this._spriteTexture) return null;
+    if (!this._particleEmitters) this._particleEmitters = [];
+
+    const mat = new THREE.MeshBasicNodeMaterial({
+      map: this._spriteTexture,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    });
+    const ps = new ParticleSystem({
+      duration: 5,
+      looping: true,
+      startLife: new Quarks.IntervalValue(1.5, 2.6),
+      startSpeed: new Quarks.IntervalValue(0.10, 0.20),
+      startSize: new Quarks.IntervalValue(0.012, 0.020),
+      // Warm magical gold (matching source vec3(1.0, 0.9, 0.6))
+      startColor: new Quarks.RandomColor(
+        new THREE.Vector4(1.0, 0.92, 0.65, 0.85),
+        new THREE.Vector4(1.0, 0.85, 0.55, 0.85),
+      ),
+      emissionOverTime: new Quarks.ConstantValue(16),
+      shape: new SphereEmitter({ radius: 0.06 }),
+      material: mat,
+      renderMode: Quarks.RenderMode.BillBoard,
+      worldSpace: true,
+    });
+    const emitter = new ParticleEmitter(ps);
+    emitter.userData.isRuntimeOnly = true;
+    // Emitter is added as a child of the shrine group; the shrine's own
+    // surface-aligned quaternion already orients local +Y to the surface
+    // normal, so spawning at local origin emits along normal naturally.
+    emitter.position.set(0, 0.04, 0);
+    this._particleEmitters.push(emitter);
+    return emitter;
+  };
+
+  this._registerParticleSystemsWithBatchedRenderer = function () {
+    if (!this._particleEmitters || this._particleEmitters.length === 0) return;
+    const br = game?.scene?.getObjectByProperty?.("type", "BatchedRenderer");
+    if (!br) {
+      this._log("BatchedRenderer not found — particles will not render this frame");
+      return;
+    }
+    for (const e of this._particleEmitters) {
+      if (e && e.system) br.addSystem(e.system);
+    }
+    this._batchedRenderer = br;
+  };
+
+  this._teardownVisuals = function () {
+    if (!this._root) return;
+    if (this._batchedRenderer && this._particleEmitters) {
+      for (const e of this._particleEmitters) {
+        if (e && e.system) {
+          try { this._batchedRenderer.deleteSystem(e.system); } catch (_) {}
+        }
+      }
+    }
+    if (this._particleEmitters) {
+      for (const e of this._particleEmitters) {
+        if (e && e.system && typeof e.system.dispose === "function") {
+          try { e.system.dispose(); } catch (_) {}
+        }
+      }
+    }
+    if (this._spriteTexture) {
+      try { this._spriteTexture.dispose(); } catch (_) {}
+      this._spriteTexture = null;
+    }
+    this._root.traverse((child) => {
+      if (child.geometry && typeof child.geometry.dispose === "function") child.geometry.dispose();
+      if (child.material) {
+        if (Array.isArray(child.material)) {
+          for (const m of child.material) if (m && typeof m.dispose === "function") m.dispose();
+        } else if (typeof child.material.dispose === "function") {
+          child.material.dispose();
+        }
+      }
+    });
+    if (this._root.parent) this._root.parent.remove(this._root);
+    this._root = null;
+    this._floatingStones = null;
+    this._floatTime = 0;
+    this._particleEmitters = null;
+    this._batchedRenderer = null;
+  };
