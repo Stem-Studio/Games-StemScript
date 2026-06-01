@@ -988,7 +988,13 @@ code: |
 
   function unwrapModelInstance(instance) {
     if (!instance) return null;
-    if (instance.target) return instance.target;
+    // erth.asset.model.createInstance() resolves to a GameObject wrapper whose
+    // raw THREE.Object3D lives at _internal.three. We need the real Object3D so
+    // we can add() it to a group and traverse()/transform it; the wrapper itself
+    // is not a THREE.Object3D (its .rotation is a Quaternion, it has no .add).
+    if (instance._internal && instance._internal.three) return instance._internal.three;
+    if (instance.target) return instance.target; // legacy this.target shape
+    if (instance.isObject3D) return instance;     // already a raw Object3D
     return instance;
   }
 
@@ -1421,6 +1427,7 @@ code: |
     }, false);
     ui.guideButton = createUIButton("Guide", 72, function() {
       state.showGuide = !state.showGuide;
+      state.dirtyTop = true; // refreshTopBar applies the overlay show/hide
     }, false);
     buttonRow.add(ui.langButton);
     buttonRow.add(ui.musicButton);
@@ -1434,9 +1441,9 @@ code: |
     ui.topBar.add(rightTop);
 
     ui.leftPanel = new UIKit.Container(useNodeMaterialProps({
-      position: "absolute",
-      left: 14,
-      top: 92,
+      positionType: "absolute",
+      positionLeft: 14,
+      positionTop: 92,
       width: 220,
       backgroundColor: COLORS.panel,
       borderRadius: 12,
@@ -1447,9 +1454,9 @@ code: |
     }));
 
     ui.rightPanel = new UIKit.Container(useNodeMaterialProps({
-      position: "absolute",
-      right: 14,
-      top: 92,
+      positionType: "absolute",
+      positionRight: 14,
+      positionTop: 92,
       width: 240,
       backgroundColor: COLORS.panel,
       borderRadius: 12,
@@ -1460,10 +1467,10 @@ code: |
     }));
 
     ui.footerBar = new UIKit.Container(useNodeMaterialProps({
-      position: "absolute",
-      left: 14,
-      right: 14,
-      bottom: 14,
+      positionType: "absolute",
+      positionLeft: 14,
+      positionRight: 14,
+      positionBottom: 14,
       backgroundColor: COLORS.panel,
       borderRadius: 12,
       padding: 12,
@@ -1481,9 +1488,9 @@ code: |
     ui.footerBar.add(ui.footerStability);
 
     ui.toastLayer = new UIKit.Container(useNodeMaterialProps({
-      position: "absolute",
-      bottom: 88,
-      right: 18,
+      positionType: "absolute",
+      positionBottom: 88,
+      positionRight: 18,
       width: 320,
       flexDirection: "column",
       gap: 6,
@@ -1492,7 +1499,9 @@ code: |
     }));
 
     ui.guideOverlay = new UIKit.Container(useNodeMaterialProps({
-      position: "absolute",
+      positionType: "absolute",
+      positionLeft: 0,
+      positionTop: 0,
       width: "100%",
       height: "100%",
       backgroundColor: COLORS.overlay,
@@ -1521,6 +1530,7 @@ code: |
     }));
     let startButton = createUIButton("Start City", 160, function() {
       state.showGuide = false;
+      state.dirtyTop = true; // refreshTopBar runs -> guide overlay hides now, not on the next day tick
     }, true);
     guideCard.add(guideTitle);
     guideCard.add(guideBody);
@@ -1528,7 +1538,9 @@ code: |
     ui.guideOverlay.add(guideCard);
 
     ui.mapOverlay = new UIKit.Container(useNodeMaterialProps({
-      position: "absolute",
+      positionType: "absolute",
+      positionLeft: 0,
+      positionTop: 0,
       width: "100%",
       height: "100%",
       backgroundColor: COLORS.overlay,
@@ -1553,8 +1565,11 @@ code: |
     rebuildToastLayer();
     refreshTopBar();
     refreshFooter();
-    ui.guideOverlay.setProperties({ visibility: state.showGuide ? 'visible' : 'hidden' });
-    ui.mapOverlay.setProperties({ visibility: state.showMap ? 'visible' : 'hidden' });
+    // Use display:none (not visibility:hidden) so a hidden full-screen overlay
+    // is removed from layout AND raycasting — otherwise its pointerEvents:"auto"
+    // mesh keeps intercepting clicks meant for the HUD buttons behind it.
+    ui.guideOverlay.setProperties({ display: state.showGuide ? 'flex' : 'none' });
+    ui.mapOverlay.setProperties({ display: state.showMap ? 'flex' : 'none' });
   }
 
   function rebuildPalettePanel() {
@@ -1740,7 +1755,7 @@ code: |
   function rebuildMapOverlay() {
     if (!ui.mapOverlay) return;
     clearUIChildren(ui.mapOverlay);
-    ui.mapOverlay.setProperties({ visibility: state.showMap ? 'visible' : 'hidden' });
+    ui.mapOverlay.setProperties({ display: state.showMap ? 'flex' : 'none' });
     if (!state.showMap) {
       state.dirtyMap = false;
       return;
@@ -1828,7 +1843,11 @@ code: |
     ui.musicButton._label.setProperties({ text: state.musicEnabled ? "Music On" : "Music Off" });
     ui.mapButton._label.setProperties({ text: state.showMap ? "Hide Map" : "Map" });
     ui.guideButton._label.setProperties({ text: state.showGuide ? "Hide Guide" : "Guide" });
-    ui.guideOverlay.setProperties({ visibility: state.showGuide ? 'visible' : 'hidden' });
+    // display (not visibility): a hidden full-screen overlay with
+    // pointerEvents:"auto" still raycast-blocks the HUD buttons under
+    // visibility:"hidden". refreshTopBar runs on every dirty-top frame, so this
+    // is the path that was re-introducing the click-blocker after "Start City".
+    ui.guideOverlay.setProperties({ display: state.showGuide ? 'flex' : 'none' });
     state.dirtyTop = false;
   }
 
@@ -2050,12 +2069,30 @@ code: |
       state.hoveredTileKey = visual ? visual.key : null;
       updateAllTileHighlights();
     };
-    this._onClick = function(event) {
-      if (nowMs() < state.ignoreWorldClickUntil) return;
-      if (state.showGuide || state.showMap) return;
-      let visual = pickTile(event);
-      if (!visual) return;
-      handleTileClick(visual);
+    // Tile placement used to listen for the DOM "click" event on the canvas.
+    // But the camera controls call setPointerCapture() on #scene-container on
+    // pointerdown, which redirects pointerup (and the synthesized click) off the
+    // canvas — so the canvas "click" listener never fired and tiles could not be
+    // placed (a stray click during a tiny drag was the only thing that ever
+    // worked). Track the press on the canvas and complete the tap on a
+    // window-level pointerup (which always sees the captured event), then DEFER
+    // the placement to update() so it runs AFTER UIKitPointerEvents has flushed
+    // its batched click — consumeUIClick() sets ignoreWorldClickUntil when a HUD
+    // button was pressed, which then suppresses placing a tile underneath it.
+    // NOTE: these are DOM listeners, so inside them `this` is the element; use
+    // the `state` closure for shared data, never `this`.
+    this._onWorldPointerDown = function(event) {
+      if (event.button !== 0) return;
+      state.worldTapStart = { x: event.clientX, y: event.clientY };
+    };
+    this._onWorldPointerUp = function(event) {
+      let start = state.worldTapStart;
+      state.worldTapStart = null;
+      if (!start || event.button !== 0) return;
+      let dx = event.clientX - start.x;
+      let dy = event.clientY - start.y;
+      if ((dx * dx + dy * dy) > 49) return; // moved > ~7px => camera drag, not a tap
+      state.pendingWorldTap = { clientX: event.clientX, clientY: event.clientY };
     };
     this._onContextMenu = function(event) {
       event.preventDefault();
@@ -2069,7 +2106,8 @@ code: |
     this._ccKeyPrev = {};
 
     pointerCanvas.addEventListener("pointermove", this._onPointerMove); // @check-ok
-    pointerCanvas.addEventListener("click", this._onClick); // @check-ok
+    pointerCanvas.addEventListener("pointerdown", this._onWorldPointerDown); // @check-ok
+    window.addEventListener("pointerup", this._onWorldPointerUp); // @check-ok
     pointerCanvas.addEventListener("contextmenu", this._onContextMenu); // @check-ok
     pointerCanvas.addEventListener("wheel", this._onWheel, { passive: false }); // @check-ok
   }
@@ -2111,7 +2149,8 @@ code: |
 
   const unbindInput = async () => {
     if (pointerCanvas && this._onPointerMove) pointerCanvas.removeEventListener("pointermove", this._onPointerMove);
-    if (pointerCanvas && this._onClick) pointerCanvas.removeEventListener("click", this._onClick);
+    if (pointerCanvas && this._onWorldPointerDown) pointerCanvas.removeEventListener("pointerdown", this._onWorldPointerDown);
+    if (this._onWorldPointerUp) window.removeEventListener("pointerup", this._onWorldPointerUp);
     if (pointerCanvas && this._onContextMenu) pointerCanvas.removeEventListener("contextmenu", this._onContextMenu);
     if (pointerCanvas && this._onWheel) pointerCanvas.removeEventListener("wheel", this._onWheel);
     this._ccKeyPrev = {};
@@ -2256,6 +2295,18 @@ code: |
     updateCamera(deltaTime);
     updateStatuses(deltaTime);
     updateUI(deltaTime);
+    // Process a deferred world tap AFTER updateUI() (which runs
+    // UIKitPointerEvents.update and therefore any HUD button's consumeUIClick).
+    // If a HUD button was just pressed, ignoreWorldClickUntil is now set and we
+    // skip placing a tile underneath the panel.
+    if (state.pendingWorldTap) {
+      let tap = state.pendingWorldTap;
+      state.pendingWorldTap = null;
+      if (nowMs() >= state.ignoreWorldClickUntil && !state.showGuide && !state.showMap) {
+        let visual = pickTile(tap);
+        if (visual) handleTileClick(visual);
+      }
+    }
   };
 
   this.dispose = function() {

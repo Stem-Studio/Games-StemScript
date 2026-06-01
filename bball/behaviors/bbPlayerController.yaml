@@ -190,11 +190,11 @@ code: |
     gameObject.position.y = getAvatarY();
     gameObject.position.z = posZ;
 
-    gameObject.userData.bb_angleX = angleX;
-    gameObject.userData.bb_angleY = angleY;
-    gameObject.userData.bb_catching = catching;
-    gameObject.userData.bb_hasBall = hasBall;
-    gameObject.userData.bb_isLocal = true;
+    gameObject._internal.three.userData.bb_angleX = angleX;
+    gameObject._internal.three.userData.bb_angleY = angleY;
+    gameObject._internal.three.userData.bb_catching = catching;
+    gameObject._internal.three.userData.bb_hasBall = hasBall;
+    gameObject._internal.three.userData.bb_isLocal = true;
   }
 
   this.init = function(_game) {
@@ -207,20 +207,20 @@ code: |
     posZ = this.gameObject.position.z;
 
     // Set initial userData
-    this.gameObject.userData.bb_isLocal = true;
-    this.gameObject.userData.bb_team = this.gameObject.userData.bb_team || 0;
-    this.gameObject.userData.bb_name = "GUEST" + Math.floor(1000 + Math.random() * 9000);
-    this.gameObject.userData.bb_angleX = 0;
-    this.gameObject.userData.bb_angleY = 0;
-    this.gameObject.userData.bb_catching = false;
-    this.gameObject.userData.bb_hasBall = false;
+    this.gameObject._internal.three.userData.bb_isLocal = true;
+    this.gameObject._internal.three.userData.bb_team = this.gameObject._internal.three.userData.bb_team || 0;
+    this.gameObject._internal.three.userData.bb_name = "GUEST" + Math.floor(1000 + Math.random() * 9000);
+    this.gameObject._internal.three.userData.bb_angleX = 0;
+    this.gameObject._internal.three.userData.bb_angleY = 0;
+    this.gameObject._internal.three.userData.bb_catching = false;
+    this.gameObject._internal.three.userData.bb_hasBall = false;
 
     canvas = game.renderer ? game.renderer.domElement : null;
 
     // Broadcast initial player data
     if (mp) {
-      mp.setPlayerData("bb_name", this.gameObject.userData.bb_name);
-      mp.setPlayerData("bb_team", "" + (this.gameObject.userData.bb_team || 0));
+      mp.setPlayerData("bb_name", this.gameObject._internal.three.userData.bb_name);
+      mp.setPlayerData("bb_team", "" + (this.gameObject._internal.three.userData.bb_team || 0));
       mp.setPlayerData("bb_throw", "0");
     }
   };

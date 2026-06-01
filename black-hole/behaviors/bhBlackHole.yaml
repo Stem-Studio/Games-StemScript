@@ -9,14 +9,15 @@ config:
   author: "conversion"
   isScript: true
   main: "script.js"
-  version: "1.0.0"
+  version: "2.0.0"
   priority: 0
-  description: "Direct Three.js port of the webgl-black-hole demo:
-    50k disc particles + 50k star particles + cylindrical accretion disc +
-    radial distortion mask, composed in a 2-pass renderer (space target +
-    distortion target) and applied via a screen-aligned final quad parented
-    to game.camera. All 7 RawShaderMaterials are constructed inline with
-    GLSL3 shaders inlined verbatim from upstream sources/Experience/shaders/."
+  description: "WebGPU/TSL port of the webgl-black-hole demo: accretion disc +
+    50k spiraling disc particles + 50k star sphere, authored as TSL node
+    materials (PointsNodeMaterial / MeshBasicNodeMaterial) so they compile on
+    the WebGPU renderer. The original 7 GLSL3 RawShaderMaterials and the 2-pass
+    gravitational-lensing composite are NOT supported by the WebGPU/TSL
+    renderer; the lensing distortion pass is omitted (see notes). Renders
+    directly into the scene instead of an offscreen 2-pass composite."
   tags: [vfx, shader, demo]
   attributes:
     innerColor:
@@ -60,655 +61,241 @@ config:
     enableFrustumCulling: false
     enableDistanceThrottling: false
     requiresConsistentUpdates: true
-  documentation: Black hole shader demo — disc + particles + stars + 2-pass distortion composite.
+  documentation: Black hole — TSL node-material port (disc + particles + stars). Lensing composite omitted (WebGPU/TSL has no RawShaderMaterial support).
 code: |
+  // WebGPU/TSL port of the black-hole demo.
+  //
+  // The upstream demo used 7 GLSL3 RawShaderMaterials and a 2-pass
+  // render-to-target gravitational-lensing composite. The StemStudio runtime
+  // renders with the WebGPU/TSL renderer, which cannot compile
+  // RawShaderMaterial (it threw "Material RawShaderMaterial is not compatible"
+  // every frame) and a raw GLSL multi-pass composite. This port:
+  //   * rebuilds the accretion disc, the 50k spiraling disc particles, and the
+  //     50k-star celestial sphere as TSL node materials (the same pattern the
+  //     working tinyskies.starfield / hexgl effects use);
+  //   * renders them directly into the scene (no offscreen 2-pass composite);
+  //   * OMITS the gravitational-lensing + RGB-shift distortion pass — that was
+  //     a screen-space multi-pass effect with no TSL equivalent here. The black
+  //     hole still reads as a glowing accretion disc + particle swirl + stars;
+  //     the light-bending halo is the documented fidelity loss.
   let game;
   const LOG_TAG = "[bh.blackHole]";
+  const BH_COUNT = 50000;
+  const STAR_COUNT = 50000;
 
-  // ============================================================
-  // GLSL shader source — inlined verbatim from upstream
-  // sources/Experience/shaders/. Partials are concatenated into
-  // shaders that include them.
-  // ============================================================
+  // Soft round sprite so points render as discs (replaces the GLSL
+  // gl_PointCoord circular discard).
+  function makeRoundSprite() {
+    const size = 64;
+    const canvas = document.createElement("canvas");
+    canvas.width = size; canvas.height = size;
+    const ctx = canvas.getContext("2d");
+    const g = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+    g.addColorStop(0.0, "rgba(255,255,255,1)");
+    g.addColorStop(0.5, "rgba(255,255,255,0.6)");
+    g.addColorStop(1.0, "rgba(255,255,255,0)");
+    ctx.fillStyle = g; ctx.fillRect(0, 0, size, size);
+    const t = new THREE.CanvasTexture(canvas);
+    t.colorSpace = THREE.SRGBColorSpace;
+    return t;
+  }
 
-  const PERLIN_3D_PERIODIC = `
-    vec3 mod289_3(vec3 x){return x - floor(x * (1.0 / 289.0)) * 289.0;}
-    vec4 mod289_4(vec4 x){return x - floor(x * (1.0 / 289.0)) * 289.0;}
-    vec4 perm4(vec4 x){return mod289_4(((x*34.0)+10.0)*x);}
-    vec4 taylorInvSqrt4(vec4 r){return 1.79284291400159 - 0.85373472095314 * r;}
-    vec3 fade3(vec3 t){return t*t*t*(t*(t*6.0-15.0)+10.0);}
-    float perlin3dPeriodic(vec3 P, vec3 rep){
-      vec3 Pi0 = mod(floor(P), rep);
-      vec3 Pi1 = mod(Pi0 + vec3(1.0), rep);
-      Pi0 = mod289_3(Pi0); Pi1 = mod289_3(Pi1);
-      vec3 Pf0 = fract(P); vec3 Pf1 = Pf0 - vec3(1.0);
-      vec4 ix = vec4(Pi0.x, Pi1.x, Pi0.x, Pi1.x);
-      vec4 iy = vec4(Pi0.yy, Pi1.yy);
-      vec4 iz0 = Pi0.zzzz; vec4 iz1 = Pi1.zzzz;
-      vec4 ixy = perm4(perm4(ix) + iy);
-      vec4 ixy0 = perm4(ixy + iz0);
-      vec4 ixy1 = perm4(ixy + iz1);
-      vec4 gx0 = ixy0 * (1.0 / 7.0);
-      vec4 gy0 = fract(floor(gx0) * (1.0 / 7.0)) - 0.5;
-      gx0 = fract(gx0);
-      vec4 gz0 = vec4(0.5) - abs(gx0) - abs(gy0);
-      vec4 sz0 = step(gz0, vec4(0.0));
-      gx0 -= sz0 * (step(0.0, gx0) - 0.5);
-      gy0 -= sz0 * (step(0.0, gy0) - 0.5);
-      vec4 gx1 = ixy1 * (1.0 / 7.0);
-      vec4 gy1 = fract(floor(gx1) * (1.0 / 7.0)) - 0.5;
-      gx1 = fract(gx1);
-      vec4 gz1 = vec4(0.5) - abs(gx1) - abs(gy1);
-      vec4 sz1 = step(gz1, vec4(0.0));
-      gx1 -= sz1 * (step(0.0, gx1) - 0.5);
-      gy1 -= sz1 * (step(0.0, gy1) - 0.5);
-      vec3 g000 = vec3(gx0.x,gy0.x,gz0.x);
-      vec3 g100 = vec3(gx0.y,gy0.y,gz0.y);
-      vec3 g010 = vec3(gx0.z,gy0.z,gz0.z);
-      vec3 g110 = vec3(gx0.w,gy0.w,gz0.w);
-      vec3 g001 = vec3(gx1.x,gy1.x,gz1.x);
-      vec3 g101 = vec3(gx1.y,gy1.y,gz1.y);
-      vec3 g011 = vec3(gx1.z,gy1.z,gz1.z);
-      vec3 g111 = vec3(gx1.w,gy1.w,gz1.w);
-      vec4 norm0 = taylorInvSqrt4(vec4(dot(g000,g000),dot(g010,g010),dot(g100,g100),dot(g110,g110)));
-      g000 *= norm0.x; g010 *= norm0.y; g100 *= norm0.z; g110 *= norm0.w;
-      vec4 norm1 = taylorInvSqrt4(vec4(dot(g001,g001),dot(g011,g011),dot(g101,g101),dot(g111,g111)));
-      g001 *= norm1.x; g011 *= norm1.y; g101 *= norm1.z; g111 *= norm1.w;
-      float n000 = dot(g000, Pf0);
-      float n100 = dot(g100, vec3(Pf1.x, Pf0.yz));
-      float n010 = dot(g010, vec3(Pf0.x, Pf1.y, Pf0.z));
-      float n110 = dot(g110, vec3(Pf1.xy, Pf0.z));
-      float n001 = dot(g001, vec3(Pf0.xy, Pf1.z));
-      float n101 = dot(g101, vec3(Pf1.x, Pf0.y, Pf1.z));
-      float n011 = dot(g011, vec3(Pf0.x, Pf1.yz));
-      float n111 = dot(g111, Pf1);
-      vec3 fade_xyz = fade3(Pf0);
-      vec4 n_z = mix(vec4(n000,n100,n010,n110), vec4(n001,n101,n011,n111), fade_xyz.z);
-      vec2 n_yz = mix(n_z.xy, n_z.zw, fade_xyz.y);
-      float n_xyz = mix(n_yz.x, n_yz.y, fade_xyz.x);
-      return 2.2 * n_xyz;
+  // Low-res smooth-ish noise (linear-filtered) sampled by the disc. Replaces
+  // the GLSL perlin noise-generation render pass.
+  function makeNoiseTexture() {
+    const size = 64;
+    const canvas = document.createElement("canvas");
+    canvas.width = size; canvas.height = size;
+    const ctx = canvas.getContext("2d");
+    const img = ctx.createImageData(size, size);
+    for (let i = 0; i < size * size; i++) {
+      img.data[i * 4 + 0] = Math.random() * 255;
+      img.data[i * 4 + 1] = Math.random() * 255;
+      img.data[i * 4 + 2] = Math.random() * 255;
+      img.data[i * 4 + 3] = 255;
     }
-  `;
-
-  const NOISES_VERTEX = `
-    in vec3 position;
-    in vec2 uv;
-    out vec2 vUv;
-    void main() {
-      gl_Position = vec4(position, 1.0);
-      vUv = uv;
-    }
-  `;
-
-  const NOISES_FRAGMENT = `
-    precision highp float;
-    precision highp int;
-    in vec2 vUv;
-    ${PERLIN_3D_PERIODIC}
-    layout(location = 0) out vec4 pc_FragColor;
-    void main() {
-      float uFrequency = 8.0;
-      float noiseR = perlin3dPeriodic(vec3(vUv * uFrequency, 123.456), vec3(uFrequency)) * 0.5 + 0.5;
-      float noiseG = perlin3dPeriodic(vec3(vUv * uFrequency, 456.789), vec3(uFrequency)) * 0.5 + 0.5;
-      float noiseB = perlin3dPeriodic(vec3(vUv * uFrequency, 789.123), vec3(uFrequency)) * 0.5 + 0.5;
-      pc_FragColor = vec4(noiseR, noiseG, noiseB, 1.0);
-    }
-  `;
-
-  const DISC_VERTEX = `
-    uniform mat4 projectionMatrix;
-    uniform mat4 modelViewMatrix;
-    in vec3 position;
-    in vec2 uv;
-    out vec2 vUv;
-    void main() {
-      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-      vUv = uv;
-    }
-  `;
-
-  const DISC_FRAGMENT = `
-    precision highp float;
-    precision highp int;
-    uniform float uTime;
-    uniform sampler2D uNoiseTexture;
-    uniform vec3 uInnerColor;
-    uniform vec3 uOuterColor;
-    in vec2 vUv;
-    layout(location = 0) out vec4 pc_FragColor;
-    float inverseLerp(float v, float minValue, float maxValue) { return (v - minValue) / (maxValue - minValue); }
-    float remap(float v, float inMin, float inMax, float outMin, float outMax) { return mix(outMin, outMax, inverseLerp(v, inMin, inMax)); }
-    vec3 blendAdd(vec3 base, vec3 blend) { return min(base+blend, vec3(1.0)); }
-    void main() {
-      vec4 color = vec4(0.0);
-      color.a = 1.0;
-      float iterations = 3.0;
-      for(float i = 0.0; i < iterations; i++) {
-        float progress = i / (iterations - 1.0);
-        float intensity = 1.0 - ((vUv.y - progress) * iterations) * 0.5;
-        intensity = smoothstep(0.0, 1.0, intensity);
-        vec2 uv = vUv;
-        uv.y *= 2.0;
-        uv.x += uTime / ((i * 10.0) + 1.0);
-        vec3 ringColor = mix(uInnerColor, uOuterColor, progress);
-        float noiseIntensity = texture(uNoiseTexture, uv).r;
-        ringColor = mix(vec3(0.0), ringColor.rgb, noiseIntensity * intensity);
-        color.rgb = blendAdd(color.rgb, ringColor);
-      }
-      float edgesAttenuation = min(inverseLerp(vUv.y, 0.0, 0.02), inverseLerp(vUv.y, 1.0, 0.5));
-      color.rgb = mix(vec3(0.0), color.rgb, edgesAttenuation);
-      pc_FragColor = color;
-    }
-  `;
-
-  const BH_PARTICLES_VERTEX = `
-    uniform mat4 projectionMatrix;
-    uniform mat4 modelViewMatrix;
-    uniform float uTime;
-    uniform vec3 uInnerColor;
-    uniform vec3 uOuterColor;
-    uniform float uViewHeight;
-    uniform float uSize;
-    in float position;
-    in float aSize;
-    in float aRandom;
-    out vec3 vColor;
-    void main() {
-      float concentration = 0.05;
-      float outerProgress = smoothstep(0.0, 1.0, position);
-      outerProgress = mix(concentration, outerProgress, pow(aRandom, 1.7));
-      float radius = 1.0 + outerProgress * 5.0;
-      float angle = outerProgress - uTime * (1.0 - outerProgress) * 3.0;
-      vec3 newPosition = vec3(sin(angle) * radius, 0.0, cos(angle) * radius);
-      vec4 modelViewPosition = modelViewMatrix * vec4(newPosition, 1.0);
-      gl_Position = projectionMatrix * modelViewPosition;
-      gl_PointSize = aSize * uSize * uViewHeight;
-      gl_PointSize *= (1.0 / - modelViewPosition.z);
-      vColor = mix(uInnerColor, uOuterColor, outerProgress);
-    }
-  `;
-
-  const BH_PARTICLES_FRAGMENT = `
-    precision highp float;
-    precision highp int;
-    in vec3 vColor;
-    layout(location = 0) out vec4 pc_FragColor;
-    void main() {
-      float distanceToCenter = length(gl_PointCoord - vec2(0.5));
-      if(distanceToCenter > 0.5) discard;
-      pc_FragColor = vec4(vColor, 0.5);
-    }
-  `;
-
-  const STARS_VERTEX = `
-    uniform mat4 projectionMatrix;
-    uniform mat4 modelViewMatrix;
-    uniform float uViewHeight;
-    uniform float uSize;
-    in vec3 position;
-    in float aSize;
-    in vec3 aColor;
-    out vec3 vColor;
-    void main() {
-      vec4 modelViewPosition = modelViewMatrix * vec4(position, 1.0);
-      gl_Position = projectionMatrix * modelViewPosition;
-      gl_PointSize = aSize * uSize * uViewHeight;
-      vColor = aColor;
-    }
-  `;
-
-  const STARS_FRAGMENT = `
-    precision highp float;
-    precision highp int;
-    in vec3 vColor;
-    layout(location = 0) out vec4 pc_FragColor;
-    void main() {
-      float distanceToCenter = length(gl_PointCoord - vec2(0.5));
-      if(distanceToCenter > 0.5) discard;
-      pc_FragColor = vec4(vColor, 1.0);
-    }
-  `;
-
-  const DIST_VERTEX = `
-    uniform mat4 projectionMatrix;
-    uniform mat4 modelViewMatrix;
-    in vec3 position;
-    in vec2 uv;
-    out vec2 vUv;
-    void main() {
-      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-      vUv = uv;
-    }
-  `;
-
-  const DIST_ACTIVE_FRAGMENT = `
-    precision highp float;
-    precision highp int;
-    in vec2 vUv;
-    layout(location = 0) out vec4 pc_FragColor;
-    float inverseLerp(float v, float a, float b){ return (v - a)/(b - a); }
-    float remap(float v, float a, float b, float c, float d){ return mix(c, d, inverseLerp(v,a,b)); }
-    void main() {
-      float distanceToCenter = length(vUv - 0.5);
-      float radialStrength = remap(distanceToCenter, 0.0, 0.15, 1.0, 0.0);
-      radialStrength = smoothstep(0.0, 1.0, radialStrength);
-      pc_FragColor = vec4(radialStrength, 1.0, 1.0, 1.0);
-    }
-  `;
-
-  const DIST_MASK_FRAGMENT = `
-    precision highp float;
-    precision highp int;
-    in vec2 vUv;
-    layout(location = 0) out vec4 pc_FragColor;
-    float inverseLerp(float v, float a, float b){ return (v - a)/(b - a); }
-    float remap(float v, float a, float b, float c, float d){ return mix(c, d, inverseLerp(v,a,b)); }
-    void main() {
-      float distanceToCenter = length(vUv - 0.5);
-      float radialStrength = remap(distanceToCenter, 0.0, 0.15, 1.0, 0.0);
-      radialStrength = smoothstep(0.0, 1.0, radialStrength);
-      float alpha = smoothstep(0.0, 1.0, remap(distanceToCenter, 0.4, 0.5, 1.0, 0.0));
-      pc_FragColor = vec4(radialStrength, 0.0, 0.0, alpha);
-    }
-  `;
-
-  const FINAL_VERTEX = `
-    in vec3 position;
-    in vec2 uv;
-    out vec2 vUv;
-    void main() {
-      vUv = uv;
-      gl_Position = vec4(position, 1.0);
-    }
-  `;
-
-  const FINAL_FRAGMENT = `
-    #define PI 3.1415926538
-    precision highp float;
-    precision highp int;
-    in vec2 vUv;
-    uniform sampler2D uSpaceTexture;
-    uniform sampler2D uDistortionTexture;
-    uniform vec2 uBlackHolePosition;
-    uniform float uRGBShiftRadius;
-    layout(location = 0) out vec4 pc_FragColor;
-    vec3 getRGBShiftedColor(sampler2D _t, vec2 _uv, float _r) {
-      vec3 angle = vec3(PI * 2.0 / 3.0, PI * 4.0 / 3.0, 0);
-      vec3 c = vec3(0.0);
-      c.r = texture(_t, _uv + vec2(sin(angle.r) * _r, cos(angle.r) * _r)).r;
-      c.g = texture(_t, _uv + vec2(sin(angle.g) * _r, cos(angle.g) * _r)).g;
-      c.b = texture(_t, _uv + vec2(sin(angle.b) * _r, cos(angle.b) * _r)).b;
-      return c;
-    }
-    void main() {
-      vec4 distortionColor = texture(uDistortionTexture, vUv);
-      float distortionIntensity = distortionColor.r;
-      vec2 towardCenter = vUv - uBlackHolePosition;
-      towardCenter *= - distortionIntensity * 2.0;
-      vec2 distoredUv = vUv + towardCenter;
-      vec3 outColor = getRGBShiftedColor(uSpaceTexture, distoredUv, uRGBShiftRadius);
-      pc_FragColor = vec4(outColor, 1.0);
-    }
-  `;
-
-  // ============================================================
-  // Behavior lifecycle
-  // ============================================================
+    ctx.putImageData(img, 0, 0);
+    const t = new THREE.CanvasTexture(canvas);
+    t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    t.minFilter = THREE.LinearFilter;
+    t.magFilter = THREE.LinearFilter;
+    return t;
+  }
 
   this.init = function (_game) {
     game = _game;
-    this._log = (...args) => {
-      if (this.getAttribute("debugLogs")) {
-        console.log(LOG_TAG, this.gameObject?.name ?? "?", "·", ...args);
-      }
-    };
-    this._innerColor = new THREE.Color(this.getAttribute("innerColor") ?? "#ff8080");
-    this._outerColor = new THREE.Color(this.getAttribute("outerColor") ?? "#3633ff");
-    this._bhParticleSize = this.getAttribute("blackHoleParticleSize") ?? 0.015;
-    this._starParticleSize = this.getAttribute("starParticleSize") ?? 0.001;
-    this._rgbShiftRadius = this.getAttribute("rgbShiftRadius") ?? 0.00001;
-    this._discRadiusOuter = this.getAttribute("discRadiusOuter") ?? 5;
-    this._discRadiusInner = this.getAttribute("discRadiusInner") ?? 1;
-    this._starRadius = this.getAttribute("starSphereRadius") ?? 400;
-
-    this._time = 0;
-
-    // Common color uniforms shared by disc + particles
-    this._uInnerColor = { value: this._innerColor };
-    this._uOuterColor = { value: this._outerColor };
-
-    // Scenes
-    this._spaceScene = new THREE.Scene();
-    this._distortionScene = new THREE.Scene();
-
-    // Render targets — created in onStart when renderer size is known
-    this._spaceTarget = null;
-    this._distortionTarget = null;
-    this._noiseTarget = null;
-
-    // Materials and meshes
-    this._discMaterial = null;
-    this._discMesh = null;
-    this._bhParticlesMaterial = null;
-    this._bhParticlesMesh = null;
-    this._starsMaterial = null;
-    this._starsMesh = null;
-    this._distActiveMaterial = null;
-    this._distActiveMesh = null;
-    this._distMaskMaterial = null;
-    this._distMaskMesh = null;
-    this._finalMaterial = null;
-    this._finalPlane = null;
-
-    // Pre-allocated math
-    this._screenPos = new THREE.Vector3();
-    this._tmpVec2 = new THREE.Vector2();
+    this._log = (...a) => { if (this.getAttribute("debugLogs")) console.log(LOG_TAG, ...a); };
+    this._buildVisuals();
+    this._log("init (play)");
   };
 
-  this.onStart = function () {
-    const renderer = game?.renderer;
-    const cam = game?.camera;
-    if (!renderer || !cam) {
-      this._log("missing renderer/camera");
-      return;
-    }
-
-    const sz = new THREE.Vector2();
-    renderer.getSize(sz);
-    const w = Math.max(64, Math.floor(sz.x));
-    const h = Math.max(64, Math.floor(sz.y));
-
-    // 1) Render targets
-    this._spaceTarget = new THREE.WebGLRenderTarget(w * 2, h * 2, {
-      magFilter: THREE.LinearFilter,
-      minFilter: THREE.LinearFilter,
-    });
-    this._distortionTarget = new THREE.WebGLRenderTarget(Math.max(64, Math.floor(w * 0.5)), Math.max(64, Math.floor(h * 0.5)), {
-      magFilter: THREE.LinearFilter,
-      minFilter: THREE.LinearFilter,
-      format: THREE.RedFormat,
-      type: THREE.FloatType,
-    });
-
-    // 2) One-shot noise texture (128x128 RT)
-    this._renderNoises();
-
-    // 3) Disc mesh
-    this._setupDisc();
-
-    // 4) Black-hole particles
-    this._setupBlackHoleParticles(h);
-
-    // 5) Stars
-    this._setupStars(h);
-
-    // 6) Distortion planes
-    this._setupDistortion();
-
-    // 7) Final composite plane parented to game.camera
-    this._setupFinalPlane();
-
-    this._log("onStart complete", { w, h });
-  };
-
-  this._renderNoises = function () {
-    const renderer = game?.renderer;
-    if (!renderer) return;
-    const noisesScene = new THREE.Scene();
-    const noisesCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10);
-    const noisesMat = new THREE.RawShaderMaterial({
-      glslVersion: THREE.GLSL3,
-      uniforms: {},
-      vertexShader: NOISES_VERTEX,
-      fragmentShader: NOISES_FRAGMENT,
-    });
-    const noisesPlane = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), noisesMat);
-    noisesPlane.frustumCulled = false;
-    noisesScene.add(noisesPlane);
-
-    this._noiseTarget = new THREE.WebGLRenderTarget(128, 128, {
-      generateMipmaps: false,
-      wrapS: THREE.RepeatWrapping,
-      wrapT: THREE.RepeatWrapping,
-    });
-    const prev = renderer.getRenderTarget();
-    renderer.setRenderTarget(this._noiseTarget);
-    renderer.render(noisesScene, noisesCamera);
-    renderer.setRenderTarget(prev);
-
-    // Discard the temp scene/material/geometry — keep the texture
-    noisesScene.remove(noisesPlane);
-    if (noisesPlane.geometry?.dispose) noisesPlane.geometry.dispose();
-    if (noisesMat?.dispose) noisesMat.dispose();
-  };
-
-  this._setupDisc = function () {
-    const geometry = new THREE.CylinderGeometry(this._discRadiusOuter, this._discRadiusInner, 0, 64, 10, true);
-    const noiseTexture = this._noiseTarget ? this._noiseTarget.texture : null;
-    this._discMaterial = new THREE.RawShaderMaterial({
-      glslVersion: THREE.GLSL3,
-      side: THREE.DoubleSide,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
-      depthTest: false,
-      transparent: true,
-      uniforms: {
-        uTime: { value: 0 },
-        uNoiseTexture: { value: noiseTexture },
-        uInnerColor: this._uInnerColor,
-        uOuterColor: this._uOuterColor,
-      },
-      vertexShader: DISC_VERTEX,
-      fragmentShader: DISC_FRAGMENT,
-    });
-    this._discMesh = new THREE.Mesh(geometry, this._discMaterial);
-    this._discMesh.userData = this._discMesh.userData || {};
-    this._discMesh.userData.isRuntimeOnly = true;
-    this._spaceScene.add(this._discMesh);
-  };
-
-  this._setupBlackHoleParticles = function (viewHeight) {
-    const count = 50000;
-    const distArr = new Float32Array(count);
-    const sizeArr = new Float32Array(count);
-    const randArr = new Float32Array(count);
-    for (let i = 0; i < count; i++) {
-      distArr[i] = Math.random();
-      sizeArr[i] = Math.random();
-      randArr[i] = Math.random();
-    }
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute("position", new THREE.Float32BufferAttribute(distArr, 1));
-    geo.setAttribute("aSize", new THREE.Float32BufferAttribute(sizeArr, 1));
-    geo.setAttribute("aRandom", new THREE.Float32BufferAttribute(randArr, 1));
-
-    this._bhParticlesMaterial = new THREE.RawShaderMaterial({
-      glslVersion: THREE.GLSL3,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
-      depthTest: false,
-      transparent: true,
-      uniforms: {
-        uTime: { value: 0 },
-        uInnerColor: this._uInnerColor,
-        uOuterColor: this._uOuterColor,
-        uViewHeight: { value: viewHeight },
-        uSize: { value: this._bhParticleSize },
-      },
-      vertexShader: BH_PARTICLES_VERTEX,
-      fragmentShader: BH_PARTICLES_FRAGMENT,
-    });
-    this._bhParticlesMesh = new THREE.Points(geo, this._bhParticlesMaterial);
-    this._bhParticlesMesh.frustumCulled = false;
-    this._bhParticlesMesh.userData = this._bhParticlesMesh.userData || {};
-    this._bhParticlesMesh.userData.isRuntimeOnly = true;
-    this._spaceScene.add(this._bhParticlesMesh);
-  };
-
-  this._setupStars = function (viewHeight) {
-    const count = 50000;
-    const positions = new Float32Array(count * 3);
-    const sizes = new Float32Array(count);
-    const colors = new Float32Array(count * 3);
-    const tmpColor = new THREE.Color();
-    for (let i = 0; i < count; i++) {
-      const i3 = i * 3;
-      const theta = 2 * Math.PI * Math.random();
-      const phi = Math.acos(2 * Math.random() - 1.0);
-      const r = this._starRadius;
-      positions[i3 + 0] = Math.cos(theta) * Math.sin(phi) * r;
-      positions[i3 + 1] = Math.sin(theta) * Math.sin(phi) * r;
-      positions[i3 + 2] = Math.cos(phi) * r;
-      sizes[i] = Math.random();
-      tmpColor.setHSL(Math.random(), 1, 0.8);
-      colors[i3 + 0] = tmpColor.r;
-      colors[i3 + 1] = tmpColor.g;
-      colors[i3 + 2] = tmpColor.b;
-    }
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-    geo.setAttribute("aSize", new THREE.Float32BufferAttribute(sizes, 1));
-    geo.setAttribute("aColor", new THREE.Float32BufferAttribute(colors, 3));
-
-    this._starsMaterial = new THREE.RawShaderMaterial({
-      glslVersion: THREE.GLSL3,
-      depthWrite: false,
-      depthTest: false,
-      uniforms: {
-        uViewHeight: { value: viewHeight },
-        uSize: { value: this._starParticleSize },
-      },
-      vertexShader: STARS_VERTEX,
-      fragmentShader: STARS_FRAGMENT,
-    });
-    this._starsMesh = new THREE.Points(geo, this._starsMaterial);
-    this._starsMesh.frustumCulled = false;
-    this._starsMesh.userData = this._starsMesh.userData || {};
-    this._starsMesh.userData.isRuntimeOnly = true;
-    this._spaceScene.add(this._starsMesh);
-  };
-
-  this._setupDistortion = function () {
-    this._distActiveMaterial = new THREE.RawShaderMaterial({
-      glslVersion: THREE.GLSL3,
-      side: THREE.DoubleSide,
-      transparent: true,
-      uniforms: {},
-      vertexShader: DIST_VERTEX,
-      fragmentShader: DIST_ACTIVE_FRAGMENT,
-    });
-    this._distActiveMesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), this._distActiveMaterial);
-    this._distActiveMesh.scale.set(10, 10, 10);
-    this._distActiveMesh.userData = this._distActiveMesh.userData || {};
-    this._distActiveMesh.userData.isRuntimeOnly = true;
-    this._distortionScene.add(this._distActiveMesh);
-
-    this._distMaskMaterial = new THREE.RawShaderMaterial({
-      glslVersion: THREE.GLSL3,
-      side: THREE.DoubleSide,
-      transparent: true,
-      uniforms: {},
-      vertexShader: DIST_VERTEX,
-      fragmentShader: DIST_MASK_FRAGMENT,
-    });
-    this._distMaskMesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), this._distMaskMaterial);
-    this._distMaskMesh.scale.set(10, 10, 10);
-    this._distMaskMesh.rotation.x = Math.PI * 0.5;
-    this._distMaskMesh.userData = this._distMaskMesh.userData || {};
-    this._distMaskMesh.userData.isRuntimeOnly = true;
-    this._distortionScene.add(this._distMaskMesh);
-  };
-
-  this._setupFinalPlane = function () {
-    this._finalMaterial = new THREE.RawShaderMaterial({
-      glslVersion: THREE.GLSL3,
-      depthWrite: false,
-      depthTest: false,
-      uniforms: {
-        uSpaceTexture: { value: this._spaceTarget ? this._spaceTarget.texture : null },
-        uDistortionTexture: { value: this._distortionTarget ? this._distortionTarget.texture : null },
-        uBlackHolePosition: { value: new THREE.Vector2(0.5, 0.5) },
-        uRGBShiftRadius: { value: this._rgbShiftRadius },
-      },
-      vertexShader: FINAL_VERTEX,
-      fragmentShader: FINAL_FRAGMENT,
-    });
-    this._finalPlane = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this._finalMaterial);
-    this._finalPlane.frustumCulled = false;
-    this._finalPlane.userData = this._finalPlane.userData || {};
-    this._finalPlane.userData.isRuntimeOnly = true;
-    this._finalPlane.renderOrder = -1; // draw before normal scene meshes (background-like)
-    const cam = game?.camera;
-    if (cam) cam.add(this._finalPlane);
-  };
+  // Play-only (like the original). Building the 100k-particle clouds during
+  // an editor hook also runs them at stemscript-IMPORT time, which is heavy
+  // enough to stall the import — so the editor preview is intentionally a
+  // no-op and the visuals are built in init() (play) only.
+  this.onEditorAdded = function () { /* play-only */ };
+  this.onEditorAttributesUpdated = function () { /* play-only */ };
+  this.onEditorDispose = function () { /* nothing built in editor */ };
 
   this.update = function (deltaTime) {
-    const dt = Math.min(deltaTime, 0.1);
-    this._time += dt;
-    const renderer = game?.renderer;
-    const cam = game?.camera;
-    if (!renderer || !cam) return;
-    if (!this._spaceTarget || !this._distortionTarget) return;
+    if (!this._uTime) return;
+    this._uTime.value += Math.min(deltaTime || 0.016, 0.1);
+  };
 
-    // Update animated uniforms
-    if (this._discMaterial) this._discMaterial.uniforms.uTime.value = this._time;
-    if (this._bhParticlesMaterial) this._bhParticlesMaterial.uniforms.uTime.value = this._time + 9999.0;
+  this.dispose = function () { this._teardown(); };
 
-    // Distortion-active plane always faces the camera
-    if (this._distActiveMesh) this._distActiveMesh.lookAt(cam.position);
+  this._buildVisuals = function () {
+    if (this._root) return; // already built
+    const TSL = THREE.TSL;
+    const parent = this.gameObject && this.gameObject._internal && this.gameObject._internal.three;
+    if (!parent || !TSL) { this._log("no parent/TSL"); return; }
 
-    // Project black-hole world origin to NDC for the final shader's RGB-shift center
-    this._screenPos.set(0, 0, 0).project(cam);
-    if (this._finalMaterial) {
-      this._finalMaterial.uniforms.uBlackHolePosition.value.set(
-        this._screenPos.x * 0.5 + 0.5,
-        this._screenPos.y * 0.5 + 0.5
-      );
+    const innerHex = this.getAttribute("innerColor") || "#ff8080";
+    const outerHex = this.getAttribute("outerColor") || "#3633ff";
+    const discOuter = this.getAttribute("discRadiusOuter") || 5;
+    const discInner = this.getAttribute("discRadiusInner") || 1;
+    const starRadius = this.getAttribute("starSphereRadius") || 400;
+    const bhSizeAttr = this.getAttribute("blackHoleParticleSize") || 0.015;
+    const starSizeAttr = this.getAttribute("starParticleSize") || 0.001;
+
+    const inner = new THREE.Color(innerHex);
+    const outer = new THREE.Color(outerHex);
+    const innerN = TSL.vec3(inner.r, inner.g, inner.b);
+    const outerN = TSL.vec3(outer.r, outer.g, outer.b);
+
+    this._uTime = TSL.uniform(0);
+    this._sprite = makeRoundSprite();
+    this._noiseTex = makeNoiseTexture();
+    this._disposables = [];
+
+    const root = new THREE.Group();
+    root.name = "bhBlackHoleRoot";
+    root.userData.isRuntimeOnly = true;
+
+    root.add(this._buildDisc(TSL, innerN, outerN, discOuter, discInner));
+    root.add(this._buildParticles(TSL, innerN, outerN, bhSizeAttr));
+    root.add(this._buildStars(TSL, starRadius, starSizeAttr));
+
+    parent.add(root);
+    this._root = root;
+    this._log("built visuals");
+  };
+
+  this._buildDisc = function (TSL, innerN, outerN, outerR, innerR) {
+    // Thin open cylinder = accretion-disc band.
+    const geo = new THREE.CylinderGeometry(outerR, innerR, 0, 64, 1, true);
+    const uvN = TSL.uv();
+    // Scroll noise around the ring + over time for a churning look.
+    const nUv = TSL.vec2(uvN.x.add(this._uTime.mul(0.05)), uvN.y.mul(2.0));
+    const noise = TSL.texture(this._noiseTex, nUv).r;
+    const ring = TSL.mix(innerN, outerN, uvN.y);
+    // Bright across the band, attenuated at the inner lip and the outer half.
+    const edge = TSL.smoothstep(0.0, 0.05, uvN.y).mul(TSL.smoothstep(1.0, 0.4, uvN.y));
+    const rgb = ring.mul(noise).mul(edge).mul(2.0);
+    const mat = new THREE.MeshBasicNodeMaterial({
+      side: THREE.DoubleSide,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      transparent: true,
+    });
+    mat.colorNode = TSL.vec4(rgb, TSL.float(1.0));
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.userData.isRuntimeOnly = true;
+    this._disposables.push(geo, mat);
+    return mesh;
+  };
+
+  this._buildParticles = function (TSL, innerN, outerN, sizeAttr) {
+    const dist = new Float32Array(BH_COUNT);
+    const size = new Float32Array(BH_COUNT);
+    const rnd = new Float32Array(BH_COUNT);
+    // 3-component position kept zeroed (defines vertex count + a finite
+    // bounding sphere); the real position is computed in positionNode. The
+    // original set "position" itemSize=1 which produced NaN bounds.
+    const pos0 = new Float32Array(BH_COUNT * 3);
+    for (let i = 0; i < BH_COUNT; i++) {
+      dist[i] = Math.random();
+      size[i] = Math.random();
+      rnd[i] = Math.random();
     }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(pos0, 3));
+    geo.setAttribute("aDist", new THREE.BufferAttribute(dist, 1));
+    geo.setAttribute("aSize", new THREE.BufferAttribute(size, 1));
+    geo.setAttribute("aRandom", new THREE.BufferAttribute(rnd, 1));
 
-    // 2-pass render: space + distortion → targets. The final plane is part of
-    // game.camera's tree so stem's main render draws it fullscreen.
-    const prev = renderer.getRenderTarget();
-    renderer.setRenderTarget(this._spaceTarget);
-    renderer.clear();
-    renderer.render(this._spaceScene, cam);
-    renderer.setRenderTarget(this._distortionTarget);
-    renderer.clear();
-    renderer.render(this._distortionScene, cam);
-    renderer.setRenderTarget(prev);
+    const aDist = TSL.attribute("aDist");
+    const aRandom = TSL.attribute("aRandom");
+    const aSize = TSL.attribute("aSize");
+    const conc = TSL.float(0.05);
+    const op = TSL.mix(conc, TSL.smoothstep(0.0, 1.0, aDist), aRandom.pow(1.7));
+    const radius = op.mul(5.0).add(1.0);
+    const angle = op.sub(this._uTime.mul(TSL.float(1.0).sub(op)).mul(3.0));
+    const newPos = TSL.vec3(angle.sin().mul(radius), TSL.float(0.0), angle.cos().mul(radius));
+
+    const mat = new THREE.PointsNodeMaterial({
+      map: this._sprite,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      transparent: true,
+    });
+    mat.positionNode = newPos;
+    // Perspective point scaling (1/-z) isn't reliably available to a
+    // PointsNodeMaterial.sizeNode, so use a constant-factor pixel size like
+    // tinyskies.starfield does.
+    mat.sizeNode = aSize.mul(sizeAttr * 800.0).add(1.0);
+    mat.colorNode = TSL.vec4(TSL.mix(innerN, outerN, op), TSL.float(0.6));
+
+    const pts = new THREE.Points(geo, mat);
+    pts.frustumCulled = false;
+    pts.userData.isRuntimeOnly = true;
+    this._disposables.push(geo, mat);
+    return pts;
   };
 
-  this.dispose = function () {
-    const cam = game?.camera;
-    if (this._finalPlane && this._finalPlane.parent) this._finalPlane.parent.remove(this._finalPlane);
-    const dispose = (mat) => {
-      if (!mat) return;
-      if (mat.uniforms?.uNoiseTexture?.value?.dispose) mat.uniforms.uNoiseTexture.value.dispose();
-      if (mat.dispose) mat.dispose();
-    };
-    if (this._discMesh?.geometry?.dispose) this._discMesh.geometry.dispose();
-    dispose(this._discMaterial);
-    if (this._bhParticlesMesh?.geometry?.dispose) this._bhParticlesMesh.geometry.dispose();
-    dispose(this._bhParticlesMaterial);
-    if (this._starsMesh?.geometry?.dispose) this._starsMesh.geometry.dispose();
-    dispose(this._starsMaterial);
-    if (this._distActiveMesh?.geometry?.dispose) this._distActiveMesh.geometry.dispose();
-    dispose(this._distActiveMaterial);
-    if (this._distMaskMesh?.geometry?.dispose) this._distMaskMesh.geometry.dispose();
-    dispose(this._distMaskMaterial);
-    if (this._finalPlane?.geometry?.dispose) this._finalPlane.geometry.dispose();
-    dispose(this._finalMaterial);
-    if (this._spaceTarget?.dispose) this._spaceTarget.dispose();
-    if (this._distortionTarget?.dispose) this._distortionTarget.dispose();
-    if (this._noiseTarget?.dispose) this._noiseTarget.dispose();
-    this._spaceTarget = null;
-    this._distortionTarget = null;
-    this._noiseTarget = null;
-    this._finalPlane = null;
+  this._buildStars = function (TSL, radius, sizeAttr) {
+    const positions = new Float32Array(STAR_COUNT * 3);
+    const size = new Float32Array(STAR_COUNT);
+    const colors = new Float32Array(STAR_COUNT * 3);
+    const c = new THREE.Color();
+    for (let i = 0; i < STAR_COUNT; i++) {
+      const i3 = i * 3;
+      const theta = 2 * Math.PI * Math.random();
+      const phi = Math.acos(2 * Math.random() - 1);
+      positions[i3 + 0] = Math.cos(theta) * Math.sin(phi) * radius;
+      positions[i3 + 1] = Math.sin(theta) * Math.sin(phi) * radius;
+      positions[i3 + 2] = Math.cos(phi) * radius;
+      size[i] = Math.random();
+      c.setHSL(Math.random(), 1, 0.8);
+      colors[i3 + 0] = c.r; colors[i3 + 1] = c.g; colors[i3 + 2] = c.b;
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    geo.setAttribute("aSize", new THREE.BufferAttribute(size, 1));
+    geo.setAttribute("aColor", new THREE.BufferAttribute(colors, 3));
+
+    const mat = new THREE.PointsNodeMaterial({
+      map: this._sprite,
+      transparent: true,
+      depthWrite: false,
+    });
+    // Bump star pixel size for visibility (original ~sub-pixel at this size).
+    mat.sizeNode = TSL.attribute("aSize").mul(Math.max(2.0, sizeAttr * 800.0 * 2.0)).add(1.0);
+    mat.colorNode = TSL.vec4(TSL.attribute("aColor"), TSL.float(1.0));
+
+    const pts = new THREE.Points(geo, mat);
+    pts.frustumCulled = false;
+    pts.userData.isRuntimeOnly = true;
+    this._disposables.push(geo, mat);
+    return pts;
   };
 
-  // Editor preview — the entire scene is shader-driven and depends on the
-  // play-mode renderer; the editor can't recreate the multi-pass composite.
-  // Stubs satisfy the validator.
-  this.onEditorAdded = function (_editor) { /* play-only */ };
-  this.onEditorDispose = function () { /* nothing to release */ };
+  this._teardown = function () {
+    if (this._root && this._root.parent) this._root.parent.remove(this._root);
+    for (const d of this._disposables || []) { if (d && d.dispose) d.dispose(); }
+    if (this._sprite && this._sprite.dispose) this._sprite.dispose();
+    if (this._noiseTex && this._noiseTex.dispose) this._noiseTex.dispose();
+    this._disposables = [];
+    this._root = null;
+    this._uTime = null;
+  };

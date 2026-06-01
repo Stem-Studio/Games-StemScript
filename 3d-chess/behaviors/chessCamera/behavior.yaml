@@ -8,7 +8,7 @@ meta:
   exportedAt: 2026-04-30T17:38:38.668Z
 config:
   name: Chess Camera
-  id: 69eab9da5b53803168c082a5
+  id: chess.chessCamera
   author: chess
   isScript: true
   main: script.js

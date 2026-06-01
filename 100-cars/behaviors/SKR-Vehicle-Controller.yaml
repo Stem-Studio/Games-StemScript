@@ -265,8 +265,8 @@ code: |
     this.gameObject.position.copy(this.spawnPos);
     this.gameObject.position.y = this.spawnPos.y - 0.5 + this.groundOffset;
     this.gameObject.rotation.set(0, 0, 0);
-    this.gameObject.quaternion.identity();
-    this.gameObject.rotateY(this.spawnAngle);
+    this.gameObject.rotation.identity();
+    this.gameObject._internal.three.rotateY(this.spawnAngle);
     this.prevModelPos.copy(this.gameObject.position);
   };
 
@@ -304,7 +304,7 @@ code: |
   };
 
   this._moveVehicle = function(dt) {
-    this._forward.set(0, 0, 1).applyQuaternion(this.gameObject.quaternion);
+    this._forward.set(0, 0, 1).applyQuaternion(this.gameObject.rotation);
     this._forward.y = 0;
     this._forward.normalize();
 
@@ -431,12 +431,12 @@ code: |
     let grip = THREE.MathUtils.clamp(Math.abs(this.linearSpeed), this.gripMin, this.gripMax);
     let targetAngular = -this.inputX * grip * this.steeringMul * direction;
     this.angularSpeed = THREE.MathUtils.lerp(this.angularSpeed, targetAngular, dt * 4);
-    this.gameObject.rotateY(this.angularSpeed * dt);
+    this.gameObject._internal.three.rotateY(this.angularSpeed * dt);
 
-    this._tmpVec.set(0, 1, 0).applyQuaternion(this.gameObject.quaternion);
+    this._tmpVec.set(0, 1, 0).applyQuaternion(this.gameObject.rotation);
     if (this._tmpVec.y > 0.5) {
-      let targetQuat = this._alignWithY(this.gameObject.quaternion, this._up);
-      this.gameObject.quaternion.slerp(targetQuat, 0.2);
+      let targetQuat = this._alignWithY(this.gameObject.rotation, this._up);
+      this.gameObject.rotation.slerp(targetQuat, 0.2);
     }
 
     let targetSpeed = this.inputZ;
@@ -484,7 +484,7 @@ code: |
       + (this._bodyNode ? Math.abs(this._bodyNode.rotation.z) * 2 : 0);
     this._updateDriftSmoke(this.driftIntensity > 0.25);
 
-    this._forward.set(0, 0, 1).applyQuaternion(this.gameObject.quaternion);
+    this._forward.set(0, 0, 1).applyQuaternion(this.gameObject.rotation);
     this._forward.y = 0;
     this._forward.normalize();
 

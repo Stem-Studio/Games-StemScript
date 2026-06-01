@@ -236,19 +236,19 @@ code: |
   // --- Play mode ---
   this.init = function(_game) {
     game = _game;
-    let teamIdx = this.gameObject.userData.bb_team;
+    let teamIdx = this.gameObject._internal.three.userData.bb_team;
     if (teamIdx === undefined) teamIdx = this.getAttribute("teamIndex") || 0;
     buildAvatar(this.gameObject._internal.three, teamIdx);
     currentTeam = teamIdx;
 
-    let name = this.gameObject.userData.bb_name || "GUEST";
-    let isLocal = this.gameObject.userData.bb_isLocal || false;
+    let name = this.gameObject._internal.three.userData.bb_name || "GUEST";
+    let isLocal = this.gameObject._internal.three.userData.bb_isLocal || false;
     buildNametag(this.gameObject._internal.three, name, isLocal);
     currentName = name;
   };
 
   this.update = function(deltaTime) {
-    let ud = this.gameObject.userData;
+    let ud = this.gameObject._internal.three.userData;
 
     // Rebuild nametag if name changed
     let name = ud.bb_name || "GUEST";

@@ -519,6 +519,7 @@ code: |
   };
 
   this.onEditorAdded = function(editor) {
+    erth = this.erth;
     targetThree = this.gameObject._internal.three;
     this.game = { scene: editor.scene, camera: editor.camera };
     initRuntimeState(false);
@@ -530,6 +531,7 @@ code: |
   };
 
   this.onEditorAttributesUpdated = function() {
+    erth = this.erth;
     this.dispose();
     initRuntimeState(!previewMode);
     if (previewMode) {

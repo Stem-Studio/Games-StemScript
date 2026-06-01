@@ -110,8 +110,17 @@ code: |
     mesh.frustumCulled = false;
     mesh.userData.isRuntimeOnly = true;
 
-    const laserGameObject = erth.object.createFromThreeObject(mesh);
-    await erth.scene.addObject(laserGameObject);
+    // In play mode the laser is registered as a runtime game object. In editor
+    // preview erth.object/erth.scene are unavailable ("not a function"), so add
+    // the mesh straight to the scene root instead.
+    if (erth.object && typeof erth.object.createFromThreeObject === "function" &&
+        erth.scene && typeof erth.scene.addObject === "function") {
+      const laserGameObject = erth.object.createFromThreeObject(mesh);
+      await erth.scene.addObject(laserGameObject);
+    } else {
+      const root = (game && game.scene) || obj.parent;
+      if (root) root.add(mesh);
+    }
 
     lasers.push({
       mesh: mesh,

@@ -37,6 +37,43 @@ import model name="CC Solar Plant" filepath="models/sun_power.glb" comment="Sour
 import model name="CC Wind Plant" filepath="models/wind_power.glb" comment="Source wind power plant"
 import model name="CC Water Tower" filepath="models/water_tower.glb" comment="Source water tower"
 
+# --- Hide source/template models ---
+# These are imported only as asset sources; the cc.cityGame behavior spawns
+# buildings at runtime via erth.asset.model.createInstance(), so the imported
+# template objects must be hidden in play (otherwise they pile up at the origin).
+update "CC House L1" objectSettings={gameVisibility:false}
+update "CC House L2" objectSettings={gameVisibility:false}
+update "CC House L3" objectSettings={gameVisibility:false}
+update "CC House2 L1" objectSettings={gameVisibility:false}
+update "CC House2 L2" objectSettings={gameVisibility:false}
+update "CC House2 L3" objectSettings={gameVisibility:false}
+update "CC Shop L1" objectSettings={gameVisibility:false}
+update "CC Shop L2" objectSettings={gameVisibility:false}
+update "CC Shop L3" objectSettings={gameVisibility:false}
+update "CC Office L1" objectSettings={gameVisibility:false}
+update "CC Office L2" objectSettings={gameVisibility:false}
+update "CC Office L3" objectSettings={gameVisibility:false}
+update "CC Park L1" objectSettings={gameVisibility:false}
+update "CC Park L2" objectSettings={gameVisibility:false}
+update "CC Park L3" objectSettings={gameVisibility:false}
+update "CC Road Straight" objectSettings={gameVisibility:false}
+update "CC Road Bend" objectSettings={gameVisibility:false}
+update "CC Road T" objectSettings={gameVisibility:false}
+update "CC Road Cross" objectSettings={gameVisibility:false}
+update "CC Hospital" objectSettings={gameVisibility:false}
+update "CC Police" objectSettings={gameVisibility:false}
+update "CC Factory" objectSettings={gameVisibility:false}
+update "CC Fire Station" objectSettings={gameVisibility:false}
+update "CC Chemistry L1" objectSettings={gameVisibility:false}
+update "CC Chemistry L2" objectSettings={gameVisibility:false}
+update "CC Chemistry L3" objectSettings={gameVisibility:false}
+update "CC Nuclear Plant" objectSettings={gameVisibility:false}
+update "CC Hero Park" objectSettings={gameVisibility:false}
+update "CC Garbage Station" objectSettings={gameVisibility:false}
+update "CC Solar Plant" objectSettings={gameVisibility:false}
+update "CC Wind Plant" objectSettings={gameVisibility:false}
+update "CC Water Tower" objectSettings={gameVisibility:false}
+
 # --- Import Status Icon Textures ---
 import image name="CC Icon Happy" filepath="textures/effect/happy.png" comment="Source positive environment icon"
 import image name="CC Icon Sad" filepath="textures/effect/sad.png" comment="Source negative environment icon"

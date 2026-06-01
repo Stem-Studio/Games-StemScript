@@ -35,6 +35,14 @@ config:
 code: |
   let game;
   const erth = this.erth;
+  // Canonical target list — shared by init() and the editor hooks so the
+  // texture also applies during editor preview (where init() never runs and
+  // this._targets would otherwise be undefined).
+  const SKR_COLORMAP_TARGETS = [
+    "TrackStraight", "TrackCorner", "TrackBump", "TrackFinish",
+    "DecoEmpty", "DecoForest", "DecoTents", "PlayerTruck",
+    "NpcTruckGreen", "NpcTruckPurple", "NpcTruckRed"
+  ];
   this.init = function(_game) {
       game = _game;
     this._sceneRoot = game && game.scene ? game.scene : null;
@@ -79,8 +87,9 @@ code: |
     let scene = this._sceneRoot || (game && game.scene ? game.scene : null);
     if (!scene) return;
 
-    for (let i = 0; i < this._targets.length; i++) {
-      let obj = scene.getObjectByName(this._targets[i]);
+    let targets = this._targets || SKR_COLORMAP_TARGETS;
+    for (let i = 0; i < targets.length; i++) {
+      let obj = scene.getObjectByName(targets[i]);
       if (obj) {
         this._applyTextureToObject(obj, texture);
       }

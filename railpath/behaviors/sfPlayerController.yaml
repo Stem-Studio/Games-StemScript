@@ -101,7 +101,12 @@ code: |
     if (arwingAttr) {
       this.erth.asset.model.createInstance(arwingAttr).then((model) => {
         if (!model) return;
-        let loadedTarget = model && model.target ? model.target : model;
+        // createInstance resolves to a GameObject wrapper; the actual Object3D
+        // (with .children/.quaternion) lives on _internal.three. Using the
+        // wrapper directly crashes markRuntimeOnly and quaternion.copy.
+        let loadedTarget = (model._internal && model._internal.three)
+          ? model._internal.three
+          : (model.target ? model.target : model);
         if (!loadedTarget || this.arwing) return;
         this.arwing = loadedTarget;
         this._loadedArwingFromAttr = true;

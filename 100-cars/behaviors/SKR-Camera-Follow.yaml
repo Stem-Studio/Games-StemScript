@@ -87,7 +87,7 @@ code: |
     let cam = game.camera;
     if (!cam) return;
 
-    this._forward.set(0, 0, 1).applyQuaternion(this.gameObject.quaternion);
+    this._forward.set(0, 0, 1).applyQuaternion(this.gameObject.rotation);
     this._forward.y = 0;
     if (this._forward.lengthSq() > 1e-6) {
       this._forward.normalize();

@@ -21,9 +21,8 @@ light "Directional Light" intensity=0 castShadow=false
 # Asset Imports
 # ============================================================
 import model name="CupolaTemplate" filepath="models/cupola.glb" comment="Optional cockpit frame (commented out upstream)"
-import image name="LennaTexture"   filepath="textures/lenna.png" comment="Mirrored upstream test texture (unused at runtime)"
-import image name="ProjectCover"   filepath="textures/lenna.png" comment="Scene thumbnail (placeholder)"
-scene thumbnail name="ProjectCover"
+import image name="LennaTexture"   filepath="textures/lenna.png" comment="Mirrored upstream test texture (unused at runtime); also used as the scene thumbnail"
+scene thumbnail name="LennaTexture"
 
 # Hide cupola template (mounted at runtime if user enables bhCupola)
 update CupolaTemplate objectSettings={gameVisibility:false,enableAtStart:false}

@@ -135,7 +135,7 @@ code: |
     }
 
     // Load background music
-    this.erth.asset.audio.getUrl({ name: "BackgroundMusic" }).then(function(url) {
+    this.erth.asset.audio.getUrlByName("BackgroundMusic").then(function(url) {
       if (url) {
         bgAudio = new Audio(url);
         bgAudio.loop = true;
@@ -144,7 +144,7 @@ code: |
     });
 
     // Load success sound
-    this.erth.asset.audio.getUrl({ name: "SuccessSound" }).then(function(url) {
+    this.erth.asset.audio.getUrlByName("SuccessSound").then(function(url) {
       if (url) {
         successAudio = new Audio(url);
         successAudio.volume = 0.2;
