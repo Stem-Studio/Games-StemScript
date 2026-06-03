@@ -35,8 +35,58 @@ code: |+
     this._createHUD();
   };
 
+  this._getSafeArea = function() {
+    if (this.erth && this.erth.viewport && this.erth.viewport.getSafeArea) {
+      return this.erth.viewport.getSafeArea();
+    }
+    if (this.game && this.game.getViewportSafeArea) {
+      return this.game.getViewportSafeArea();
+    }
+    return {
+      left: 0,
+      top: 0,
+      right: window.innerWidth,
+      bottom: window.innerHeight,
+      width: window.innerWidth,
+      height: window.innerHeight,
+      insetLeft: 0,
+      insetTop: 0,
+      insetRight: 0,
+      insetBottom: 0
+    };
+  };
+
+  this._syncHUDLayout = function() {
+    var safe = this._getSafeArea();
+    var hud = document.getElementById('pirate-hud');
+    if (hud) {
+      var hudKey = [safe.left, safe.width, safe.insetBottom].join(':');
+      if (hud._safeKey !== hudKey) {
+        hud._safeKey = hudKey;
+        hud.style.left = (safe.left + safe.width * 0.5) + 'px';
+        hud.style.bottom = (safe.insetBottom + 18) + 'px';
+      }
+    }
+
+    var wrap = document.getElementById('pirate-sprint-wrap');
+    if (wrap) {
+      var wrapKey = [safe.left, safe.width, safe.insetBottom, safe.insetRight, this._hudIsMobile ? 'm' : 'd'].join(':');
+      if (wrap._safeKey !== wrapKey) {
+        wrap._safeKey = wrapKey;
+        if (this._hudIsMobile) {
+          wrap.style.right = (safe.insetRight + 20) + 'px';
+          wrap.style.bottom = (safe.insetBottom + 234) + 'px';
+        } else {
+          wrap.style.left = (safe.left + safe.width * 0.5) + 'px';
+          wrap.style.bottom = (safe.insetBottom + 50) + 'px';
+        }
+      }
+    }
+  };
+
   this._createHUD = function() {
     var isMobile = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
+    this._hudIsMobile = isMobile;
 
     var old = document.getElementById('pirate-hud');
     if (old) old.remove();
@@ -88,9 +138,11 @@ code: |+
     wrap.appendChild(lbl);
     wrap.appendChild(track);
     document.body.appendChild(wrap);
+    this._syncHUDLayout();
   };
 
   this.update = function(dt) {
+    this._syncHUDLayout();
     // Sprint fuel gauge
     var sp = this.game.scene.userData._playerSprint;
     var bar = document.getElementById('sprint-bar');
@@ -119,7 +171,9 @@ code: |+
     var playerUUID = scene.userData._playerShipUUID;
     var THREE = window.THREE;
     if (camera && THREE && aiShips.length) {
-      var w = window.innerWidth, h = window.innerHeight;
+      var safe = this._getSafeArea();
+      var w = safe.width, h = safe.height;
+      if (w <= 0 || h <= 0) return;
       var tmpV = this._tmpV;
       aiShips.forEach(function(ship) {
         if (!ship || ship.uuid === playerUUID) return;
@@ -146,8 +200,8 @@ code: |+
         tmpV.copy(ship.position);
         tmpV.y += 8;
         tmpV.project(camera);
-        var sx = (tmpV.x * 0.5 + 0.5) * w;
-        var sy = (-tmpV.y * 0.5 + 0.5) * h;
+        var sx = safe.left + (tmpV.x * 0.5 + 0.5) * w;
+        var sy = safe.top + (-tmpV.y * 0.5 + 0.5) * h;
         if (tmpV.z > 1) { el.style.display = 'none'; return; }
         el.style.display = 'block';
         el.style.left = sx + 'px';

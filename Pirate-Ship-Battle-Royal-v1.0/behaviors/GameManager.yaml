@@ -55,6 +55,8 @@ code: |-
     this._restartTimer = 0;
     this._prevCount    = -1;
     this._gracePeriod  = 0;
+    this._countdownFadeTimer = null;
+    this._countdownRemoveTimer = null;
     var _self = this;
     this.game.scene.userData._skipToNextMatch = function() { _self._doRestart(); };
   };
@@ -85,24 +87,70 @@ code: |-
     this._doRestart();
   };
 
+  this._getSafeArea = function() {
+    if (this.erth && this.erth.viewport && this.erth.viewport.getSafeArea) {
+      return this.erth.viewport.getSafeArea();
+    }
+    if (this.game && this.game.getViewportSafeArea) {
+      return this.game.getViewportSafeArea();
+    }
+    return {
+      left: 0,
+      top: 0,
+      right: window.innerWidth,
+      bottom: window.innerHeight,
+      width: window.innerWidth,
+      height: window.innerHeight,
+      insetLeft: 0,
+      insetTop: 0,
+      insetRight: 0,
+      insetBottom: 0
+    };
+  };
+
+  this._applyOverlaySafeArea = function() {
+    var el = document.getElementById('pirate-overlay');
+    if (!el) return;
+    var safe = this._getSafeArea();
+    var key = [safe.left, safe.top, safe.width, safe.height].join(':');
+    if (el._safeKey === key) return;
+    el._safeKey = key;
+    el.style.left = safe.left + 'px';
+    el.style.top = safe.top + 'px';
+    el.style.width = safe.width + 'px';
+    el.style.height = safe.height + 'px';
+  };
+
+  this._applyCenteredSafeArea = function(el) {
+    if (!el) return;
+    var safe = this._getSafeArea();
+    var key = [safe.left, safe.top, safe.width, safe.height].join(':');
+    if (el._safeKey === key) return;
+    el._safeKey = key;
+    el.style.left = (safe.left + safe.width * 0.5) + 'px';
+    el.style.top = (safe.top + safe.height * 0.5) + 'px';
+  };
+
   this._createUI = function() {
     window._stemScene = this.game.scene;
+    var safe = this._getSafeArea();
     var old = document.getElementById('pirate-overlay');
     if (old) old.remove();
     var div = document.createElement('div');
     div.id = 'pirate-overlay';
     div.style.cssText = [
-      'position:fixed', 'top:0', 'left:0', 'width:100%', 'height:100%',
+      'position:fixed', 'top:' + safe.top + 'px', 'left:' + safe.left + 'px',
+      'width:' + safe.width + 'px', 'height:' + safe.height + 'px',
       'display:flex', 'flex-direction:column', 'align-items:center',
       'justify-content:flex-start',
-      'padding-top:max(16px, env(safe-area-inset-top, 16px))',
+      'padding-top:16px',
       'pointer-events:none', 'z-index:9999', 'font-family:serif'
     ].join(';');
 
     div.innerHTML =
       '<div id="ships-remaining" style="background:rgba(0,0,0,0.55);color:#f5d76e;' +
       'font-size:clamp(14px,2.5vw,20px);padding:6px 14px;border-radius:8px;' +
-      'border:2px solid #8b6914;max-width:90vw;text-align:center;">' +
+      'border:2px solid #8b6914;max-width:90%;text-align:center;">' +
       '\u2875 Ships Afloat: ' + TOTAL + '</div>' +
       '<div id="pirate-winner" style="display:none;margin-top:clamp(4px,2vh,20px);' +
       'background:rgba(0,0,0,0.82);color:#f5d76e;' +
@@ -110,9 +158,60 @@ code: |-
       'padding:clamp(14px,3vw,30px) clamp(20px,5vw,60px);' +
       'border-radius:16px;border:3px solid #f5d76e;text-align:center;' +
       'text-shadow:2px 2px 4px #000;pointer-events:auto;' +
-      'max-width:90vw;word-break:break-word;">' +
+      'max-width:90%;word-break:break-word;">' +
       '</div>';
     document.body.appendChild(div);
+    this._applyOverlaySafeArea();
+  };
+
+  this._clearCountdownTimers = function() {
+    if (this._countdownFadeTimer) {
+      clearTimeout(this._countdownFadeTimer);
+      this._countdownFadeTimer = null;
+    }
+    if (this._countdownRemoveTimer) {
+      clearTimeout(this._countdownRemoveTimer);
+      this._countdownRemoveTimer = null;
+    }
+  };
+
+  this._clearTransientSceneObjects = function() {
+    var scene = this.game && this.game.scene;
+    if (!scene || !scene.userData) return;
+    ['_cannonballs','_cannonVFX','_wake'].forEach(function(key) {
+      var arr = scene.userData[key];
+      if (!arr) return;
+      arr.forEach(function(item) {
+        if (!item) return;
+        if (item.parent) {
+          scene.remove(item);
+          if (item.geometry) item.geometry.dispose();
+          if (item.material) item.material.dispose();
+          return;
+        }
+        if (item.mesh && item.mesh.parent) {
+          scene.remove(item.mesh);
+          if (item.mesh.geometry) item.mesh.geometry.dispose();
+          if (item.mesh.material) item.mesh.material.dispose();
+        }
+        if (item.parts) item.parts.forEach(function(p) {
+          if (p.mesh && p.mesh.parent) {
+            scene.remove(p.mesh);
+            if (p.mesh.geometry) p.mesh.geometry.dispose();
+            if (p.mesh.material) p.mesh.material.dispose();
+          }
+        });
+      });
+      scene.userData[key] = [];
+    });
+  };
+
+  this._destroyUI = function() {
+    this._clearCountdownTimers();
+    var countdownEl = document.getElementById('pirate-countdown');
+    if (countdownEl) countdownEl.remove();
+    var overlayEl = document.getElementById('pirate-overlay');
+    if (overlayEl) overlayEl.remove();
   };
 
   this._doRestart = function() {
@@ -140,35 +239,7 @@ code: |-
       }
       ship.userData._cannonCd = 0; ship.userData._cannonCdMax = 3;
     }
-    ['_cannonballs','_cannonVFX','_wake'].forEach(function(key) {
-      var arr = scene.userData[key];
-      if (!arr) return;
-      arr.forEach(function(item) {
-        if (!item) return;
-        // Cannonballs are direct meshes
-        if (item.parent) {
-          scene.remove(item);
-          if (item.geometry) item.geometry.dispose();
-          if (item.material) item.material.dispose();
-          return;
-        }
-        // Wake entries have a .mesh
-        if (item.mesh && item.mesh.parent) {
-          scene.remove(item.mesh);
-          if (item.mesh.geometry) item.mesh.geometry.dispose();
-          if (item.mesh.material) item.mesh.material.dispose();
-        }
-        // VFX entries have .parts array
-        if (item.parts) item.parts.forEach(function(p) {
-          if (p.mesh && p.mesh.parent) {
-            scene.remove(p.mesh);
-            if (p.mesh.geometry) p.mesh.geometry.dispose();
-            if (p.mesh.material) p.mesh.material.dispose();
-          }
-        });
-      });
-      scene.userData[key] = [];
-    });
+    this._clearTransientSceneObjects();
     this.gameOver = false; this._restartTimer = 0; this._prevCount = -1; this._gracePeriod = 3.0; this._lastCountNum = -1; this._matchElapsed = 0; this.game.scene.userData._matchStarted = false; this._showCountdown(3);
     var winEl = document.getElementById('pirate-winner');
     if (winEl) winEl.style.display = 'none';
@@ -205,6 +276,8 @@ code: |-
 
   this.update = function(dt) {
     if (!this._shipRefs) { this._shipRefCd -= dt; if (this._shipRefCd <= 0) this._ensureShipRefs(); }
+    this._applyOverlaySafeArea();
+    this._applyCenteredSafeArea(document.getElementById('pirate-countdown'));
     if (this._gracePeriod > 0) {
       this._gracePeriod -= dt;
       var cNum = Math.ceil(this._gracePeriod);
@@ -323,26 +396,41 @@ code: |-
   };
 
   this._showCountdown = function(n) {
+    this._clearCountdownTimers();
     var el = document.getElementById('pirate-countdown');
     if (!el) {
       el = document.createElement('div');
       el.id = 'pirate-countdown';
-      el.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);' +
+      el.style.cssText = 'position:fixed;transform:translate(-50%,-50%);' +
         'font-family:Georgia,serif;font-size:clamp(60px,15vw,120px);font-weight:bold;' +
         'color:#f5d76e;text-shadow:0 0 30px rgba(245,215,110,0.8);pointer-events:none;' +
         'z-index:99999;text-align:center;transition:opacity 0.3s;';
       document.body.appendChild(el);
     }
+    this._applyCenteredSafeArea(el);
     el.style.opacity = '1';
     el.textContent = n > 0 ? n : 'GO!';
     if (n === 0) {
       var _el = el;
-      setTimeout(function() { _el.style.opacity = '0'; setTimeout(function(){ _el.remove(); }, 400); }, 600);
+      this._countdownFadeTimer = setTimeout(function() {
+        _el.style.opacity = '0';
+        this._countdownFadeTimer = null;
+        this._countdownRemoveTimer = setTimeout(function() {
+          _el.remove();
+          this._countdownRemoveTimer = null;
+        }.bind(this), 400);
+      }.bind(this), 600);
     }
   };
   this.dispose = function() {
+    this._destroyUI();
+    this._clearTransientSceneObjects();
+    if (this.game && this.game.scene && this.game.scene.userData) {
+      delete this.game.scene.userData._skipToNextMatch;
+      delete this.game.scene.userData._matchStarted;
+    }
+    if (window._stemScene === (this.game && this.game.scene)) window._stemScene = null;
+    this._shipRefs = null;
     var skipEl2 = document.getElementById('pirate-skip-btn');
     if (skipEl2) skipEl2.remove();
-    var el = document.getElementById('pirate-overlay');
-    if (el) el.remove();
   };

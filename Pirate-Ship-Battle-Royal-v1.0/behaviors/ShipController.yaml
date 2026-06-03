@@ -121,6 +121,53 @@ code: |+
     if (refs.length === AI_NAMES.length) this._aiShipRefs = refs;
   };
 
+  this._getSafeArea = function() {
+    if (this.erth && this.erth.viewport && this.erth.viewport.getSafeArea) {
+      return this.erth.viewport.getSafeArea();
+    }
+    if (this.game && this.game.getViewportSafeArea) {
+      return this.game.getViewportSafeArea();
+    }
+    return {
+      left: 0,
+      top: 0,
+      right: window.innerWidth,
+      bottom: window.innerHeight,
+      width: window.innerWidth,
+      height: window.innerHeight,
+      insetLeft: 0,
+      insetTop: 0,
+      insetRight: 0,
+      insetBottom: 0
+    };
+  };
+
+  this._syncTouchUILayout = function() {
+    if (!this._touchUI || !this._touchUI.length) return;
+    var safe = this._getSafeArea();
+    var key = [safe.insetLeft, safe.insetRight, safe.insetBottom].join(':');
+    if (this._touchLayoutKey === key) return;
+    this._touchLayoutKey = key;
+
+    var base = document.getElementById('pirate-joystick');
+    if (base) {
+      base.style.left = (safe.insetLeft + 20) + 'px';
+      base.style.bottom = (safe.insetBottom + 32) + 'px';
+    }
+
+    var fireBtn = document.getElementById('pirate-fire-btn');
+    if (fireBtn) {
+      fireBtn.style.right = (safe.insetRight + 20) + 'px';
+      fireBtn.style.bottom = (safe.insetBottom + 48) + 'px';
+    }
+
+    var sprintBtn = document.getElementById('pirate-sprint-btn');
+    if (sprintBtn) {
+      sprintBtn.style.right = (safe.insetRight + 20) + 'px';
+      sprintBtn.style.bottom = (safe.insetBottom + 152) + 'px';
+    }
+  };
+
   this._createTouchUI = function() {
     this._removeTouchUI();
     // Also clear any orphaned touch UI from previous sessions
@@ -167,6 +214,8 @@ code: |+
     document.body.appendChild(fireBtn);
     document.body.appendChild(sprintBtn);
     this._touchUI = [base, fireBtn, sprintBtn];
+    this._touchLayoutKey = null;
+    this._syncTouchUILayout();
 
     var MAX = 46; var startX = 0; var startY = 0; var active = false;
     base.addEventListener('pointerdown', function(e) {
@@ -235,6 +284,7 @@ code: |+
 
   this.update = function(dt) {
     if (!this.target) return;
+    this._syncTouchUILayout();
     var health = this.target.userData._shipHealth;
     if (health && health.isDead) return;
 
