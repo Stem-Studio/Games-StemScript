@@ -50,10 +50,10 @@ update NpcTruckPurple scale={"x":0.5,"y":0.5,"z":0.5} objectSettings={"isSelecta
 physics set NpcTruckPurple config={"enabled":true,"shape":"box","shapeExcludesHiddenObjects":false,"mass":0,"restitution":0,"friction":0,"rollingFriction":0,"spinningFriction":0,"contactStiffness":0,"contactDamping":0,"ctype":"Static","enable_preview":false,"collision_material":"Ground","climbable":false}
 update NpcTruckRed scale={"x":0.5,"y":0.5,"z":0.5} objectSettings={"isSelectable":false,"enableAtStart":false,"gameVisibility":false}
 physics set NpcTruckRed config={"enabled":true,"shape":"box","shapeExcludesHiddenObjects":false,"mass":0,"restitution":0,"friction":0,"rollingFriction":0,"spinningFriction":0,"contactStiffness":0,"contactDamping":0,"ctype":"Static","enable_preview":false,"collision_material":"Ground","climbable":false}
-add group name=Player position={"x":3.745,"y":0,"z":3.745} rotation={"x":0,"y":0,"z":0} scale={"x":1,"y":1,"z":1} objectSettings={"isSelectable":false}
+add group name=Player rotation={"x":0,"y":0,"z":0} scale={"x":1,"y":1,"z":1} objectSettings={"isSelectable":false}
 update Player tag=Player
 move PlayerTruck parent=Player
-update PlayerTruck position={"x":-3.745,"z":-3.745} scale={"x":0.5,"y":0.5,"z":0.5} objectSettings={"isSelectable":false}
+update PlayerTruck scale={"x":0.5,"y":0.5,"z":0.5} objectSettings={"isSelectable":false}
 physics set PlayerTruck config={"enabled":true,"shape":"box","shapeExcludesHiddenObjects":false,"mass":0,"restitution":0,"friction":0,"rollingFriction":0,"spinningFriction":0,"contactStiffness":0,"contactDamping":0,"ctype":"Static","enable_preview":false,"collision_material":"Ground","climbable":false}
 add box name=GroundPlane position={"x":-7.492,"y":-0.14,"z":0} rotation={"x":0,"y":0,"z":0} scale={"x":79.94,"y":0.02,"z":79.94} color=#369069 objectSettings={"isSelectable":false}
 physics set GroundPlane config={"enabled":true,"shape":"box","shapeExcludesHiddenObjects":false,"mass":0,"restitution":0,"friction":0,"rollingFriction":0,"spinningFriction":0,"contactStiffness":0,"contactDamping":0,"ctype":"Static","enable_preview":false,"collision_material":"Ground","climbable":false}
