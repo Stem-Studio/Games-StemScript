@@ -30,6 +30,10 @@ config:
     colliders, and optional looping NPC traffic. Configure attributes in the
     editor to tune gameplay behavior.
 code: |
+  function rgba(hex, alpha) {
+    return "rgba(" + ((hex >> 16) & 255) + ", " + ((hex >> 8) & 255) + ", " + (hex & 255) + ", " + alpha + ")";
+  }
+
   let game;
   let self = this; // @check-ok needed for nested callbacks in _buildTrack
   this.init = function(_game) {
@@ -44,6 +48,7 @@ code: |
     this._npcTemplates = {};
     this._npcClickCount = 0;
     this._npcButton = null;
+    this._npcButtonText = null;
     this._npcButtonRoot = null;
     this._npcButtonParented = false;
     this._npcButtonHandler = null;
@@ -102,12 +107,13 @@ code: |
   };
 
   this._disposeNpcUi = function() {
-    // UIKit handles click via `userData.onClick` — no DOM listener to remove.
+    // UIKit handles click via `onClick` property — no DOM listener to remove.
     if (this._npcButtonRoot && this._npcButtonRoot.parent) {
       this._npcButtonRoot.parent.remove(this._npcButtonRoot);
     }
     if (this._npcButtonRoot) this._npcButtonRoot.dispose();
     this._npcButton = null;
+    this._npcButtonText = null;
     this._npcButtonRoot = null;
     this._npcButtonParented = false;
     this._npcButtonHandler = null;
@@ -115,9 +121,9 @@ code: |
   };
 
   this._refreshNpcButtonLabel = function() {
-    if (!this._npcButton) return;
+    if (!this._npcButtonText) return;
     let nextAdd = this._npcClickCount === 0 ? 100 : 10;
-    this._npcButton.setProperties({ text: "Add NPC Trucks (+" + nextAdd + ") Total: " + this._npcRunners.length });
+    this._npcButtonText.setProperties({ text: "Add NPC Trucks (+" + nextAdd + ") Total: " + this._npcRunners.length });
   };
 
   this._createNpcUi = function() {
@@ -126,23 +132,10 @@ code: |
     this._npcButtonRoot = new UIKit.Fullscreen(game.renderer || game.app?.renderer || game.uiCamera, {
       width: "100%",
       height: "100%",
-      positionType: "absolute", visibility: "visible"
-    });
-    this._npcButton = new UIKit.Text({
       positionType: "absolute",
-      top: 16,
-      right: 16,
-      paddingTop: 12,
-      paddingBottom: 12,
-      paddingLeft: 16,
-      paddingRight: 16,
-      borderRadius: 20,
-      backgroundColor: "rgba(21,24,31,0.88)",
-      color: "#f4f7fb",
-      fontSize: 13,
-      text: "Add NPC Trucks", visibility: "visible"
+      visibility: "visible",
+      pointerEvents: "auto"
     });
-    this._npcButtonRoot.add(this._npcButton);
 
     this._npcButtonHandler = () => {
       let count = this._npcClickCount === 0 ? 100 : 10;
@@ -151,7 +144,36 @@ code: |
       this._refreshNpcButtonLabel();
     };
 
-    this._npcButton.userData.onClick = this._npcButtonHandler;
+    this._npcButton = new UIKit.Container({
+      positionType: "absolute",
+      top: 16,
+      right: 16,
+      paddingTop: 12,
+      paddingBottom: 12,
+      paddingLeft: 16,
+      paddingRight: 16,
+      borderRadius: 20,
+      borderWidth: 2,
+      borderColor: "#4488ff",
+      backgroundColor: rgba(0x1a2a4a, 0.95),
+      flexDirection: "row",
+      justifyContent: "center",
+      alignItems: "center",
+      pointerEvents: "auto",
+      onClick: this._npcButtonHandler,
+      hover: { backgroundColor: rgba(0x2a3a5a, 1.0) },
+      active: { backgroundColor: rgba(0x0f1929, 0.95) }
+    });
+
+    this._npcButtonText = new UIKit.Text({
+      fontSize: 13,
+      color: "#f4f7fb",
+      text: "Add NPC Trucks",
+      pointerEvents: "none"
+    });
+    this._npcButton.add(this._npcButtonText);
+    this._npcButtonRoot.add(this._npcButton);
+
     if (!this._npcButtonParented && game && game.uiCamera) {
       game.uiCamera.add(this._npcButtonRoot);
       this._npcButtonParented = true;
